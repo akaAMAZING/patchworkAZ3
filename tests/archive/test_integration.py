@@ -68,8 +68,8 @@ def test_selfplay_worker_creation():
     assert "values" in result
     assert "action_masks" in result
     assert len(result["states"]) > 0
-    # states is a list of (56, 9, 9) arrays per position (gold_v2)
-    assert result["states"][0].shape == (56, 9, 9)
+    # states is a list of (32, 9, 9) arrays per position (gold_v2_32ch)
+    assert result["states"][0].shape == (32, 9, 9)
     assert result["policies"][0].shape == (2026,)  # Action space size
 
 
@@ -207,15 +207,15 @@ def test_network_creation():
 
 
 def test_state_encoder():
-    """Test that the state encoder works correctly (gold_v2 56ch)."""
+    """Test that the state encoder works correctly (gold_v2_32ch)."""
     from src.network.encoder import encode_state_multimodal
     from src.game.patchwork_engine import new_game, current_player
-    from src.network.gold_v2_constants import C_SPATIAL
+    from src.network.gold_v2_constants import C_SPATIAL_ENC
 
     state = new_game(edition="revised")
     to_move = current_player(state)
     x_spatial, _, _, _, _ = encode_state_multimodal(state, to_move)
-    assert x_spatial.shape == (C_SPATIAL, 9, 9)
+    assert x_spatial.shape == (C_SPATIAL_ENC, 9, 9)
     assert x_spatial.dtype == np.float32 or str(x_spatial.dtype) == "float32"
 
 

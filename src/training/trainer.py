@@ -8,11 +8,6 @@ BATCHED HDF5 INPUT PIPELINE (high-throughput)
 - AMP is CUDA-only (won't crash on CPU/MPS)
 - Optional replay buffer integration: train on sliding window of recent iterations
 
-FIX CHANGELOG:
-- [C2] LR lambda now produces correct absolute LR via ratio (min_lr_ratio = min_lr / base_lr)
-- [M1/m7] SummaryWriter is explicitly closed in train_iteration to avoid file handle leaks
-- Warmup is clamped to at most 10% of total steps to prevent perpetual-warmup on small datasets
-- [Diff Applied] Optimized numpy casting/contiguous checks to avoid unnecessary copies
 """
 
 import logging
@@ -1103,7 +1098,7 @@ class Trainer:
             for checkpoint in checkpoints[:-keep_n]:
                 if checkpoint.name not in protected:
                     checkpoint.unlink()
-                    logger.info(f"Removed old checkpoint: {checkpoint}")
+                    logger.debug(f"Removed old checkpoint: {checkpoint}")
 
         # Clean old iteration checkpoints
         iter_checkpoints = sorted(
@@ -1114,7 +1109,7 @@ class Trainer:
             for checkpoint in iter_checkpoints[:-keep_n]:
                 if checkpoint.name not in protected:
                     checkpoint.unlink()
-                    logger.info(f"Removed old iteration checkpoint: {checkpoint}")
+                    logger.debug(f"Removed old iteration checkpoint: {checkpoint}")
 
 
 def _split_indices(n: int, val_split: float, seed: int) -> Tuple[List[int], List[int]]:
@@ -1306,8 +1301,6 @@ def train_iteration(
 
     try:
         for epoch in range(num_epochs):
-            logger.info(f"  Epoch {epoch+1}/{num_epochs} (step {trainer.global_step})")
-
             if hasattr(train_loader.sampler, "set_epoch"):
                 train_loader.sampler.set_epoch(epoch)
             elif hasattr(train_loader.dataset, "set_epoch"):
@@ -1335,8 +1328,6 @@ def train_iteration(
             if "policy_entropy" in metrics:
                 if metrics["policy_entropy"] < 0.5:
                     logger.warning(f"  Low policy entropy ({metrics['policy_entropy']:.3f}) — potential policy collapse!")
-                elif metrics["policy_entropy"] > 5.0:
-                    logger.info(f"  High policy entropy ({metrics['policy_entropy']:.3f}) — model still exploring broadly")
 
             # Loss explosion detection: abort iteration if loss is NaN/Inf
             if math.isnan(metrics['total_loss']) or math.isinf(metrics['total_loss']):

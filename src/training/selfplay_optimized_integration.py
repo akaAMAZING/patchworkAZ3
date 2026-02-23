@@ -11,8 +11,6 @@ ARCHITECTURE:
 - Workers write NPZ shards to avoid Windows IPC MemoryError
 - Main process merges shards into HDF5 dataset
 
-FIX CHANGELOG:
-- [RECONSTRUCTION] Replaced 661 lines of duplicate MCTS code with proper integration layer
 """
 
 import logging
@@ -352,7 +350,7 @@ class SelfPlayGenerator:
                 if result:
                     summaries.append(result)
                     done = len(summaries)
-                    if done % 10 == 0:
+                    if done % 50 == 0:
                         elapsed = time.time() - batch_start
                         gpm = (done / elapsed) * 60.0 if elapsed > 0 else 0
                         logger.info(
@@ -416,7 +414,7 @@ class SelfPlayGenerator:
             for result in pool.imap_unordered(play_game_optimized, game_args):
                 if result:
                     summaries.append(result)
-                    if len(summaries) % 10 == 0:
+                    if len(summaries) % 50 == 0:
                         elapsed = time.time() - selfplay_start_time
                         games_per_min = (len(summaries) / elapsed) * 60.0 if elapsed > 0 else 0
                         logger.info(

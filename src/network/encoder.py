@@ -16,6 +16,14 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+try:
+    import numba as _numba
+    _HAS_NUMBA = True
+    _njit = _numba.njit(cache=True, fastmath=True, nogil=True)
+except ImportError:
+    _HAS_NUMBA = False
+    _njit = lambda f: f  # pure-Python fallback — correct but slower
+
 # Import from the game engine
 from src.game.patchwork_engine import (
     PIECE_BY_ID,
@@ -95,6 +103,240 @@ def _patches_crossed(prev_pos: int, new_pos: int, opponent_pos: int, edition_cod
 
 def _clamp_pos(pos: int) -> int:
     return TRACK_LENGTH if int(pos) > TRACK_LENGTH else int(pos)
+
+
+# ---------------------------------------------------------------------------
+# Numba JIT helpers — used by GoldV2StateEncoder.encode_into
+# ---------------------------------------------------------------------------
+
+@_njit
+def _popcount32(x):
+    """Bit population count (Brian Kernighan) — Numba replacement for int.bit_count()."""
+    count = 0
+    x = x & 0xFFFFFFFF
+    while x:
+        x = x & (x - 1)
+        count += 1
+    return count
+
+
+@_njit
+def _jit_clamp_pos(pos, track_length):
+    return track_length if pos > track_length else pos
+
+
+@_njit
+def _jit_buttons_crossed(prev_pos, new_pos, buttons_after):
+    count = 0
+    for i in range(len(buttons_after)):
+        m = buttons_after[i]
+        if prev_pos < m and m <= new_pos:
+            count += 1
+    return count
+
+
+@_njit
+def _jit_patches_crossed(prev_pos, new_pos, opp_pos, patches_after):
+    count = 0
+    for i in range(len(patches_after)):
+        m = patches_after[i]
+        if prev_pos < m and m <= new_pos and opp_pos < m:
+            count += 1
+    return count
+
+
+@_njit
+def _encode_scalars_shop_jit(
+    slot_pids,       # (3,)    int32 — piece_id per visible slot, -1 if empty
+    shop_pids,       # (NMAX,) int32 — circle piece_ids in shop order
+    n_shop,          # int — actual number of items in shop_pids
+    n_circle,        # int — total circle length
+    c_pos, c_buttons, c_income, c_occ0, c_occ1, c_occ2,
+    o_pos, o_buttons, o_income, o_occ0, o_occ1, o_occ2,
+    bonus_owner, pending, tie_player, to_move,
+    piece_cost_lut,    # (MAX_PID,) int32
+    piece_time_lut,    # (MAX_PID,) int32
+    piece_income_lut,  # (MAX_PID,) int32
+    piece_area_lut,    # (MAX_PID,) int32
+    orient_count_lut,  # (MAX_PID,) int32
+    buttons_after,     # (M,) int64
+    patches_after,     # (K,) int64
+    seven_mask_w0,     # (9,) int64
+    seven_mask_w1,     # (9,) int64
+    seven_mask_w2,     # (9,) int64
+    x_global,          # (F_GLOBAL,)      float32 — output
+    x_track,           # (C_TRACK, TRACK_LEN) float32 — output
+    shop_ids,          # (NMAX,)          int16   — output
+    shop_feats,        # (NMAX, F_SHOP)   float32 — output
+    track_length,      # int = 53
+    track_len,         # int = 54
+    log1p_200,         # float
+    log1p_20,          # float
+):
+    """JIT-compiled scalar/shop encoder: fills x_global, x_track, shop_ids, shop_feats."""
+
+    # Mask occupancy to 32-bit unsigned range for correct bitwise arithmetic
+    c_o0 = c_occ0 & 0xFFFFFFFF
+    c_o1 = c_occ1 & 0xFFFFFFFF
+    c_o2 = c_occ2 & 0xFFFFFFFF
+    o_o0 = o_occ0 & 0xFFFFFFFF
+    o_o1 = o_occ1 & 0xFFFFFFFF
+    o_o2 = o_occ2 & 0xFFFFFFFF
+
+    denom_pos = float(track_len)
+
+    # ---- x_global[0-8]: position & resource features ----
+    x_global[0] = c_pos / denom_pos
+    x_global[1] = o_pos / denom_pos
+    x_global[2] = (c_pos - o_pos) / denom_pos
+    cb_c = c_buttons if c_buttons < 200 else 200
+    ob_c = o_buttons if o_buttons < 200 else 200
+    x_global[3] = math.log1p(cb_c) / log1p_200
+    x_global[4] = math.log1p(ob_c) / log1p_200
+    x_global[5] = math.tanh((c_buttons - o_buttons) / 40.0)
+    ci_c = c_income if c_income < 15 else 15
+    oi_c = o_income if o_income < 15 else 15
+    x_global[6] = math.tanh(ci_c / 15.0)
+    x_global[7] = math.tanh(oi_c / 15.0)
+    x_global[8] = math.tanh((c_income - o_income) / 10.0)
+
+    # ---- x_global[9-10]: board fill fractions ----
+    cur_filled = _popcount32(c_o0) + _popcount32(c_o1) + _popcount32(c_o2)
+    opp_filled = _popcount32(o_o0) + _popcount32(o_o1) + _popcount32(o_o2)
+    x_global[9]  = cur_filled / 81.0
+    x_global[10] = opp_filled / 81.0
+
+    # ---- x_global[11]: bonus tile owner ----
+    if bonus_owner == -1:
+        x_global[11] = 0.0
+    elif bonus_owner == to_move:
+        x_global[11] = 1.0
+    else:
+        x_global[11] = 0.5
+
+    # ---- x_global[12-13]: 7x7 completion distance (cur / opp) ----
+    best7 = 49
+    for k in range(9):
+        m0 = seven_mask_w0[k]
+        m1 = seven_mask_w1[k]
+        m2 = seven_mask_w2[k]
+        if (c_o0 & m0) == m0 and (c_o1 & m1) == m1 and (c_o2 & m2) == m2:
+            best7 = 0
+            break
+        fi = _popcount32(c_o0 & m0) + _popcount32(c_o1 & m1) + _popcount32(c_o2 & m2)
+        miss = 49 - fi
+        if miss < best7:
+            best7 = miss
+    x_global[12] = best7 / 49.0
+
+    best7o = 49
+    for k in range(9):
+        m0 = seven_mask_w0[k]
+        m1 = seven_mask_w1[k]
+        m2 = seven_mask_w2[k]
+        if (o_o0 & m0) == m0 and (o_o1 & m1) == m1 and (o_o2 & m2) == m2:
+            best7o = 0
+            break
+        fi = _popcount32(o_o0 & m0) + _popcount32(o_o1 & m1) + _popcount32(o_o2 & m2)
+        miss = 49 - fi
+        if miss < best7o:
+            best7o = miss
+    x_global[13] = best7o / 49.0
+
+    # ---- x_global[14-21]: track state ----
+    x_global[14] = (pending if pending < 5 else 5) / 5.0
+    remaining = 0
+    if n_circle > 0:
+        for i in range(len(patches_after)):
+            if o_pos < patches_after[i]:
+                remaining += 1
+    x_global[15] = (remaining if remaining < 5 else 5) / 5.0
+    for i in range(len(patches_after)):
+        x_global[16 + i] = 1.0 if o_pos < patches_after[i] else 0.0
+    x_global[21] = 1.0 if tie_player == to_move else 0.0
+
+    # ---- x_global[22-27]: pass action features ----
+    pass_new = _jit_clamp_pos(o_pos + 1, track_length)
+    pass_steps = pass_new - c_pos
+    pass_inc = _jit_buttons_crossed(c_pos, pass_new, buttons_after)
+    pass_pat = _jit_patches_crossed(c_pos, pass_new, o_pos, patches_after)
+    x_global[22] = pass_steps / denom_pos
+    x_global[23] = (pass_inc if pass_inc < 9 else 9) / 9.0
+    x_global[24] = (pass_pat if pass_pat < 2 else 2) / 2.0
+    pass_btn_delta = pass_inc * c_income
+    x_global[25] = math.tanh(pass_btn_delta / 30.0)
+    x_global[26] = pass_new / denom_pos
+    x_global[27] = 1.0 if pass_new == o_pos else 0.0
+
+    # ---- x_global[28-60]: per-slot (3 x 11) buy action features ----
+    for s in range(3):
+        pid = slot_pids[s]
+        base = 28 + s * 11
+        if pid < 0:
+            continue
+        cost    = piece_cost_lut[pid]
+        tv      = piece_time_lut[pid]
+        inc_g   = piece_income_lut[pid]
+        area    = piece_area_lut[pid]
+        buy_new = _jit_clamp_pos(c_pos + tv, track_length)
+        buy_inc = _jit_buttons_crossed(c_pos, buy_new, buttons_after)
+        buy_pat = _jit_patches_crossed(c_pos, buy_new, o_pos, patches_after)
+        ibg     = buy_inc * c_income
+        x_global[base]      = 1.0 if c_buttons >= cost else 0.0
+        x_global[base + 1]  = math.log1p(cost if cost < 20 else 20) / log1p_20
+        x_global[base + 2]  = (tv if tv < 6 else 6) / 6.0
+        x_global[base + 3]  = (inc_g if inc_g < 3 else 3) / 3.0
+        x_global[base + 4]  = (area if area < 9 else 9) / 9.0
+        x_global[base + 5]  = (buy_inc if buy_inc < 9 else 9) / 9.0
+        x_global[base + 6]  = math.tanh(ibg / 80.0)
+        x_global[base + 7]  = (buy_pat if buy_pat < 2 else 2) / 2.0
+        x_global[base + 8]  = math.tanh((-cost + ibg) / 40.0)
+        x_global[base + 9]  = buy_new / denom_pos
+        x_global[base + 10] = 1.0 if buy_new == o_pos else 0.0
+
+    # ---- x_track (C_TRACK x TRACK_LEN): one-hot positions & event markers ----
+    tc = c_pos if c_pos < track_len else track_len - 1
+    to_ = o_pos if o_pos < track_len else track_len - 1
+    x_track[0, tc]  = 1.0
+    x_track[1, to_] = 1.0
+    for i in range(len(buttons_after)):
+        m = buttons_after[i]
+        if m < track_len:
+            x_track[2, m] = 1.0
+    for i in range(len(patches_after)):
+        m = patches_after[i]
+        if o_pos < m and m < track_len:
+            x_track[3, m] = 1.0
+    pl = _jit_clamp_pos(o_pos + 1, track_length)
+    if pl < track_len:
+        x_track[4, pl] = 1.0
+    for s in range(3):
+        pid = slot_pids[s]
+        if pid >= 0:
+            land = _jit_clamp_pos(c_pos + piece_time_lut[pid], track_length)
+            if land < track_len:
+                x_track[5 + s, land] = 1.0
+
+    # ---- shop_ids + shop_feats: 33-item circle loop ----
+    if n_shop > 0:
+        denom_sh = float(n_circle - 1) if n_circle > 1 else 1.0
+        for i in range(n_shop):
+            pid = shop_pids[i]
+            shop_ids[i] = pid
+            cost  = piece_cost_lut[pid]
+            tv    = piece_time_lut[pid]
+            inc   = piece_income_lut[pid]
+            area  = piece_area_lut[pid]
+            n_or  = orient_count_lut[pid]
+            shop_feats[i, 0] = i / denom_sh
+            shop_feats[i, 1] = math.log1p(cost if cost < 20 else 20) / log1p_20
+            shop_feats[i, 2] = (tv if tv < 6 else 6) / 6.0
+            shop_feats[i, 3] = (inc if inc < 3 else 3) / 3.0
+            shop_feats[i, 4] = (area if area < 9 else 9) / 9.0
+            shop_feats[i, 5] = n_or / 8.0
+            shop_feats[i, 6] = 1.0 if c_buttons >= cost else 0.0
+            shop_feats[i, 7] = 1.0 if o_buttons >= cost else 0.0
+            # shop_feats[i, 8] and [i, 9]: num_legal placements, computed on-GPU
 
 
 def _dist_to_next_income(pos: int) -> int:
@@ -400,6 +642,33 @@ class GoldV2StateEncoder:
             n_o = int(ORIENT_COUNT[pid_int])
             self._piece_income[pid_int] = max(int(ORIENT_INCOME[pid_int, o]) for o in range(n_o))
 
+        # ---- Numba JIT LUTs: 1-D numpy arrays indexed by piece_id ----
+        # Replaces per-call dict lookups with O(1) array indexing inside the JIT function.
+        _all_pids = sorted(int(pid) for pid in PIECE_BY_ID)
+        _max_pid = _all_pids[-1] + 1 if _all_pids else 0
+        self._piece_cost_lut   = np.zeros(_max_pid, dtype=np.int32)
+        self._piece_time_lut   = np.zeros(_max_pid, dtype=np.int32)
+        self._piece_income_lut = np.zeros(_max_pid, dtype=np.int32)
+        self._piece_area_lut   = np.zeros(_max_pid, dtype=np.int32)
+        self._orient_count_lut = np.zeros(_max_pid, dtype=np.int32)
+        for pid_int in _all_pids:
+            self._piece_cost_lut[pid_int]   = int(PIECE_COST_BUTTONS[pid_int])
+            self._piece_time_lut[pid_int]   = int(PIECE_COST_TIME[pid_int])
+            self._piece_income_lut[pid_int] = self._piece_income.get(pid_int, 0)
+            self._piece_area_lut[pid_int]   = self._piece_area.get(pid_int, 0)
+            self._orient_count_lut[pid_int] = int(ORIENT_COUNT[pid_int])
+
+        # int64 copies of track marker / bitmask arrays for Numba bitwise ops
+        self._buttons_after_i64 = BUTTONS_AFTER.astype(np.int64)
+        self._patches_after_i64 = PATCHES_AFTER.astype(np.int64)
+        self._seven_mask_w0_i64 = SEVEN_MASK_W0.astype(np.int64)
+        self._seven_mask_w1_i64 = SEVEN_MASK_W1.astype(np.int64)
+        self._seven_mask_w2_i64 = SEVEN_MASK_W2.astype(np.int64)
+
+        # Pre-allocated working buffers for JIT pre-extraction (avoids hot-path malloc)
+        self._buf_slot_pids = np.zeros(3, dtype=np.int32)
+        self._buf_shop_pids = np.zeros(NMAX, dtype=np.int32)
+
         # Pre-allocated instance buffers — reused across encode calls (no per-call malloc).
         # encode_state_multimodal writes here then returns copies; encode_into writes in-place.
         self._buf_spatial    = np.zeros((C_SPATIAL_ENC, 9, 9), dtype=np.float32)
@@ -456,25 +725,29 @@ class GoldV2StateEncoder:
         Caller must provide pre-allocated views (e.g. from WorkerSharedBuffer).
         """
         if int(to_move) == 0:
-            c_pos = int(state[P0_POS])
+            c_pos     = int(state[P0_POS])
             c_buttons = int(state[P0_BUTTONS])
-            c_income = int(state[P0_INCOME])
+            c_income  = int(state[P0_INCOME])
             c_occ0, c_occ1, c_occ2 = int(state[P0_OCC0]), int(state[P0_OCC1]), int(state[P0_OCC2])
-            o_pos = int(state[P1_POS])
+            o_pos     = int(state[P1_POS])
             o_buttons = int(state[P1_BUTTONS])
-            o_income = int(state[P1_INCOME])
+            o_income  = int(state[P1_INCOME])
             o_occ0, o_occ1, o_occ2 = int(state[P1_OCC0]), int(state[P1_OCC1]), int(state[P1_OCC2])
         else:
-            c_pos = int(state[P1_POS])
+            c_pos     = int(state[P1_POS])
             c_buttons = int(state[P1_BUTTONS])
-            c_income = int(state[P1_INCOME])
+            c_income  = int(state[P1_INCOME])
             c_occ0, c_occ1, c_occ2 = int(state[P1_OCC0]), int(state[P1_OCC1]), int(state[P1_OCC2])
-            o_pos = int(state[P0_POS])
+            o_pos     = int(state[P0_POS])
             o_buttons = int(state[P0_BUTTONS])
-            o_income = int(state[P0_INCOME])
+            o_income  = int(state[P0_INCOME])
             o_occ0, o_occ1, o_occ2 = int(state[P0_OCC0]), int(state[P0_OCC1]), int(state[P0_OCC2])
 
-        ed = int(state[EDITION_CODE]) if state.shape[0] > EDITION_CODE else 0
+        n_circle   = int(state[CIRCLE_LEN])
+        neutral    = int(state[NEUTRAL])
+        bonus_own  = int(state[BONUS_OWNER])
+        pending    = int(state[PENDING_PATCHES])
+        tie_player = int(state[TIE_PLAYER])
 
         # Zero buffers (SHM may contain stale data)
         x_spatial.fill(0.0)
@@ -483,7 +756,7 @@ class GoldV2StateEncoder:
         shop_ids.fill(-1)
         shop_feats.fill(0.0)
 
-        # ---- out_s (C_SPATIAL_ENC, 9, 9) — channels 0-31 only ----
+        # ---- ch 0-7: numpy spatial planes (vectorised — keep as numpy) ----
         x_spatial[0] = StateEncoder._decode_occ_words(c_occ0, c_occ1, c_occ2)
         x_spatial[1] = StateEncoder._decode_occ_words(o_occ0, o_occ1, o_occ2)
         x_spatial[2] = self._coord_row
@@ -493,7 +766,7 @@ class GoldV2StateEncoder:
         x_spatial[6] = _valid_7x7_empty(c_occ0, c_occ1, c_occ2)
         x_spatial[7] = _valid_7x7_empty(o_occ0, o_occ1, o_occ2)
 
-        # Shape planes 8-31 (piece shapes for 3 visible slots x 8 orientations).
+        # ---- ch 8-31: slot×orient shape masks (dict lookup + numpy copy) ----
         # legalTL is NOT stored here — DeterministicLegalityModule computes it on-GPU.
         for slot in range(3):
             pid = get_slot_piece_id(state, slot)
@@ -503,137 +776,33 @@ class GoldV2StateEncoder:
                 if pid is not None and o < n_orient:
                     mask = self._slot_orient_shape_masks.get((pid, o))
                     if mask is not None:
-                        x_spatial[ch_shape] = mask   # numpy assignment copies — no intermediate alloc
+                        x_spatial[ch_shape] = mask  # numpy copy — no intermediate alloc
 
-        # ---- out_g (F_GLOBAL,) ----
-        denom_pos = float(TRACK_LEN)
-        x_global[0] = c_pos / denom_pos
-        x_global[1] = o_pos / denom_pos
-        x_global[2] = (c_pos - o_pos) / denom_pos
-        x_global[3] = math.log1p(min(c_buttons, 200)) / _LOG1P_200
-        x_global[4] = math.log1p(min(o_buttons, 200)) / _LOG1P_200
-        btn_diff = c_buttons - o_buttons
-        x_global[5] = math.tanh(btn_diff / 40.0)
-        x_global[6] = math.tanh(min(c_income, 15) / 15.0)
-        x_global[7] = math.tanh(min(o_income, 15) / 15.0)
-        x_global[8] = math.tanh((c_income - o_income) / 10.0)
-        cur_filled = int(c_occ0).bit_count() + int(c_occ1).bit_count() + int(c_occ2).bit_count()
-        opp_filled = int(o_occ0).bit_count() + int(o_occ1).bit_count() + int(o_occ2).bit_count()
-        x_global[9] = cur_filled / 81.0
-        x_global[10] = opp_filled / 81.0
-        bonus_owner = int(state[BONUS_OWNER])
-        if bonus_owner == -1:
-            x_global[11] = 0.0
-        elif bonus_owner == int(to_move):
-            x_global[11] = 1.0
-        else:
-            x_global[11] = 0.5
-        best7_missing = 49
-        for k in range(9):
-            m0, m1, m2 = int(SEVEN_MASK_W0[k]), int(SEVEN_MASK_W1[k]), int(SEVEN_MASK_W2[k])
-            if (c_occ0 & m0) == m0 and (c_occ1 & m1) == m1 and (c_occ2 & m2) == m2:
-                best7_missing = 0
-                break
-            filled_in = (int(c_occ0 & m0).bit_count() + int(c_occ1 & m1).bit_count() + int(c_occ2 & m2).bit_count())
-            best7_missing = min(best7_missing, 49 - filled_in)
-        x_global[12] = min(best7_missing, 49) / 49.0
-        best7_missing_opp = 49
-        for k in range(9):
-            m0, m1, m2 = int(SEVEN_MASK_W0[k]), int(SEVEN_MASK_W1[k]), int(SEVEN_MASK_W2[k])
-            if (o_occ0 & m0) == m0 and (o_occ1 & m1) == m1 and (o_occ2 & m2) == m2:
-                best7_missing_opp = 0
-                break
-            filled_in = (int(o_occ0 & m0).bit_count() + int(o_occ1 & m1).bit_count() + int(o_occ2 & m2).bit_count())
-            best7_missing_opp = min(best7_missing_opp, 49 - filled_in)
-        x_global[13] = min(best7_missing_opp, 49) / 49.0
-        pending = int(state[PENDING_PATCHES])
-        x_global[14] = min(pending, 5) / 5.0
-        n_circle = int(state[CIRCLE_LEN])
-        remaining_on_track = sum(1 for m in PATCHES_AFTER.tolist() if int(o_pos) < int(m)) if n_circle > 0 else 0
-        x_global[15] = min(remaining_on_track, 5) / 5.0
-        for i, m in enumerate(PATCHES_AFTER.tolist()):
-            x_global[16 + i] = 1.0 if int(o_pos) < int(m) else 0.0
-        tie_player = int(state[TIE_PLAYER])
-        x_global[21] = 1.0 if tie_player == int(to_move) else 0.0
-        pass_new_pos = _clamp_pos(o_pos + 1)
-        pass_steps = pass_new_pos - c_pos
-        pass_income = _button_marks_crossed(c_pos, pass_new_pos)
-        pass_patches = _patches_crossed(c_pos, pass_new_pos, o_pos, ed)
-        x_global[22] = pass_steps / denom_pos
-        x_global[23] = min(pass_income, 9) / 9.0
-        x_global[24] = min(pass_patches, 2) / 2.0
-        pass_btn_delta = pass_income * c_income
-        x_global[25] = math.tanh(pass_btn_delta / 30.0)
-        x_global[26] = pass_new_pos / denom_pos
-        x_global[27] = 1.0 if pass_new_pos == o_pos else 0.0
+        # ---- pre-extract slot / shop piece IDs for JIT (avoids dict inside JIT) ----
+        slot_pids = self._buf_slot_pids
         for s in range(3):
-            pid = get_slot_piece_id(state, s)
-            base = 28 + s * 11
-            if pid is None:
-                continue
-            cost = int(PIECE_COST_BUTTONS[pid])
-            time_val = int(PIECE_COST_TIME[pid])
-            income_gain = self._piece_income.get(pid, 0)
-            area = self._piece_area.get(pid, 0)
-            buy_new_pos = _clamp_pos(c_pos + time_val)
-            buy_income = _button_marks_crossed(c_pos, buy_new_pos)
-            buy_patches = _patches_crossed(c_pos, buy_new_pos, o_pos, ed)
-            income_buttons_gained = buy_income * c_income
-            btn_gained = -cost + income_buttons_gained
-            x_global[base] = 1.0 if c_buttons >= cost else 0.0
-            x_global[base + 1] = math.log1p(min(cost, 20)) / _LOG1P_20
-            x_global[base + 2] = min(time_val, 6) / 6.0
-            x_global[base + 3] = min(income_gain, 3) / 3.0
-            x_global[base + 4] = min(area, 9) / 9.0
-            x_global[base + 5] = min(buy_income, 9) / 9.0
-            x_global[base + 6] = math.tanh(income_buttons_gained / 80.0)
-            x_global[base + 7] = min(buy_patches, 2) / 2.0
-            x_global[base + 8] = math.tanh(btn_gained / 40.0)
-            x_global[base + 9] = buy_new_pos / denom_pos
-            x_global[base + 10] = 1.0 if buy_new_pos == o_pos else 0.0
+            p = get_slot_piece_id(state, s)
+            slot_pids[s] = p if p is not None else -1
 
-        # ---- out_t (C_TRACK, TRACK_LEN) ----
-        x_track[0, min(c_pos, TRACK_LEN - 1)] = 1.0
-        x_track[1, min(o_pos, TRACK_LEN - 1)] = 1.0
-        for m in BUTTONS_AFTER.tolist():
-            if m < TRACK_LEN:
-                x_track[2, m] = 1.0
-        for m in PATCHES_AFTER.tolist():
-            if int(o_pos) < int(m) and m < TRACK_LEN:
-                x_track[3, m] = 1.0
-        pass_land = _clamp_pos(o_pos + 1)
-        if pass_land < TRACK_LEN:
-            x_track[4, pass_land] = 1.0
-        for s in range(3):
-            pid = get_slot_piece_id(state, s)
-            if pid is not None:
-                time_val = int(PIECE_COST_TIME[pid])
-                land = _clamp_pos(c_pos + time_val)
-                if land < TRACK_LEN:
-                    x_track[5 + s, land] = 1.0
+        n_shop = min(n_circle, NMAX) if n_circle > 0 else 0
+        shop_pids = self._buf_shop_pids
+        for i in range(n_shop):
+            piece_idx = (neutral + 1 + i) % n_circle
+            shop_pids[i] = int(state[CIRCLE_START + piece_idx])
 
-        # ---- out_si, out_sf ----
-        n = int(state[CIRCLE_LEN])
-        if n > 0:
-            neutral = int(state[NEUTRAL])
-            for i in range(min(n, NMAX)):
-                piece_idx = (neutral + 1 + i) % n
-                pid = int(state[CIRCLE_START + piece_idx])
-                shop_ids[i] = pid
-                cost = int(PIECE_COST_BUTTONS[pid])
-                time_val = int(PIECE_COST_TIME[pid])
-                income = self._piece_income.get(pid, 0)
-                area = self._piece_area.get(pid, 0)
-                n_orients = int(ORIENT_COUNT[pid])
-                shop_feats[i, 0] = i / max(n - 1, 1)
-                shop_feats[i, 1] = math.log1p(min(cost, 20)) / _LOG1P_20
-                shop_feats[i, 2] = min(time_val, 6) / 6.0
-                shop_feats[i, 3] = min(income, 3) / 3.0
-                shop_feats[i, 4] = min(area, 9) / 9.0
-                shop_feats[i, 5] = n_orients / 8.0
-                shop_feats[i, 6] = 1.0 if c_buttons >= cost else 0.0
-                shop_feats[i, 7] = 1.0 if o_buttons >= cost else 0.0
-                # shop_feats[i, 8] and [i, 9] (num_legal cur/opp) computed on-GPU
+        # ---- x_global + x_track + shop_ids/feats: Numba JIT ----
+        _encode_scalars_shop_jit(
+            slot_pids, shop_pids, n_shop, n_circle,
+            c_pos, c_buttons, c_income, c_occ0, c_occ1, c_occ2,
+            o_pos, o_buttons, o_income, o_occ0, o_occ1, o_occ2,
+            bonus_own, pending, tie_player, int(to_move),
+            self._piece_cost_lut, self._piece_time_lut,
+            self._piece_income_lut, self._piece_area_lut, self._orient_count_lut,
+            self._buttons_after_i64, self._patches_after_i64,
+            self._seven_mask_w0_i64, self._seven_mask_w1_i64, self._seven_mask_w2_i64,
+            x_global, x_track, shop_ids, shop_feats,
+            TRACK_LENGTH, TRACK_LEN, _LOG1P_200, _LOG1P_20,
+        )
 
 
 # Module-level singleton encoder — avoids recreating the encoder (and

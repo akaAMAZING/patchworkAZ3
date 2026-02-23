@@ -17,11 +17,6 @@ KataGo features:
   to increase data diversity without increasing compute budget.
   (see: KataGo paper, Section 3.5 "Playout Cap Randomization")
 
-FIX CHANGELOG:
-- [S4] Seed MCTS noise RNG per game for diverse exploration across workers
-- [Diff Applied] Updated augmentation to track 3 slot IDs for correct flip remapping
-- [v3] Threaded NPZ shard writes for non-blocking I/O
-- [v3] Playout cap randomization (KataGo-style)
 """
 
 import logging

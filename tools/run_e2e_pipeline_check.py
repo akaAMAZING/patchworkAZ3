@@ -207,8 +207,8 @@ def check_2_encoder_invariants(config: dict) -> Dict:
                         source="src/network/encoder.py",
                     )
 
-        # Planes 4-55: frontier, valid_7x7, slot×orient shape (8-31), slot×orient legal (32-55)
-        for ch in range(4, C_SPATIAL):
+        # Planes 4-31: frontier, valid_7x7, slot×orient shape (8-31)
+        for ch in range(4, C_SPATIAL_ENC):
             plane = enc[ch]
             if plane.shape != (9, 9):
                 raise E2ECheckError(

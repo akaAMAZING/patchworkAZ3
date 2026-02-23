@@ -52,13 +52,13 @@ def _dummy_gold_v2_batch(B: int, device: torch.device) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Step A: Encoder correctness (56ch gold_v2)
+# Step A: Encoder correctness (32ch gold_v2)
 # ---------------------------------------------------------------------------
 def step_a_encoder_correctness(config: dict) -> float:
-    """Validate gold_v2 encoder: 56ch spatial, multimodal shapes, flip invariance."""
+    """Validate gold_v2 encoder: 32ch spatial, multimodal shapes, flip invariance."""
     from src.game.patchwork_engine import new_game
     from src.network.encoder import GoldV2StateEncoder, ActionEncoder, get_slot_piece_id
-    from src.network.gold_v2_constants import C_SPATIAL, F_GLOBAL, C_TRACK, TRACK_LEN, NMAX, F_SHOP
+    from src.network.gold_v2_constants import C_SPATIAL_ENC, F_GLOBAL, C_TRACK, TRACK_LEN, NMAX, F_SHOP
 
     t0 = time.perf_counter()
     encoder = GoldV2StateEncoder()
@@ -68,15 +68,15 @@ def step_a_encoder_correctness(config: dict) -> float:
     x_spatial0, x_global0, x_track0, shop_ids0, shop_feats0 = encoder.encode_state_multimodal(state, 0)
     x_spatial1, x_global1, x_track1, shop_ids1, shop_feats1 = encoder.encode_state_multimodal(state, 1)
 
-    # Assert 56ch gold_v2 shapes
-    assert x_spatial0.shape == (C_SPATIAL, 9, 9), f"Expected ({C_SPATIAL},9,9), got {x_spatial0.shape}"
+    # Assert 32ch gold_v2 shapes
+    assert x_spatial0.shape == (C_SPATIAL_ENC, 9, 9), f"Expected ({C_SPATIAL_ENC},9,9), got {x_spatial0.shape}"
     assert x_spatial0.dtype == np.float32, f"Expected float32, got {x_spatial0.dtype}"
     assert x_global0.shape == (F_GLOBAL,), f"Expected ({F_GLOBAL},), got {x_global0.shape}"
     assert x_track0.shape == (C_TRACK, TRACK_LEN), f"Expected ({C_TRACK},{TRACK_LEN}), got {x_track0.shape}"
     assert shop_ids0.shape == (NMAX,), f"Expected ({NMAX},), got {shop_ids0.shape}"
     assert shop_feats0.shape == (NMAX, F_SHOP), f"Expected ({NMAX},{F_SHOP}), got {shop_feats0.shape}"
 
-    # Flip invariance on spatial (slots 8-55)
+    # Flip invariance on spatial (slots 8-31)
     slot_piece_ids = [get_slot_piece_id(state, i) for i in range(3)]
     policy = np.zeros(2026, dtype=np.float32)
     policy[0] = 1.0
@@ -353,9 +353,9 @@ def step_e_selfplay_hdf5_dataset(config: dict, device: torch.device, tmp_dir: Pa
         states_np = np.array(states)
     masks_np = action_masks.numpy() if hasattr(action_masks, "numpy") else np.array(action_masks)
 
-    from src.network.gold_v2_constants import C_SPATIAL
+    from src.network.gold_v2_constants import C_SPATIAL_ENC
     assert states_np.dtype == np.float32, f"states dtype must be float32, got {states_np.dtype}"
-    assert states_np.shape[1:] == (C_SPATIAL, 9, 9), f"states shape (B,{C_SPATIAL},9,9), got {states_np.shape}"
+    assert states_np.shape[1:] == (C_SPATIAL_ENC, 9, 9), f"states shape (B,{C_SPATIAL_ENC},9,9), got {states_np.shape}"
     assert masks_np.shape[-1] == 2026, f"action_masks shape (B,2026), got {masks_np.shape}"
     assert (masks_np.sum(axis=-1) >= 1).all(), "Every sample must have >=1 legal action"
 

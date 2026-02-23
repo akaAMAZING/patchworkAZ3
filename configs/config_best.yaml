@@ -74,8 +74,8 @@ training:
   ownership_loss_weight: 0.15
   epochs_per_iteration: 2
   val_split: 0.08
-  val_frequency: 200
-  profile_training_steps: 5   # Uncomment to log per-step timings for bottleneck diagnosis
+  val_frequency: 1000
+  # profile_training_steps: 5   # Uncomment to log per-step timings for bottleneck diagnosis
   checkpoint_frequency: 10000
   keep_last_n_checkpoints: 200
   save_best: false
@@ -101,7 +101,7 @@ selfplay:
   api_retry_attempts: 3
   num_workers: 16  # 32ch spatial; async shard write enabled (bounded queue)
   max_game_length: 200
-  games_per_iteration: 120  # Min 300k: 8×40.5k≈324k raw → subsample to 300k
+  games_per_iteration: 900  # Fallback only; overridden by iteration.games_schedule at every iter
   store_canonical_only: true   # 1 state/move; D4 applied at train time (dynamic)
   augmentation: d4  # none | flip | d4 (default flip preserves current behavior)
   mcts:
@@ -122,17 +122,17 @@ selfplay:
     fast_probability: 0.00
   bootstrap:
     use_pure_mcts: true
-    mcts_simulations: 1
+    mcts_simulations: 192
     games: 900
   stream_to_disk: true
   hdf5_compression: lzf
   hdf5_compression_level: 0
   write_buffer_positions: 8192
   policy_target_mode: visits         # visits = N/sum(N); visits_temperature_shaped = legacy T-shaped
-  q_value_weight: 0.13               # Base; iteration.q_value_weight_schedule overrides
+  q_value_weight: 0.25               # Base; iteration.q_value_weight_schedule overrides
 
 replay_buffer:
-  max_size: 320000   # 32ch ~23KB/pos => 7.5GB loaded (was 300k/9GB at 56ch). 320k gives headroom for window schedule peaks (iter200: 302k, iter400: 302k)
+  max_size: 300000   # 32ch ~23KB/pos => 7.5GB loaded (was 300k/9GB at 56ch). 320k gives headroom for window schedule peaks (iter200: 302k, iter400: 302k)
   min_size: 4000
   window_iterations: 8
   newest_fraction: 0.25
@@ -196,7 +196,7 @@ paths:
   run_id: patchwork_production
 
 iteration:
-  max_iterations: 400
+  max_iterations: 500
   auto_resume: true
 
   # GLOBAL LR SCHEDULE — decays peak LR across iterations (AlphaZero-style)
@@ -242,11 +242,11 @@ iteration:
   - iteration: 50
     alpha: 0.08
   - iteration: 100
-    alpha: 0.05
+    alpha: 0.06      # floor: stay exploratory through mid-training
   - iteration: 200
-    alpha: 0.03
+    alpha: 0.04
   - iteration: 300
-    alpha: 0.015
+    alpha: 0.03      # floor: never go below 0.03
 
   # Shifted up to prevent value overfitting (ML review)
   q_value_weight_schedule:
@@ -277,13 +277,13 @@ iteration:
   - iteration: 80
     weight: 0.22
   - iteration: 100
-    weight: 0.18 
+    weight: 0.18
   - iteration: 140
-    weight: 0.12
+    weight: 0.18     # hold floor — keep exploration through mid-training
   - iteration: 200
-    weight: 0.08
+    weight: 0.14
   - iteration: 300
-    weight: 0.05
+    weight: 0.10     # floor: never go below 0.10
 
   games_schedule:
   - iteration: 0

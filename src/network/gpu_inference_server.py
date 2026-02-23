@@ -109,7 +109,6 @@ class GPUInferenceServer:
             _GV2_ENC if getattr(self.model, "use_film", False) else "full_clarity_v1"
         )
         logger.info("GPU server expects encoding_version=%s", self._expected_encoding)
-        self._batch_sizes: List[int] = []
 
         # Open per-worker shared memory buffers (zero-copy IPC path).
         # Workers write encoded state into SHM; server reads via numpy views.
@@ -371,15 +370,6 @@ class GPUInferenceServer:
                 policy_probs_cpu = policy_probs.detach().cpu()
                 value_cpu = value.detach().cpu()
                 score_cpu = score.detach().cpu()
-
-                self._batch_sizes.append(len(parsed))
-                if len(self._batch_sizes) >= 500:
-                    arr = np.array(self._batch_sizes[-500:])
-                    logger.info(
-                        "GPU server batch sizes (last 500): min=%d avg=%.1f max=%d",
-                        int(arr.min()), float(arr.mean()), int(arr.max()),
-                    )
-                    self._batch_sizes.clear()
 
                 for i, rid in enumerate(rids):
                     wid = max(0, min(wids[i], len(resp_qs) - 1)) if isinstance(resp_qs, (list, tuple)) else 0

@@ -228,8 +228,17 @@ class ReplayBuffer:
         # Atomic write: write to .tmp then replace
         tmp_path = merged_path.with_suffix(merged_path.suffix + ".tmp")
 
-        expected_channels = int(self.config.get("network", {}).get("input_channels", 56))
-        is_multimodal = expected_channels == 56
+        data_cfg = self.config.get("data", {}) or {}
+        # data.expected_spatial_channels is the channel count actually stored on disk.
+        # network.input_channels is the model trunk input (may differ: e.g. gold_v2_32ch
+        # stores 32ch but the trunk sees 56ch after DeterministicLegalityModule).
+        _stored_ch = data_cfg.get("expected_spatial_channels")
+        expected_channels = int(_stored_ch) if _stored_ch is not None else int(
+            (self.config.get("network", {}) or {}).get("input_channels", 56)
+        )
+        # is_multimodal: True for any gold_v2 encoding (has spatial/global/track/shop arrays)
+        _enc_ver = data_cfg.get("encoding_version", "")
+        is_multimodal = _enc_ver.startswith("gold_v2") or expected_channels == 56
         state_shape = (expected_channels, 9, 9)
         mask_shape = (2026,)
         pol_shape = (2026,)
