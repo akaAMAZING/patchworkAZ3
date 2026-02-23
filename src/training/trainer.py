@@ -523,12 +523,17 @@ class Trainer:
             for k in self.ema_state_dict:
                 if k in sd and sd[k].is_floating_point():
                     self._ema_pairs.append((self.ema_state_dict[k], sd[k]))
+            # Pre-split into flat lists for _foreach_lerp_ (avoids per-step tuple unpacking)
+            self._ema_tensors: List[torch.Tensor] = [p[0] for p in self._ema_pairs]
+            self._param_tensors: List[torch.Tensor] = [p[1] for p in self._ema_pairs]
             logger.info(
                 "[EMA] enabled decay=%.4f use_for_selfplay=%s use_for_eval=%s (%d params)",
                 self.ema_decay, self.ema_use_for_selfplay, self.ema_use_for_eval, len(self._ema_pairs),
             )
         else:
             logger.debug("[EMA] disabled")
+            self._ema_tensors: List[torch.Tensor] = []
+            self._param_tensors: List[torch.Tensor] = []
 
         # Resume optimizer/scheduler/scaler from checkpoint (only when enabled)
         resume_opt = bool(train_config.get("resume_optimizer_state", False))
@@ -851,12 +856,14 @@ class Trainer:
                 self.optimizer.step()
             _t4 = time.perf_counter() if _t0 is not None else None
 
-            # EMA update: cached pairs + single lerp_ per param (was mul_+add_ = 2 kernels)
-            if self.ema_enabled and self._ema_pairs and not step_skipped:
+            # EMA update: single fused _foreach_lerp_ call instead of 290 individual kernel launches.
+            # 290 separate lerp_() calls saturate the CUDA kernel queue (backpressure from optimizer
+            # step already queuing ~870 kernels), causing the CPU to block for 130-180ms waiting for
+            # queue capacity. _foreach fuses all 290 updates into 1-2 kernels → ~5ms.
+            if self.ema_enabled and self._ema_tensors and not step_skipped:
                 alpha = 1.0 - self.ema_decay
                 with torch.no_grad():
-                    for ema_t, param_t in self._ema_pairs:
-                        ema_t.lerp_(param_t.detach(), alpha)
+                    torch._foreach_lerp_(self._ema_tensors, self._param_tensors, alpha)
             _t5 = time.perf_counter() if _t0 is not None else None
 
             if not step_skipped:
