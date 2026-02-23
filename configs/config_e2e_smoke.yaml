@@ -1,0 +1,117 @@
+# E2E Pipeline Smoke Test — Fast but Deep Validation
+# 56ch gold_v2_multimodal (matches production); shrunk for speed.
+#
+# USAGE: python -m tools.run_e2e_pipeline_check --config configs/config_e2e_smoke.yaml
+
+seed: 42
+deterministic: true
+
+hardware:
+  device: cpu
+  pin_memory: false
+  persistent_workers: false
+
+data:
+  allow_legacy_state_channels: false
+  encoding_version: gold_v2_multimodal
+  expected_spatial_channels: 56
+  expected_global_dim: 61
+  expected_track_shape: [8, 54]
+  expected_shop_shapes: [33, 10]
+
+network:
+  input_channels: 56
+  num_res_blocks: 4
+  channels: 64
+  policy_channels: 24
+  policy_hidden: 128
+  use_factorized_policy_head: true
+  value_channels: 24
+  value_hidden: 128
+  max_actions: 2026
+  dropout: 0.0
+  weight_decay: 0.0002
+  use_batch_norm: true
+  se_ratio: 0.0625
+  ownership_channels: 24
+  use_film: true
+  film_hidden: 128
+  film_global_dim: 61
+  film_track_dim: 432
+  film_shop_dim: 128
+  film_per_block: true
+
+training:
+  optimizer: adamw
+  learning_rate: 0.001
+  lr_schedule: cosine_warmup
+  warmup_steps: 10
+  min_lr: 0.0001
+  batch_size: 128
+  d4_augmentation: dynamic
+  use_amp: false
+  policy_loss_weight: 1.0
+  value_loss_weight: 1.0
+  ownership_loss_weight: 0.1
+  epochs_per_iteration: 3
+  val_split: 0.1
+  val_frequency: 10
+  checkpoint_frequency: 99999
+  num_data_workers: 0
+  prefetch_factor: 2
+  max_grad_norm: 1.0
+
+selfplay:
+  num_workers: 2
+  max_game_length: 100
+  games_per_iteration: 8
+  store_canonical_only: true
+  augmentation: d4
+  mcts:
+    simulations: 32
+    parallel_leaves: 8
+    cpuct: 1.5
+    temperature: 1.0
+    temperature_threshold: 15
+    root_dirichlet_alpha: 0.08
+    root_noise_weight: 0.25
+    virtual_loss: 1.0
+    num_threads: 1
+    fpu_reduction: 0.25
+  bootstrap:
+    use_pure_mcts: true
+    mcts_simulations: 32
+    games: 8
+  stream_to_disk: true
+  hdf5_compression: lzf
+  q_value_weight: 0.0
+
+replay_buffer:
+  max_size: 20000
+  min_size: 100
+  window_iterations: 2
+  newest_fraction: 0.5
+  prioritized: false
+  storage_format: hdf5
+  compression: lzf
+
+evaluation:
+  lock_eval_cpuct_to_selfplay: true
+  games_vs_best: 0
+  games_vs_pure_mcts: 0
+  paired_eval: true
+  eval_baselines:
+  - type: pure_mcts
+    simulations: 16
+  eval_mcts:
+    simulations: 16
+    temperature: 0.0
+    cpuct: 1.5
+paths:
+  checkpoints_dir: artifacts/e2e_check/checkpoints
+  logs_dir: artifacts/e2e_check/logs
+  run_root: artifacts/e2e_check/runs
+  run_id: e2e_smoke
+
+iteration:
+  max_iterations: 1

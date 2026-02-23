@@ -1,0 +1,1004 @@
+"""
+Patchwork AlphaZero Neural Network Architecture
+
+Input:  14 channels Ã— 9Ã—9 board
+Policy: 2026 action logits
+Value:  scalar in [-1, 1]
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
+
+
+DEFAULT_INPUT_CHANNELS = 14
+DEFAULT_MAX_ACTIONS = 2026
+
+# ---------------------------------------------------------------------------
+# Fixed-weight piece mask construction (called once at model init)
+# ---------------------------------------------------------------------------
+
+def _build_piece_masks_5x5() -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build (N_PIECES, MAX_ORIENTS, 5, 5) float32 piece masks for all orientations.
+
+    Uses MASK_W0/W1/W2 from the engine (already computed at engine import).
+    Invalid orientations (orient >= ORIENT_COUNT[pid]) stay all-zeros (area=0),
+    so the legality check never marks them as legal.
+
+    Returns:
+        masks : (N_PIECES, MAX_ORIENTS, 5, 5) float32
+        areas : (N_PIECES, MAX_ORIENTS) float32 -- filled-cell count per (pid, orient)
+    """
+    from src.game.patchwork_engine import N_PIECES, MAX_ORIENTS, ORIENT_COUNT, MASK_W0, MASK_W1
+
+    masks = np.zeros((N_PIECES, MAX_ORIENTS, 5, 5), dtype=np.float32)
+
+    for pid in range(N_PIECES):
+        n_orient = int(ORIENT_COUNT[pid])
+        for o in range(n_orient):
+            # Mask at TL = board position 0 = (row 0, col 0)
+            m0 = int(MASK_W0[pid, o, 0])
+            m1 = int(MASK_W1[pid, o, 0])
+            # All Patchwork pieces fit within a 5x5 bounding box.
+            # Board positions: row in [0,4], col in [0,4] -> flat index in [0,40].
+            # Word 0 covers flat indices 0-31, word 1 covers 32-63.
+            for board_idx in range(41):
+                r, c = board_idx // 9, board_idx % 9
+                if r >= 5 or c >= 5:
+                    continue
+                word = board_idx >> 5
+                bit = board_idx & 31
+                if word == 0 and (m0 >> bit) & 1:
+                    masks[pid, o, r, c] = 1.0
+                elif word == 1 and (m1 >> bit) & 1:
+                    masks[pid, o, r, c] = 1.0
+
+    areas = masks.sum(axis=(-1, -2))  # (N_PIECES, MAX_ORIENTS) float32
+    return masks, areas
+
+
+# ---------------------------------------------------------------------------
+# DeterministicLegalityModule
+# ---------------------------------------------------------------------------
+
+class DeterministicLegalityModule(nn.Module):
+    """
+    Non-trainable GPU module: computes placement legality maps for ALL pieces
+    x orientations via a single fixed-weight F.conv2d call.
+
+    Replaces:
+      * 24x CPU legalTL plane loops in GoldV2StateEncoder  (channels 32-55)
+      * 33x _count_legal_placements_clip20() calls for shop features 8-9
+
+    Conv math (cross-correlation with padding=4):
+        Input  (B, 1, 9, 9) + padding 4  -> padded (B, 1, 17, 17)
+        Filter (264, 1, 5, 5)
+        Output (B, 264, 13, 13)   [because (9 + 2*4 - 5 + 1) = 13]
+        Crop output[:, :, 4:13, 4:13] -> (B, 264, 9, 9)
+        output[b, n, r, c] = number of free cells under piece n at TL (r, c)
+        legal[b, n, r, c]  = 1 iff output[b,n,r,c] == piece_area[n]
+
+    Throughput on RTX 3080: ~0.1 ms/batch vs O(33 * 648) Python iters per leaf.
+    """
+
+    def __init__(self, piece_masks: np.ndarray, piece_areas: np.ndarray) -> None:
+        super().__init__()
+        N_P, N_O, H, W = piece_masks.shape
+        self.N_PIECES = N_P
+        self.N_ORIENTS = N_O
+        self.N_FILTERS = N_P * N_O  # 264 = 33 pieces * 8 orientations
+
+        filters = torch.from_numpy(
+            piece_masks.reshape(N_P * N_O, 1, H, W).copy()
+        ).float()
+        areas_flat = torch.from_numpy(
+            piece_areas.reshape(N_P * N_O).copy()
+        ).float()
+
+        self.register_buffer("filters", filters)      # (264, 1, 5, 5) -- non-trainable
+        self.register_buffer("areas", areas_flat)     # (264,)
+        valid = (areas_flat > 0.5).float()
+        self.register_buffer("valid_orient", valid)   # (264,)
+
+    def parameters(self, recurse: bool = True):
+        return iter([])  # zero trainable parameters
+
+    def forward(self, board_free: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            board_free : (B, 1, 9, 9) float32  -- 1 = empty, 0 = occupied
+        Returns:
+            legal : (B, 264, 9, 9) float32  -- 1 = legal TL placement
+        """
+        # Float32 ensures exact integer arithmetic for the equality check.
+        corr = F.conv2d(board_free.float(), self.filters.float(), padding=4)
+        corr = corr[:, :, 4:13, 4:13]  # crop to (B, 264, 9, 9)
+
+        areas = self.areas.view(1, -1, 1, 1)
+        valid = self.valid_orient.view(1, -1, 1, 1)
+        # Tolerance 0.5: values are always exact integers, but guard against
+        # any residual float imprecision.
+        return (corr >= areas - 0.5).float() * valid
+
+    def extract_vis_legalTL(
+        self,
+        legal: torch.Tensor,          # (B, 264, 9, 9)
+        vis_piece_ids: torch.Tensor,   # (B, 3) int64 -- piece IDs for 3 visible slots
+        affordability: torch.Tensor,   # (B, 3) float -- 1 if affordable
+    ) -> torch.Tensor:
+        """
+        Extract and return 24-channel legalTL planes (3 slots x 8 orientations),
+        masked by affordability.  Replaces encoder channels 32-55.
+
+        Returns: (B, 24, 9, 9)
+        """
+        B = legal.shape[0]
+        N_O = self.N_ORIENTS
+
+        valid = (vis_piece_ids >= 0).float()
+        safe_ids = vis_piece_ids.clamp(min=0)
+
+        orient_offsets = torch.arange(N_O, device=legal.device, dtype=torch.long)
+        gather_idxs = (safe_ids.unsqueeze(-1) * N_O + orient_offsets).reshape(B, 24)
+
+        b_idx = torch.arange(B, device=legal.device).unsqueeze(1).expand(B, 24)
+        legalTL = legal[b_idx, gather_idxs]  # (B, 24, 9, 9)
+
+        # Expand (B,3) -> (B,24): each slot covers 8 consecutive orient planes
+        valid_24 = valid.unsqueeze(-1).expand(B, 3, N_O).reshape(B, 24, 1, 1)
+        afford_24 = affordability.unsqueeze(-1).expand(B, 3, N_O).reshape(B, 24, 1, 1)
+        return legalTL * valid_24 * afford_24
+
+    def compute_num_legal_normalized(
+        self,
+        legal: torch.Tensor,    # (B, 264, 9, 9)
+        shop_ids: torch.Tensor,  # (B, NMAX) int64 -- piece IDs, -1 = empty
+    ) -> torch.Tensor:
+        """
+        Count total legal positions per shop piece across all orientations,
+        normalize to [0,1] by clamping at 20.
+
+        Returns: (B, NMAX) float
+        """
+        B = legal.shape[0]
+        NMAX = shop_ids.shape[1]
+        N_O = self.N_ORIENTS
+
+        valid = (shop_ids >= 0).float()
+        safe_ids = shop_ids.clamp(min=0)
+
+        orient_offsets = torch.arange(N_O, device=legal.device, dtype=torch.long)
+        gather_idxs = (safe_ids.unsqueeze(-1) * N_O + orient_offsets).reshape(B, NMAX * N_O)
+
+        b_idx = torch.arange(B, device=legal.device).unsqueeze(1).expand(B, NMAX * N_O)
+        gathered = legal[b_idx, gather_idxs].reshape(B, NMAX, N_O, 9, 9)
+        num_legal = gathered.sum(dim=(-1, -2, -3)) * valid
+        return (num_legal.clamp(max=20.0) / 20.0)
+
+
+class SqueezeExcitation(nn.Module):
+    """Squeeze-and-Excitation block."""
+
+    def __init__(self, channels: int, se_ratio: float = 0.0625):
+        super().__init__()
+        # se_ratio determines the reduction: reduced = channels * se_ratio
+        reduced = max(int(channels * se_ratio), 1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, reduced, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(reduced, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        squeeze = x.mean(dim=(2, 3))
+        excitation = self.fc(squeeze).view(b, c, 1, 1)
+        return x * excitation
+
+
+class ResidualBlock(nn.Module):
+    """Residual block with optional SE attention."""
+
+    def __init__(self, channels: int, use_batch_norm: bool = True, se_ratio: float = 0.0):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=not use_batch_norm)
+        self.bn1 = nn.BatchNorm2d(channels) if use_batch_norm else nn.Identity()
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=not use_batch_norm)
+        self.bn2 = nn.BatchNorm2d(channels) if use_batch_norm else nn.Identity()
+        self.se = SqueezeExcitation(channels, se_ratio=se_ratio) if se_ratio > 0 else None
+
+    def forward(self, x: torch.Tensor, gamma: Optional[torch.Tensor] = None, beta: Optional[torch.Tensor] = None) -> torch.Tensor:
+        residual = x
+        out = self.bn1(self.conv1(x))
+        if gamma is not None and beta is not None:
+            out = out * (1 + gamma[:, :, None, None]) + beta[:, :, None, None]
+        out = F.relu(out, inplace=True)
+        out = self.bn2(self.conv2(out))
+        if self.se is not None:
+            out = self.se(out)
+        return F.relu(out + residual, inplace=True)
+
+
+# Structured action space constants (2026 indexing)
+PASS_INDEX = 0
+PATCH_START = 1
+BUY_START = 82
+NUM_SLOTS = 3
+NUM_ORIENTS = 8
+BOARD_SIZE = 9
+PATCH_SIZE = BOARD_SIZE * BOARD_SIZE  # 81
+BUY_SIZE = NUM_SLOTS * NUM_ORIENTS * PATCH_SIZE  # 1944
+
+
+class StructuredConvPolicyHead(nn.Module):
+    """Structured conv policy head with exact 2026 indexing (pass + patch map + buy maps).
+
+    Output order (exact):
+    - 0: pass
+    - 1..81: patch placement (pos=row*9+col, index=1+pos)
+    - 82..2025: buy (index=82 + (slot*8+orient)*81 + pos)
+    """
+
+    def __init__(self, input_channels: int, policy_hidden: int = 48, use_batch_norm: bool = True):
+        super().__init__()
+        self.p_conv = nn.Conv2d(input_channels, policy_hidden, 1, bias=not use_batch_norm)
+        self.p_bn = nn.BatchNorm2d(policy_hidden) if use_batch_norm else nn.Identity()
+        self.buy_conv = nn.Conv2d(policy_hidden, NUM_SLOTS * NUM_ORIENTS, 1)  # 24 channels
+        self.patch_conv = nn.Conv2d(policy_hidden, 1, 1)
+        self.pass_linear = nn.Linear(policy_hidden, 1)
+
+    def forward(self, x: torch.Tensor, return_maps: bool = False) -> torch.Tensor:
+        # x: (B, 128, 9, 9)
+        p = F.relu(self.p_bn(self.p_conv(x)), inplace=True)  # (B, 48, 9, 9)
+        buy_map = self.buy_conv(p)   # (B, 24, 9, 9)
+        patch_map = self.patch_conv(p)  # (B, 1, 9, 9)
+
+        # pass: global mean pool -> linear
+        p_mean = p.mean(dim=(2, 3))   # (B, 48)
+        pass_vec = self.pass_linear(p_mean)  # (B, 1)
+
+        # flatten row-major: (r,c) -> r*9+c
+        patch_vec = patch_map.flatten(start_dim=1)  # (B, 81)
+        buy_vec = buy_map.flatten(start_dim=1)      # (B, 1944)
+
+        logits = torch.cat([pass_vec, patch_vec, buy_vec], dim=1)  # (B, 2026)
+        if return_maps:
+            return logits, patch_map, buy_map
+        return logits
+
+
+class PolicyHead(nn.Module):
+    """Legacy policy head: single fc or factorized fc1+fc2.
+
+    use_factorized_policy_head=false => this head (legacy single fc).
+    use_factorized_policy_head=true => StructuredConvPolicyHead instead.
+    """
+
+    def __init__(
+        self,
+        input_channels: int,
+        policy_channels: int,
+        max_actions: int,
+        policy_hidden: int,
+        use_factorized: bool = False,
+        use_batch_norm: bool = True,
+    ):
+        super().__init__()
+        policy_in = policy_channels * 9 * 9
+        self.conv = nn.Conv2d(input_channels, policy_channels, 1, bias=not use_batch_norm)
+        self.bn = nn.BatchNorm2d(policy_channels) if use_batch_norm else nn.Identity()
+        self._use_factorized = use_factorized
+        if use_factorized:
+            self.fc1 = nn.Linear(policy_in, policy_hidden)
+            self.fc2 = nn.Linear(policy_hidden, max_actions)
+        else:
+            self.fc = nn.Linear(policy_in, max_actions)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.bn(self.conv(x)), inplace=True)
+        p = x.flatten(start_dim=1)
+        if self._use_factorized:
+            p = F.relu(self.fc1(p), inplace=True)
+            return self.fc2(p)
+        return self.fc(p)
+
+
+class ValueHead(nn.Module):
+    """Value head outputting scalar value in [-1, 1]. Optional score head outputs raw margin."""
+
+    def __init__(
+        self,
+        input_channels: int,
+        value_channels: int,
+        value_hidden: int,
+        use_batch_norm: bool = True,
+        with_score_head: bool = True,
+    ):
+        super().__init__()
+        self.conv = nn.Conv2d(input_channels, value_channels, 1, bias=not use_batch_norm)
+        self.bn = nn.BatchNorm2d(value_channels) if use_batch_norm else nn.Identity()
+        self.fc1 = nn.Linear(value_channels * 9 * 9, value_hidden)
+        self.fc2 = nn.Linear(value_hidden, 1)
+        # KataGo-style score head: unbounded raw scalar (Current Player Score - Opponent Score)
+        self.score_head = nn.Sequential(nn.Linear(value_hidden, 1)) if with_score_head else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+        x = F.relu(self.bn(self.conv(x)), inplace=True)
+        hidden = F.relu(self.fc1(x.flatten(start_dim=1)), inplace=True)
+        value = torch.tanh(self.fc2(hidden))
+        if self.score_head is not None:
+            score = self.score_head(hidden)  # raw scalar, no tanh
+            return value, score
+        return value
+
+
+class ShopEncoder(nn.Module):
+    """Encode shop (piece_ids + feats) into a pooled vector. Pad=-1 masked."""
+
+    def __init__(self, num_piece_ids: int = 34, feat_dim: int = 10, embed_dim: int = 32, out_dim: int = 128, n_layers: int = 2):
+        super().__init__()
+        self.embed = nn.Embedding(num_piece_ids + 1, embed_dim, padding_idx=0)
+        self.feat_proj = nn.Linear(feat_dim, embed_dim)
+        self.d_model = embed_dim * 2
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=4,
+            dim_feedforward=64,
+            dropout=0.1,
+            activation="relu",
+            batch_first=True,
+            norm_first=False,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.out_proj = nn.Linear(self.d_model, out_dim)
+
+    def forward(self, shop_ids: torch.Tensor, shop_feats: torch.Tensor) -> torch.Tensor:
+        """shop_ids: (B, N) int64, pad=-1. shop_feats: (B, N, F). Returns (B, out_dim)."""
+        ids = (shop_ids.clamp(min=-1).long() + 1)
+        emb = self.embed(ids)
+        feats = self.feat_proj(shop_feats)
+        combined = torch.cat([emb, feats], dim=-1)
+        pad_mask = (shop_ids == -1)
+        out = self.transformer(combined, src_key_padding_mask=pad_mask)
+        cnt = (~pad_mask).float().sum(dim=1, keepdim=True).clamp(min=1)
+        pooled = out.masked_fill(pad_mask.unsqueeze(-1), 0.0).sum(dim=1) / cnt
+        return self.out_proj(pooled)
+
+
+class OwnershipHead(nn.Module):
+    """Auxiliary ownership head predicting per-cell board occupancy at game end.
+
+    Patchwork has *separate* 9x9 boards per player (no shared territory), so
+    we predict two binary maps instead of a 3-class shared map:
+      Channel 0: P(current player's cell is filled at game end)
+      Channel 1: P(opponent's cell is filled at game end)
+
+    This gives 2 × 81 = 162 dense spatial training signals that help the
+    network learn spatial packing efficiency and dead-area recognition,
+    similar to KataGo's ownership prediction adapted for Patchwork's
+    dual-board structure.
+    """
+
+    def __init__(self, input_channels: int, ownership_channels: int, use_batch_norm: bool = True):
+        super().__init__()
+        self.conv = nn.Conv2d(input_channels, ownership_channels, 1, bias=not use_batch_norm)
+        self.bn = nn.BatchNorm2d(ownership_channels) if use_batch_norm else nn.Identity()
+        self.conv_out = nn.Conv2d(ownership_channels, 2, 1)  # 2 binary channels
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.bn(self.conv(x)), inplace=True)
+        return self.conv_out(x)  # (B, 2, 9, 9) logits
+
+
+class PatchworkNetwork(nn.Module):
+    """Complete AlphaZero network for Patchwork."""
+
+    def __init__(
+        self,
+        input_channels: int = DEFAULT_INPUT_CHANNELS,
+        num_res_blocks: int = 10,
+        channels: int = 128,
+        policy_channels: int = 32,
+        policy_hidden: int = 256,
+        use_factorized_policy_head: bool = True,
+        value_channels: int = 32,
+        value_hidden: int = 128,
+        max_actions: int = DEFAULT_MAX_ACTIONS,
+        use_batch_norm: bool = True,
+        se_ratio: float = 0.0,
+        dropout: float = 0.0,
+        ownership_channels: int = 0,
+        use_film: bool = False,
+        film_hidden: int = 256,
+        film_input_plane_indices: Optional[List[int]] = None,
+        film_use_plane_mean: bool = True,
+        film_per_block: bool = True,
+        film_global_dim: int = 0,
+        film_track_dim: int = 0,
+        film_shop_dim: int = 0,
+        use_gpu_legality: bool = True,
+    ):
+        super().__init__()
+        self.input_channels = input_channels
+        self.max_actions = max_actions
+        self.use_film = use_film
+        self.film_input_plane_indices = film_input_plane_indices or []
+        self.film_use_plane_mean = film_use_plane_mean
+        self.film_per_block = film_per_block
+        self.film_global_dim = film_global_dim
+        self.film_track_dim = film_track_dim
+        self.film_shop_dim = film_shop_dim
+        self.num_res_blocks = num_res_blocks
+        self.channels = channels
+
+        # GPU legality module: computes legalTL (channels 32-55) and num_legal
+        # (shop_feats[:,8:10]) on the GPU, replacing heavy CPU encoder loops.
+        # Encoder now outputs 32-ch states; _apply_gpu_legality auto-detects 32ch
+        # input (new data) and cats legalTL to produce the 56ch trunk input.
+        # Also works with legacy 56ch states (overwrites channels 32-55).
+        self.det_legality: Optional[DeterministicLegalityModule] = None
+        if use_gpu_legality and input_channels == 56:
+            try:
+                masks_np, areas_np = _build_piece_masks_5x5()
+                self.det_legality = DeterministicLegalityModule(masks_np, areas_np)
+                logger.info(
+                    "DeterministicLegalityModule initialised (%d filters, %dx%d kernels).",
+                    self.det_legality.N_FILTERS, 5, 5,
+                )
+            except Exception as e:  # pragma: no cover
+                logger.warning("DeterministicLegalityModule init failed (%s); falling back to CPU.", e)
+
+        self.conv_input = nn.Conv2d(input_channels, channels, 3, padding=1, bias=not use_batch_norm)
+        self.bn_input = nn.BatchNorm2d(channels) if use_batch_norm else nn.Identity()
+        self.res_blocks = nn.ModuleList([ResidualBlock(channels, use_batch_norm, se_ratio) for _ in range(num_res_blocks)])
+        self.dropout = nn.Dropout2d(dropout) if dropout > 0 else None
+
+        self.film_mlp: Optional[nn.Sequential] = None
+        self.film_global_mlp: Optional[nn.Sequential] = None
+        self.film_track_mlp: Optional[nn.Sequential] = None
+        self.shop_encoder: Optional[ShopEncoder] = None
+        if use_film:
+            film_out_dim = 2 * channels * num_res_blocks
+            if film_global_dim > 0:
+                self.film_global_mlp = nn.Sequential(nn.Linear(film_global_dim, film_hidden), nn.ReLU(inplace=True))
+                self.film_track_mlp = nn.Sequential(nn.Linear(film_track_dim, film_hidden), nn.ReLU(inplace=True))
+                self.shop_encoder = ShopEncoder(num_piece_ids=34, feat_dim=10, embed_dim=32, out_dim=film_shop_dim)
+                self.film_mlp = nn.Sequential(
+                    nn.Linear(film_hidden * 2 + film_shop_dim, film_hidden),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(film_hidden, film_out_dim),
+                )
+            elif self.film_input_plane_indices:
+                self.film_mlp = nn.Sequential(
+                    nn.Linear(len(self.film_input_plane_indices), film_hidden),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(film_hidden, film_out_dim),
+                )
+            else:
+                raise ValueError("use_film=true requires film_global_dim>0 or film_input_plane_indices")
+
+        self._use_structured_policy_head = use_factorized_policy_head
+        if use_factorized_policy_head:
+            self.policy_head = StructuredConvPolicyHead(
+                channels, policy_hidden=48, use_batch_norm=use_batch_norm
+            )
+        else:
+            self.policy_head = PolicyHead(
+                channels, policy_channels, max_actions, policy_hidden,
+                use_factorized=False, use_batch_norm=use_batch_norm
+            )
+        self.value_head = ValueHead(
+            channels, value_channels, value_hidden, use_batch_norm, with_score_head=True
+        )
+
+        # Auxiliary ownership head (KataGo-style) — optional
+        self.ownership_head: Optional[OwnershipHead] = None
+        if ownership_channels > 0:
+            self.ownership_head = OwnershipHead(channels, ownership_channels, use_batch_norm)
+
+        self._initialize_weights()
+
+    def _initialize_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+        # AlphaZero trick: zero-init final layers feeding tanh/softmax so network
+        # starts near-neutral (value≈0, policy≈uniform), avoiding saturation.
+        nn.init.zeros_(self.value_head.fc2.weight)
+        nn.init.zeros_(self.value_head.fc2.bias)
+        if self.value_head.score_head is not None:
+            nn.init.zeros_(self.value_head.score_head[0].weight)
+            nn.init.zeros_(self.value_head.score_head[0].bias)
+        # Policy head: zero-init output layers
+        if self._use_structured_policy_head:
+            nn.init.zeros_(self.policy_head.buy_conv.weight)
+            if self.policy_head.buy_conv.bias is not None:
+                nn.init.zeros_(self.policy_head.buy_conv.bias)
+            nn.init.zeros_(self.policy_head.patch_conv.weight)
+            if self.policy_head.patch_conv.bias is not None:
+                nn.init.zeros_(self.policy_head.patch_conv.bias)
+            nn.init.zeros_(self.policy_head.pass_linear.weight)
+            nn.init.zeros_(self.policy_head.pass_linear.bias)
+        elif getattr(self.policy_head, "_use_factorized", False):
+            nn.init.zeros_(self.policy_head.fc2.weight)
+            nn.init.zeros_(self.policy_head.fc2.bias)
+        else:
+            nn.init.zeros_(self.policy_head.fc.weight)
+            nn.init.zeros_(self.policy_head.fc.bias)
+        # FiLM: zero-init final layer so gamma=0, beta=0 → identity at start
+        if self.film_mlp is not None:
+            nn.init.zeros_(self.film_mlp[-1].weight)
+            nn.init.zeros_(self.film_mlp[-1].bias)
+
+    def _trunk_forward(
+        self,
+        state: torch.Tensor,
+        x_global: Optional[torch.Tensor] = None,
+        x_track: Optional[torch.Tensor] = None,
+        shop_ids: Optional[torch.Tensor] = None,
+        shop_feats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Shared residual trunk — used by all heads."""
+        gamma_list: Optional[List[torch.Tensor]] = None
+        beta_list: Optional[List[torch.Tensor]] = None
+
+        if self.use_film and self.film_mlp is not None:
+            if self.film_global_mlp is not None and x_global is not None:
+                g_enc = self.film_global_mlp(x_global)
+                t_enc = self.film_track_mlp(x_track.flatten(1))
+                s_enc = self.shop_encoder(shop_ids, shop_feats)
+                g = torch.cat([g_enc, t_enc, s_enc], dim=1)
+            else:
+                if not self.film_input_plane_indices:
+                    raise ValueError("use_film=true but no multimodal inputs and film_input_plane_indices empty")
+                max_idx = max(self.film_input_plane_indices)
+                if max_idx >= state.shape[1]:
+                    raise ValueError(f"film_input_plane_indices {max_idx} >= state channels {state.shape[1]}")
+                feats: List[torch.Tensor] = []
+                for idx in self.film_input_plane_indices:
+                    if self.film_use_plane_mean:
+                        feats.append(state[:, idx, :, :].mean(dim=(1, 2)))
+                    else:
+                        feats.append(state[:, idx, 0, 0])
+                g = torch.stack(feats, dim=1)
+            film_out = self.film_mlp(g)
+            film = film_out.view(film_out.shape[0], self.num_res_blocks, 2, self.channels)
+            gamma_list = [film[:, i, 0, :] for i in range(self.num_res_blocks)]
+            beta_list = [film[:, i, 1, :] for i in range(self.num_res_blocks)]
+
+        x = F.relu(self.bn_input(self.conv_input(state)), inplace=True)
+        if gamma_list is not None and beta_list is not None:
+            for i, block in enumerate(self.res_blocks):
+                x = block(x, gamma_list[i], beta_list[i])
+        else:
+            for block in self.res_blocks:
+                x = block(x)
+        if self.dropout is not None:
+            x = self.dropout(x)
+        return x
+
+    def _apply_gpu_legality(
+        self,
+        state: torch.Tensor,
+        shop_ids: Optional[torch.Tensor],
+        shop_feats: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Run DeterministicLegalityModule to compute legalTL and update shop_feats.
+
+        Accepts two state formats:
+          - (B, 32, 9, 9): new encoder output (channels 0-31 only).  Computes
+            legalTL_24 and concatenates → (B, 56, 9, 9) for the trunk.
+          - (B, 56, 9, 9): legacy / augmented states.  Overwrites channels 32-55
+            with correct GPU values (fixes latent D4 bug where legalTL was not
+            spatially transformed).
+
+        Returns: (state_56ch, shop_feats_with_num_legal)
+        """
+        if self.det_legality is None or shop_ids is None or shop_feats is None:
+            return state, shop_feats
+
+        B = state.shape[0]
+        n_ch = state.shape[1]  # 32 (new) or 56 (legacy)
+
+        # board_free: 1 = empty cell, 0 = occupied.  Channel 0 = current player.
+        cur_free = (1.0 - state[:, 0:1, :, :]).float()  # (B, 1, 9, 9)
+        opp_free = (1.0 - state[:, 1:2, :, :]).float()  # (B, 1, 9, 9)
+
+        # Stack into (2B, 1, 9, 9) so we pay for one conv call instead of two.
+        both_free = torch.cat([cur_free, opp_free], dim=0)   # (2B, 1, 9, 9)
+        legal_both = self.det_legality(both_free)             # (2B, 264, 9, 9)
+        legal_cur = legal_both[:B]                            # (B, 264, 9, 9)
+        legal_opp = legal_both[B:]                            # (B, 264, 9, 9)
+
+        # --- legalTL for visible slots → channels 32-55 ---
+        vis_ids = shop_ids[:, :3].long()          # (B, 3)
+        afford_vis = shop_feats[:, :3, 6].float() # (B, 3) -- slot affordability flag
+        legalTL_24 = self.det_legality.extract_vis_legalTL(legal_cur, vis_ids, afford_vis)
+
+        if n_ch == 32:
+            # New path: cat 32 encoded channels + 24 GPU channels → 56 for trunk
+            state = torch.cat([state, legalTL_24], dim=1)  # (B, 56, 9, 9)
+        else:
+            # Legacy path: overwrite channels 32-55 (zero-alloc cat reuses first 32)
+            state = torch.cat([state[:, :32], legalTL_24], dim=1)  # (B, 56, 9, 9)
+
+        # --- num_legal for all 33 shop pieces (features 8 and 9) ---
+        shop_ids_long = shop_ids.long()
+        nl_cur = self.det_legality.compute_num_legal_normalized(legal_cur, shop_ids_long)
+        nl_opp = self.det_legality.compute_num_legal_normalized(legal_opp, shop_ids_long)
+
+        # Rebuild shop_feats without in-place modification
+        shop_feats = torch.cat(
+            [shop_feats[:, :, :8], nl_cur.unsqueeze(-1), nl_opp.unsqueeze(-1)],
+            dim=-1,
+        )  # (B, 33, 10)
+
+        return state, shop_feats
+
+    def forward(
+        self,
+        state: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+        x_global: Optional[torch.Tensor] = None,
+        x_track: Optional[torch.Tensor] = None,
+        shop_ids: Optional[torch.Tensor] = None,
+        shop_feats: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass returning (policy_logits, value, score).
+
+        state: x_spatial (B,56,9,9) for gold_v2
+        x_global, x_track, shop_ids, shop_feats: optional multimodal inputs for FiLM
+        """
+        state, shop_feats = self._apply_gpu_legality(state, shop_ids, shop_feats)
+        trunk = self._trunk_forward(state, x_global, x_track, shop_ids, shop_feats)
+        policy_logits = self.policy_head(trunk)
+        if action_mask is not None:
+            policy_logits = policy_logits.masked_fill(action_mask == 0, float("-inf"))
+        value_out = self.value_head(trunk)
+        if isinstance(value_out, tuple):
+            value, score = value_out
+        else:
+            value = value_out
+            score = torch.zeros_like(value)
+        return policy_logits, value, score
+
+    def predict(
+        self, state: torch.Tensor, action_mask: Optional[torch.Tensor] = None, temperature: float = 1.0
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Inference helper. Returns (policy_probs, value, score)."""
+        self.eval()  # Ensure BatchNorm/Dropout in eval mode
+        with torch.no_grad():
+            policy_logits, value, score = self.forward(state, action_mask)
+            if temperature > 0:
+                policy_probs = F.softmax(policy_logits / temperature, dim=-1)
+            else:
+                policy_probs = torch.zeros_like(policy_logits)
+                policy_probs.scatter_(1, policy_logits.argmax(dim=-1, keepdim=True), 1.0)
+            return policy_probs, value, score
+
+    def get_loss(
+        self,
+        state: torch.Tensor,
+        action_mask: torch.Tensor,
+        target_policy: torch.Tensor,
+        target_value: torch.Tensor,
+        policy_weight: float = 1.0,
+        value_weight: float = 1.0,
+        target_score: Optional[torch.Tensor] = None,
+        score_loss_weight: float = 0.02,
+        target_ownership: Optional[torch.Tensor] = None,
+        ownership_weight: float = 0.0,
+        ownership_valid_mask: Optional[torch.Tensor] = None,
+        x_global: Optional[torch.Tensor] = None,
+        x_track: Optional[torch.Tensor] = None,
+        shop_ids: Optional[torch.Tensor] = None,
+        shop_feats: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Compute training loss.
+
+        Args:
+            target_ownership: (B, 2, 9, 9) float32 binary targets.
+                              Channel 0: current player's board (0=empty, 1=filled).
+                              Channel 1: opponent's board (0=empty, 1=filled).
+                              Only used when ownership_head exists and weight > 0.
+            ownership_weight: Loss weight for the auxiliary ownership head.
+            ownership_valid_mask: (B,) bool tensor. When provided, ownership loss
+                              is computed only on samples where mask is True.
+                              Allows mixed old/new data batches to still train
+                              the ownership head on valid samples.
+        """
+        state, shop_feats = self._apply_gpu_legality(state, shop_ids, shop_feats)
+        trunk = self._trunk_forward(state, x_global, x_track, shop_ids, shop_feats)
+        policy_logits = self.policy_head(trunk)
+        if action_mask is not None:
+            policy_logits = policy_logits.masked_fill(action_mask == 0, float("-inf"))
+        value_out = self.value_head(trunk)
+        if isinstance(value_out, tuple):
+            value, score = value_out
+        else:
+            value = value_out
+            score = torch.zeros_like(value)
+
+        # Policy loss (cross-entropy)
+        target_policy_sum = target_policy.sum(dim=-1, keepdim=True)
+        target_policy_norm = target_policy / torch.clamp(target_policy_sum, min=1e-8)
+        log_probs = F.log_softmax(policy_logits, dim=-1).clamp(min=-100.0)
+        policy_loss = -(target_policy_norm * log_probs).sum(dim=-1).mean()
+        # CRITICAL FIX: Raise on NaN instead of silently zeroing (hides bugs)
+        if torch.isnan(policy_loss):
+            if self.training:
+                raise RuntimeError("policy_loss is NaN - check masks/logits/targets")
+            policy_loss = torch.tensor(0.0, device=policy_loss.device)  # Inference: skip
+
+        # Value loss (MSE)
+        value_loss = F.mse_loss(value, target_value)
+
+        # Score loss (Huber, small weight because score magnitudes are large)
+        # CRITICAL: squeeze(-1) to avoid (B,1) vs (B,) broadcasting into (B,B) silent bug
+        score_loss = torch.tensor(0.0, device=state.device)
+        if target_score is not None and score_loss_weight > 0 and self.value_head.score_head is not None:
+            predicted_flat = score.squeeze(-1)  # (B, 1) -> (B,)
+            target_flat = target_score if target_score.dim() <= 1 else target_score.squeeze(-1)  # (B,)
+            score_loss = F.huber_loss(predicted_flat, target_flat, delta=5.0)
+
+        # Ownership loss (auxiliary, KataGo-style adapted for dual-board)
+        ownership_loss = torch.tensor(0.0, device=state.device)
+        ownership_logits = None
+        if (
+            self.ownership_head is not None
+            and target_ownership is not None
+            and ownership_weight > 0
+        ):
+            ownership_logits = self.ownership_head(trunk)  # (B, 2, 9, 9)
+            if ownership_valid_mask is not None and not ownership_valid_mask.all():
+                # Per-sample masking: only compute loss on valid samples
+                valid_logits = ownership_logits[ownership_valid_mask]
+                valid_targets = target_ownership[ownership_valid_mask]
+                if valid_logits.shape[0] > 0:
+                    ownership_loss = F.binary_cross_entropy_with_logits(
+                        valid_logits, valid_targets
+                    )
+            else:
+                # All samples valid (or no mask) — standard path
+                ownership_loss = F.binary_cross_entropy_with_logits(
+                    ownership_logits, target_ownership
+                )
+
+        total_loss = (
+            policy_weight * policy_loss
+            + value_weight * value_loss
+            + score_loss_weight * score_loss
+            + ownership_weight * ownership_loss
+        )
+
+        # Guard against NaN in any loss component (not just policy)
+        if torch.isnan(total_loss):
+            if self.training:
+                raise RuntimeError(
+                    f"total_loss is NaN — policy={policy_loss.item()}, "
+                    f"value={value_loss.item()}, ownership={ownership_loss.item()}. "
+                    f"Check inputs for corruption."
+                )
+            total_loss = torch.tensor(0.0, device=total_loss.device)
+
+        with torch.no_grad():
+            pred_actions = policy_logits.argmax(dim=-1)
+            target_actions = target_policy.argmax(dim=-1)
+            policy_accuracy = (pred_actions == target_actions).float().mean()
+            _, top5_pred = policy_logits.topk(5, dim=-1)
+            policy_top5_accuracy = (top5_pred == target_actions.unsqueeze(1)).any(dim=1).float().mean()
+
+            # Training diagnostics: policy entropy and KL divergence
+            policy_probs = F.softmax(policy_logits, dim=-1).clamp(min=1e-8)
+            policy_entropy = -(policy_probs * policy_probs.log()).sum(dim=-1).mean()
+
+            # KL(MCTS_target || network_policy) - measures how far net is from MCTS
+            kl_div = (target_policy_norm * (target_policy_norm.clamp(min=1e-8).log() - policy_probs.log())).sum(dim=-1).mean()
+
+            # Ownership accuracy (binary, threshold at 0.5) — only over valid samples
+            ownership_accuracy = 0.0
+            if ownership_logits is not None:
+                ownership_pred = (ownership_logits > 0).float()  # sigmoid > 0.5
+                if ownership_valid_mask is not None and not ownership_valid_mask.all():
+                    valid_pred = ownership_pred[ownership_valid_mask]
+                    valid_targets = target_ownership[ownership_valid_mask]
+                    if valid_pred.shape[0] > 0:
+                        ownership_accuracy = float(
+                            (valid_pred == valid_targets).float().mean().item()
+                        )
+                else:
+                    ownership_accuracy = float(
+                        (ownership_pred == target_ownership).float().mean().item()
+                    )
+
+        metrics = {
+            "policy_loss": float(policy_loss.item()),
+            "value_loss": float(value_loss.item()),
+            "score_loss": float(score_loss.item()),
+            "ownership_loss": float(ownership_loss.item()),
+            "total_loss": float(total_loss.item()),
+            "policy_accuracy": float(policy_accuracy.item()),
+            "policy_top5_accuracy": float(policy_top5_accuracy.item()),
+            "value_mse": float(value_loss.item()),
+            "policy_entropy": float(policy_entropy.item()),
+            "kl_divergence": float(kl_div.item()),
+            "ownership_accuracy": float(ownership_accuracy),
+        }
+        return total_loss, metrics
+
+    def num_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+def create_network(config: dict) -> PatchworkNetwork:
+    """Factory function to create network from config."""
+    net_config = config["network"]
+    film_indices = net_config.get("film_input_plane_indices", [])
+    if isinstance(film_indices, (list, tuple)):
+        film_indices = list(film_indices)
+    else:
+        film_indices = []
+    return PatchworkNetwork(
+        input_channels=int(net_config.get("input_channels", DEFAULT_INPUT_CHANNELS)),
+        num_res_blocks=int(net_config["num_res_blocks"]),
+        channels=int(net_config["channels"]),
+        policy_channels=int(net_config["policy_channels"]),
+        policy_hidden=int(net_config.get("policy_hidden", 256)),
+        use_factorized_policy_head=bool(net_config.get("use_factorized_policy_head", True)),
+        value_channels=int(net_config["value_channels"]),
+        value_hidden=int(net_config["value_hidden"]),
+        max_actions=int(net_config.get("max_actions", DEFAULT_MAX_ACTIONS)),
+        use_batch_norm=bool(net_config["use_batch_norm"]),
+        se_ratio=float(net_config["se_ratio"]),
+        dropout=float(net_config["dropout"]),
+        ownership_channels=int(net_config.get("ownership_channels", 0)),
+        use_film=bool(net_config.get("use_film", False)),
+        film_hidden=int(net_config.get("film_hidden", 256)),
+        film_input_plane_indices=film_indices,
+        film_use_plane_mean=bool(net_config.get("film_use_plane_mean", True)),
+        film_per_block=bool(net_config.get("film_per_block", True)),
+        film_global_dim=int(net_config.get("film_global_dim", 0)),
+        film_track_dim=int(net_config.get("film_track_dim", 0)),
+        film_shop_dim=int(net_config.get("film_shop_dim", 0)),
+        use_gpu_legality=bool(net_config.get("use_gpu_legality", True)),
+    )
+
+
+def load_model_checkpoint(
+    network: PatchworkNetwork, state_dict: dict
+) -> None:
+    """Load model state dict with backward compatibility for architectural changes.
+
+    - Old checkpoints without ownership_head.*: load with strict=False, init head from scratch.
+    - Policy head format mismatch (fc vs fc1/fc2): load with strict=False; policy head re-inits.
+    - Old checkpoints without film_mlp.*: load with strict=False; FiLM init from scratch.
+      (Use use_factorized_policy_head: false in config to compare legacy vs factorized.)
+    """
+    # Widen conv_input when loading old 14/16 channel checkpoints into 56ch (gold_v2) model
+    if "conv_input.weight" in state_dict:
+        old_w = state_dict["conv_input.weight"]
+        new_w = network.conv_input.weight
+        old_in = old_w.shape[1]
+        new_in = new_w.shape[1]
+        if old_in != new_in:
+            if old_in in (14, 16) and new_in in (56, 61):
+                widened = torch.zeros(new_w.shape, dtype=old_w.dtype, device=old_w.device)
+                widened[:, :old_in, :, :] = old_w
+                state_dict["conv_input.weight"] = widened
+                logger.warning("Checkpoint conv_input widened %d->%d channels (new channels zero-init).", old_in, new_in)
+            elif old_in != new_in:
+                raise ValueError(f"Checkpoint conv_input has {old_in} channels, model expects {new_in}. Incompatible.")
+
+    # Widen FiLM MLP first layer when loading old checkpoints (11->20 inputs)
+    if network.film_mlp is not None and "film_mlp.0.weight" in state_dict:
+        old_film_w = state_dict["film_mlp.0.weight"]
+        new_film_w = network.film_mlp[0].weight
+        old_in_film = old_film_w.shape[1]
+        new_in_film = new_film_w.shape[1]
+        if old_in_film < new_in_film:
+            out_film = old_film_w.shape[0]
+            widened_film = torch.zeros(out_film, new_in_film, dtype=old_film_w.dtype, device=old_film_w.device)
+            widened_film[:, :old_in_film] = old_film_w
+            state_dict["film_mlp.0.weight"] = widened_film
+            logger.warning(
+                "Checkpoint film_mlp.0 widened %d->%d inputs (new columns zero-init).",
+                old_in_film, new_in_film,
+            )
+
+    current_keys = set(network.state_dict().keys())
+    ckpt_keys = set(state_dict.keys())
+    missing = current_keys - ckpt_keys
+    unexpected = ckpt_keys - current_keys
+
+    ckpt_has_legacy = "policy_head.fc.weight" in ckpt_keys and "policy_head.fc1.weight" not in ckpt_keys
+    ckpt_has_factorized = "policy_head.fc1.weight" in ckpt_keys
+    ckpt_has_structured = "policy_head.p_conv.weight" in ckpt_keys
+
+    policy_structured_missing = {k for k in missing if any(
+        p in k for p in ("policy_head.p_", "policy_head.buy_", "policy_head.patch_", "policy_head.pass_")
+    )}
+    policy_fc_factorized_missing = {
+        k for k in missing if k.startswith("policy_head.fc1") or k.startswith("policy_head.fc2")
+    }
+    policy_fc_legacy_missing = {k for k in missing if k in ("policy_head.fc.weight", "policy_head.fc.bias")}
+    policy_legacy_conv = {k for k in missing if k.startswith("policy_head.conv") or k.startswith("policy_head.bn")}
+
+    allowable_missing = (
+        {k for k in missing if "ownership_head" in k}
+        | {k for k in missing if "score_head" in k}
+        | {k for k in missing if "film_mlp" in k}
+        | {k for k in missing if "det_legality" in k}  # new non-trainable module
+        | policy_structured_missing
+        | policy_fc_factorized_missing
+        | policy_fc_legacy_missing
+        | policy_legacy_conv
+    )
+    other_missing = missing - allowable_missing
+    if other_missing:
+        raise ValueError(
+            f"Checkpoint has incompatible keys. Missing in model: {other_missing}. "
+            "Only trunk, value, ownership, FiLM, and policy head params may differ."
+        )
+
+    if not missing and not unexpected:
+        network.load_state_dict(state_dict)
+        return
+
+    to_load = {k: v for k, v in state_dict.items() if k in current_keys}
+    msgs = []
+    if {k for k in missing if "ownership_head" in k}:
+        msgs.append("ownership head — init from scratch")
+    if policy_structured_missing and (ckpt_has_legacy or ckpt_has_factorized):
+        msgs.append("policy head (ckpt has legacy/factorized) — structured head init from scratch")
+    if (policy_fc_factorized_missing or policy_fc_legacy_missing or policy_legacy_conv) and ckpt_has_structured:
+        msgs.append("policy head (ckpt has structured) — legacy head init from scratch")
+    if policy_fc_factorized_missing and ckpt_has_legacy:
+        msgs.append("policy head (ckpt has legacy fc) — factorized head init from scratch")
+    if policy_fc_legacy_missing and ckpt_has_factorized:
+        msgs.append("policy head (ckpt has factorized fc1/fc2) — legacy head init from scratch")
+    if {k for k in missing if "film_mlp" in k}:
+        msgs.append("FiLM MLP — init from scratch")
+    if unexpected and any("policy_head" in k for k in unexpected):
+        msgs.append("policy head (ckpt has different format) — skipping unexpected")
+    if msgs:
+        logger.warning(
+            "Checkpoint incompatible with model: %s. Loading with strict=False.",
+            "; ".join(msgs),
+        )
+    network.load_state_dict(to_load, strict=False)
+
+
+def get_state_dict_for_inference(ckpt: dict, config: dict, for_selfplay: bool = False) -> dict:
+    """Return appropriate state dict for inference based on config."""
+    use_ema = False
+    if "ema" in config.get("training", {}):
+        ema_cfg = config["training"]["ema"]
+        if ema_cfg.get("enabled", False):
+            if for_selfplay and ema_cfg.get("use_for_selfplay", True):
+                use_ema = True
+            elif not for_selfplay and ema_cfg.get("use_for_eval", True):
+                use_ema = True
+                
+    if use_ema and "ema_state_dict" in ckpt:
+        return ckpt["ema_state_dict"]
+    return ckpt.get("model_state_dict", ckpt)
