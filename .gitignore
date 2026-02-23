@@ -54,7 +54,6 @@ d4_luts/
 elo_ratings*.json
 
 # IDE
-.vscode/
 .idea/
 
 # OS artifacts
