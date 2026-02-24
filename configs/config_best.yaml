@@ -259,7 +259,7 @@ iteration:
   - iteration: 100
     q_value_weight: 0.45
   - iteration: 220
-    q_value_weight: 0.40
+    q_value_weight: 0.50
 
   cpuct_schedule:
   - iteration: 0
