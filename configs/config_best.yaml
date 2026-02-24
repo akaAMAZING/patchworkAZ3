@@ -198,7 +198,7 @@ paths:
   run_id: patchwork_production
 
 iteration:
-  max_iterations: 500
+  max_iterations: 900
   auto_resume: true
 
   # GLOBAL LR SCHEDULE — decays peak LR across iterations (AlphaZero-style)

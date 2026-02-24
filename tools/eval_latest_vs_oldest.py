@@ -545,7 +545,7 @@ def run_gui(
 
 def main():
     ap = argparse.ArgumentParser(description="Evaluate two Patchwork AlphaZero checkpoints head-to-head.")
-    ap.add_argument("--config", default="configs/overnight_strong.yaml", help="Config file")
+    ap.add_argument("--config", default="configs/config_best.yaml", help="Config file")
     ap.add_argument("--games", type=int, default=20, help="Number of games")
     ap.add_argument("--override_sims", type=int, default=0, help="0 = use config eval sims")
     ap.add_argument("--override_cpuct", type=float, default=0.0, help="0 = use config eval cpuct")
