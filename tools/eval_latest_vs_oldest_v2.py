@@ -55,6 +55,7 @@ from elo_system import (
     update_ratings_standard_elo_batch,
     wr_to_elo_gap,
 )
+from cross_arch_eval.run_cross_arch import run_eval_cross_arch as _fixed_run_eval_cross_arch
 
 # Match iteration_*.pt (committed snapshots) and best_model_iter*.pt (gate-promoted copies)
 _ITER_PATTERNS = [
@@ -438,7 +439,7 @@ def main():
         log.info(f"  A: {path_a.name}  config={cfg_a_path.name}")
         log.info(f"  B: {path_b.name}  config={cfg_b_path.name}")
         log.info(f"  Games: {args.games}  Sims: {sims}\n")
-        run_eval_cross_arch(
+        _fixed_run_eval_cross_arch(
             cfg_a, cfg_b, path_a, path_b, args.games, sims, cpuct, device, log, elo_file=elo_file, elo_style=args.elo_style
         )
     else:
