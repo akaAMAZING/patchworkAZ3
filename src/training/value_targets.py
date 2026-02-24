@@ -3,16 +3,25 @@ Shared terminal value utilities for self-play and MCTS.
 
 KataGo Dual-Head Architecture:
   Value head:  strictly  1.0 (win), -1.0 (loss), 0.0 (tie)
-  Score head:  raw integer margin  (current_player_score - opponent_score)
+  Score head:  tanh-normalised margin  tanh(margin / 30.0)  in (-1, 1)
 
-  The old score_tanh(diff / scale) logic has been removed.  Instead the
-  network learns win-probability (value head) and score margin (score head)
-  as two independent targets.  During MCTS the two signals are blended
-  via ``utility = value + score_utility_weight * score`` so the agent
-  maximises margin while maintaining wins.
+  Raw integer margins are normalised via tanh so the score head and value
+  head operate on the same numeric scale.  The divisor 30.0 was chosen so
+  that a 30-point margin (a large Patchwork lead) maps to ~0.76, while
+  small differences (~5 pts) map to ~0.16 — preserving meaningful gradient
+  signal throughout.
+
+  During MCTS the two signals are blended via:
+    utility = value + score_utility_weight * score
+  so the agent maximises margin while maintaining wins.
+
+  IMPORTANT: score targets stored in the replay buffer are tanh-normalised.
+  Any existing replay data with raw integer targets is incompatible and must
+  be discarded before training with this version.
 """
 
 from __future__ import annotations
+import math
 
 
 def terminal_value_from_scores(
@@ -36,6 +45,9 @@ def terminal_value_from_scores(
     return 1.0 if int(winner) == int(to_move) else -1.0
 
 
+_SCORE_NORMALISE_DIVISOR = 30.0
+
+
 def value_and_score_from_scores(
     score0: int,
     score1: int,
@@ -45,13 +57,15 @@ def value_and_score_from_scores(
     """Return ``(value, score_margin)`` for a terminal state.
 
     value:        +1 / -1 / 0   (binary win/loss/tie from to_move perspective)
-    score_margin: integer margin (to_move's score  minus  opponent's score)
+    score_margin: tanh-normalised margin, tanh((to_move_score - opp_score) / 30.0)
+                  in the range (-1, 1).
 
     Called by selfplay_optimized.py to label both heads independently.
     """
     value = terminal_value_from_scores(score0, score1, winner, to_move)
     if int(to_move) == 0:
-        score_margin = float(int(score0) - int(score1))
+        raw_margin = float(int(score0) - int(score1))
     else:
-        score_margin = float(int(score1) - int(score0))
+        raw_margin = float(int(score1) - int(score0))
+    score_margin = math.tanh(raw_margin / _SCORE_NORMALISE_DIVISOR)
     return value, score_margin

@@ -52,12 +52,14 @@ network:
   film_track_dim: 432
   film_shop_dim: 128
   film_per_block: true
+  film_track_use_conv: true       # Conv1d over track sequence (8ch × 54 positions) instead of flat MLP
+  film_global_inject_dim: 64      # Direct global feature injection into value + pass-logit heads
 
 training:
   optimizer: adamw
   learning_rate: 0.0016              # Base LR; iteration.lr_schedule overrides per phase
   lr_schedule: cosine_warmup_per_phase  # Phases from iteration.lr_schedule; warmup once per phase, no restart each iter
-  warmup_steps: 50
+  warmup_steps: 20
   d4_augmentation: dynamic           # dynamic = apply D4 per sample; store = legacy pre-augmented
   d4_on_gpu: false                  # CPU D4 is faster: vectorized numpy in dataset; GPU path has ~15s/batch loop overhead
   d4_gpu_deterministic_test_mode: false  # If true: fixed seed per batch for reproducible D4 (testing only)
@@ -70,7 +72,7 @@ training:
   amp_dtype: bfloat16
   policy_loss_weight: 1.0
   value_loss_weight: 1.0
-  score_loss_weight: 0.02
+  score_loss_weight: 0.3          # Raised: tanh targets in [-1,1] have much smaller MSE than raw integers
   ownership_loss_weight: 0.15
   epochs_per_iteration: 2
   val_split: 0.08
@@ -107,7 +109,7 @@ selfplay:
   mcts:
     simulations: 192
     parallel_leaves: 48
-    score_utility_weight: 0.02
+    score_utility_weight: 0.1     # Raised: tanh score in [-1,1] so 5× weight still safe; adds meaningful margin pressure
     cpuct: 1.47                       # Base; iteration.cpuct_schedule overrides
     temperature: 1.0
     temperature_threshold: 15
@@ -257,7 +259,7 @@ iteration:
   - iteration: 100
     q_value_weight: 0.45
   - iteration: 220
-    q_value_weight: 0.50
+    q_value_weight: 0.40
 
   cpuct_schedule:
   - iteration: 0

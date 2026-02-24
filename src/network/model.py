@@ -247,25 +247,63 @@ class StructuredConvPolicyHead(nn.Module):
     - 0: pass
     - 1..81: patch placement (pos=row*9+col, index=1+pos)
     - 82..2025: buy (index=82 + (slot*8+orient)*81 + pos)
+
+    global_inject_dim: if >0, concatenate a projected global-feature vector into the
+    pass-logit computation.  Pass and buy/patch are spatially very different actions;
+    the pass decision is heavily position/button-driven (scalar), so direct global
+    injection here is more targeted than relying on FiLM alone.
     """
 
-    def __init__(self, input_channels: int, policy_hidden: int = 48, use_batch_norm: bool = True):
+    def __init__(
+        self,
+        input_channels: int,
+        policy_hidden: int = 48,
+        use_batch_norm: bool = True,
+        global_inject_dim: int = 0,
+    ):
         super().__init__()
         self.p_conv = nn.Conv2d(input_channels, policy_hidden, 1, bias=not use_batch_norm)
         self.p_bn = nn.BatchNorm2d(policy_hidden) if use_batch_norm else nn.Identity()
         self.buy_conv = nn.Conv2d(policy_hidden, NUM_SLOTS * NUM_ORIENTS, 1)  # 24 channels
         self.patch_conv = nn.Conv2d(policy_hidden, 1, 1)
-        self.pass_linear = nn.Linear(policy_hidden, 1)
+        self.global_inject_dim = global_inject_dim
+        self.pass_linear = nn.Linear(policy_hidden + global_inject_dim, 1)
+        # Global bias broadcast over buy/patch spatial maps (KataGo-style spatial global context).
+        # g_to_buy_bias: for each of 24 (slot, orient) channels, a learned scalar bias from
+        # global state (buttons, affordability, position) independent of board location.
+        # g_to_patch_bias: scalar bias over the entire patch placement map.
+        # Zero-initialized: neutral at start, learns to modulate based on game state.
+        self.g_to_buy_bias: Optional[nn.Linear] = None
+        self.g_to_patch_bias: Optional[nn.Linear] = None
+        if global_inject_dim > 0:
+            self.g_to_buy_bias = nn.Linear(global_inject_dim, NUM_SLOTS * NUM_ORIENTS)
+            self.g_to_patch_bias = nn.Linear(global_inject_dim, 1)
 
-    def forward(self, x: torch.Tensor, return_maps: bool = False) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        g: Optional[torch.Tensor] = None,
+        return_maps: bool = False,
+    ) -> torch.Tensor:
         # x: (B, 128, 9, 9)
         p = F.relu(self.p_bn(self.p_conv(x)), inplace=True)  # (B, 48, 9, 9)
         buy_map = self.buy_conv(p)   # (B, 24, 9, 9)
         patch_map = self.patch_conv(p)  # (B, 1, 9, 9)
 
-        # pass: global mean pool -> linear
+        # Global bias: per-(slot,orient) scalar from game state, broadcast over all board positions.
+        # Lets the network learn "given current buttons/position, how desirable is slot 0 orient 3?"
+        # independently of spatial placement quality.
+        if g is not None and self.g_to_buy_bias is not None:
+            buy_map = buy_map + self.g_to_buy_bias(g).unsqueeze(-1).unsqueeze(-1)
+            patch_map = patch_map + self.g_to_patch_bias(g).unsqueeze(-1).unsqueeze(-1)
+
+        # pass: global mean pool -> linear (+ optional global injection)
         p_mean = p.mean(dim=(2, 3))   # (B, 48)
-        pass_vec = self.pass_linear(p_mean)  # (B, 1)
+        if g is not None and self.global_inject_dim > 0:
+            pass_input = torch.cat([p_mean, g], dim=1)  # (B, 48 + global_inject_dim)
+        else:
+            pass_input = p_mean
+        pass_vec = self.pass_linear(pass_input)  # (B, 1)
 
         # flatten row-major: (r,c) -> r*9+c
         patch_vec = patch_map.flatten(start_dim=1)  # (B, 81)
@@ -314,7 +352,14 @@ class PolicyHead(nn.Module):
 
 
 class ValueHead(nn.Module):
-    """Value head outputting scalar value in [-1, 1]. Optional score head outputs raw margin."""
+    """Value head outputting scalar value in [-1, 1]. Optional score head outputs raw margin.
+
+    global_inject_dim: if >0, a projected global-feature vector is concatenated with
+    the spatial conv output before fc1.  This gives the value head direct access to
+    scalar game state (positions, buttons, income) instead of relying purely on FiLM
+    to propagate that information through the spatial trunk.  This is the KataGo
+    'global pooling' pattern adapted for multimodal input.
+    """
 
     def __init__(
         self,
@@ -323,21 +368,30 @@ class ValueHead(nn.Module):
         value_hidden: int,
         use_batch_norm: bool = True,
         with_score_head: bool = True,
+        global_inject_dim: int = 0,
     ):
         super().__init__()
         self.conv = nn.Conv2d(input_channels, value_channels, 1, bias=not use_batch_norm)
         self.bn = nn.BatchNorm2d(value_channels) if use_batch_norm else nn.Identity()
-        self.fc1 = nn.Linear(value_channels * 9 * 9, value_hidden)
+        self.global_inject_dim = global_inject_dim
+        self.fc1 = nn.Linear(value_channels * 9 * 9 + global_inject_dim, value_hidden)
         self.fc2 = nn.Linear(value_hidden, 1)
-        # KataGo-style score head: unbounded raw scalar (Current Player Score - Opponent Score)
+        # KataGo-style score head: predicts tanh-normalised score margin
         self.score_head = nn.Sequential(nn.Linear(value_hidden, 1)) if with_score_head else None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        g: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         x = F.relu(self.bn(self.conv(x)), inplace=True)
-        hidden = F.relu(self.fc1(x.flatten(start_dim=1)), inplace=True)
+        flat = x.flatten(start_dim=1)  # (B, value_channels * 81)
+        if g is not None and self.global_inject_dim > 0:
+            flat = torch.cat([flat, g], dim=1)  # (B, value_channels*81 + global_inject_dim)
+        hidden = F.relu(self.fc1(flat), inplace=True)
         value = torch.tanh(self.fc2(hidden))
         if self.score_head is not None:
-            score = self.score_head(hidden)  # raw scalar, no tanh
+            score = self.score_head(hidden)  # tanh-normalised score margin target
             return value, score
         return value
 
@@ -427,6 +481,8 @@ class PatchworkNetwork(nn.Module):
         film_track_dim: int = 0,
         film_shop_dim: int = 0,
         use_gpu_legality: bool = True,
+        film_track_use_conv: bool = False,
+        film_global_inject_dim: int = 0,
     ):
         super().__init__()
         self.input_channels = input_channels
@@ -440,6 +496,8 @@ class PatchworkNetwork(nn.Module):
         self.film_shop_dim = film_shop_dim
         self.num_res_blocks = num_res_blocks
         self.channels = channels
+        self.film_track_use_conv = film_track_use_conv
+        self.film_global_inject_dim = film_global_inject_dim
 
         # GPU legality module: computes legalTL (channels 32-55) and num_legal
         # (shop_feats[:,8:10]) on the GPU, replacing heavy CPU encoder loops.
@@ -466,18 +524,42 @@ class PatchworkNetwork(nn.Module):
         self.film_mlp: Optional[nn.Sequential] = None
         self.film_global_mlp: Optional[nn.Sequential] = None
         self.film_track_mlp: Optional[nn.Sequential] = None
+        self.film_track_conv: Optional[nn.Sequential] = None
+        self.film_track_pool: Optional[nn.Linear] = None
         self.shop_encoder: Optional[ShopEncoder] = None
+        self.global_to_heads: Optional[nn.Sequential] = None
+        self.trunk_to_heads: Optional[nn.Linear] = None
         if use_film:
             film_out_dim = 2 * channels * num_res_blocks
             if film_global_dim > 0:
                 self.film_global_mlp = nn.Sequential(nn.Linear(film_global_dim, film_hidden), nn.ReLU(inplace=True))
-                self.film_track_mlp = nn.Sequential(nn.Linear(film_track_dim, film_hidden), nn.ReLU(inplace=True))
+                if film_track_use_conv:
+                    # 1D conv preserving sequence structure: (B, 8, 54) -> (B, 32, 54) -> mean -> (B, film_hidden)
+                    self.film_track_conv = nn.Sequential(
+                        nn.Conv1d(8, 32, kernel_size=5, padding=2),
+                        nn.ReLU(inplace=True),
+                        nn.Conv1d(32, 32, kernel_size=3, padding=1),
+                        nn.ReLU(inplace=True),
+                    )
+                    self.film_track_pool = nn.Linear(32, film_hidden)
+                else:
+                    self.film_track_mlp = nn.Sequential(nn.Linear(film_track_dim, film_hidden), nn.ReLU(inplace=True))
                 self.shop_encoder = ShopEncoder(num_piece_ids=34, feat_dim=10, embed_dim=32, out_dim=film_shop_dim)
                 self.film_mlp = nn.Sequential(
                     nn.Linear(film_hidden * 2 + film_shop_dim, film_hidden),
                     nn.ReLU(inplace=True),
                     nn.Linear(film_hidden, film_out_dim),
                 )
+                if film_global_inject_dim > 0:
+                    # Direct global feature injection into both heads (KataGo global pooling pattern)
+                    self.global_to_heads = nn.Sequential(
+                        nn.Linear(film_global_dim, film_global_inject_dim),
+                        nn.ReLU(inplace=True),
+                    )
+                    # Trunk spatial pooling: pools the *learned* spatial trunk features (mean over 9×9)
+                    # and adds them additively to g_heads. Zero-initialized → identity at start.
+                    # Gives heads access to the network's trained representation, not just raw scalars.
+                    self.trunk_to_heads = nn.Linear(channels, film_global_inject_dim)
             elif self.film_input_plane_indices:
                 self.film_mlp = nn.Sequential(
                     nn.Linear(len(self.film_input_plane_indices), film_hidden),
@@ -490,7 +572,8 @@ class PatchworkNetwork(nn.Module):
         self._use_structured_policy_head = use_factorized_policy_head
         if use_factorized_policy_head:
             self.policy_head = StructuredConvPolicyHead(
-                channels, policy_hidden=48, use_batch_norm=use_batch_norm
+                channels, policy_hidden=48, use_batch_norm=use_batch_norm,
+                global_inject_dim=film_global_inject_dim,
             )
         else:
             self.policy_head = PolicyHead(
@@ -498,7 +581,8 @@ class PatchworkNetwork(nn.Module):
                 use_factorized=False, use_batch_norm=use_batch_norm
             )
         self.value_head = ValueHead(
-            channels, value_channels, value_hidden, use_batch_norm, with_score_head=True
+            channels, value_channels, value_hidden, use_batch_norm, with_score_head=True,
+            global_inject_dim=film_global_inject_dim,
         )
 
         # Auxiliary ownership head (KataGo-style) — optional
@@ -548,6 +632,18 @@ class PatchworkNetwork(nn.Module):
         if self.film_mlp is not None:
             nn.init.zeros_(self.film_mlp[-1].weight)
             nn.init.zeros_(self.film_mlp[-1].bias)
+        # Global bias layers for buy/patch: zero-init so they start neutral (no distortion at init)
+        if self._use_structured_policy_head:
+            if self.policy_head.g_to_buy_bias is not None:
+                nn.init.zeros_(self.policy_head.g_to_buy_bias.weight)
+                nn.init.zeros_(self.policy_head.g_to_buy_bias.bias)
+            if self.policy_head.g_to_patch_bias is not None:
+                nn.init.zeros_(self.policy_head.g_to_patch_bias.weight)
+                nn.init.zeros_(self.policy_head.g_to_patch_bias.bias)
+        # Trunk pooling projection: zero-init so g_heads starts identical to global_to_heads(x_global)
+        if self.trunk_to_heads is not None:
+            nn.init.zeros_(self.trunk_to_heads.weight)
+            nn.init.zeros_(self.trunk_to_heads.bias)
 
     def _trunk_forward(
         self,
@@ -564,7 +660,11 @@ class PatchworkNetwork(nn.Module):
         if self.use_film and self.film_mlp is not None:
             if self.film_global_mlp is not None and x_global is not None:
                 g_enc = self.film_global_mlp(x_global)
-                t_enc = self.film_track_mlp(x_track.flatten(1))
+                if self.film_track_conv is not None:
+                    t_out = self.film_track_conv(x_track)       # (B, 32, 54)
+                    t_enc = self.film_track_pool(t_out.mean(dim=2))  # (B, film_hidden)
+                else:
+                    t_enc = self.film_track_mlp(x_track.flatten(1))
                 s_enc = self.shop_encoder(shop_ids, shop_feats)
                 g = torch.cat([g_enc, t_enc, s_enc], dim=1)
             else:
@@ -671,10 +771,16 @@ class PatchworkNetwork(nn.Module):
         """
         state, shop_feats = self._apply_gpu_legality(state, shop_ids, shop_feats)
         trunk = self._trunk_forward(state, x_global, x_track, shop_ids, shop_feats)
-        policy_logits = self.policy_head(trunk)
+        g_heads = None
+        if self.global_to_heads is not None and x_global is not None:
+            g_heads = self.global_to_heads(x_global)
+            if self.trunk_to_heads is not None:
+                # Add trunk spatial pooling: mean over 9×9 → projected to same dim → additive residual
+                g_heads = g_heads + self.trunk_to_heads(trunk.mean(dim=(2, 3)))
+        policy_logits = self.policy_head(trunk, g=g_heads)
         if action_mask is not None:
             policy_logits = policy_logits.masked_fill(action_mask == 0, float("-inf"))
-        value_out = self.value_head(trunk)
+        value_out = self.value_head(trunk, g=g_heads)
         if isinstance(value_out, tuple):
             value, score = value_out
         else:
@@ -729,10 +835,16 @@ class PatchworkNetwork(nn.Module):
         """
         state, shop_feats = self._apply_gpu_legality(state, shop_ids, shop_feats)
         trunk = self._trunk_forward(state, x_global, x_track, shop_ids, shop_feats)
-        policy_logits = self.policy_head(trunk)
+        g_heads = None
+        if self.global_to_heads is not None and x_global is not None:
+            g_heads = self.global_to_heads(x_global)
+            if self.trunk_to_heads is not None:
+                # Add trunk spatial pooling: mean over 9×9 → projected to same dim → additive residual
+                g_heads = g_heads + self.trunk_to_heads(trunk.mean(dim=(2, 3)))
+        policy_logits = self.policy_head(trunk, g=g_heads)
         if action_mask is not None:
             policy_logits = policy_logits.masked_fill(action_mask == 0, float("-inf"))
-        value_out = self.value_head(trunk)
+        value_out = self.value_head(trunk, g=g_heads)
         if isinstance(value_out, tuple):
             value, score = value_out
         else:
@@ -759,7 +871,7 @@ class PatchworkNetwork(nn.Module):
         if target_score is not None and score_loss_weight > 0 and self.value_head.score_head is not None:
             predicted_flat = score.squeeze(-1)  # (B, 1) -> (B,)
             target_flat = target_score if target_score.dim() <= 1 else target_score.squeeze(-1)  # (B,)
-            score_loss = F.huber_loss(predicted_flat, target_flat, delta=5.0)
+            score_loss = F.huber_loss(predicted_flat, target_flat, delta=0.5)
 
         # Ownership loss (auxiliary, KataGo-style adapted for dual-board)
         ownership_loss = torch.tensor(0.0, device=state.device)
@@ -881,6 +993,8 @@ def create_network(config: dict) -> PatchworkNetwork:
         film_track_dim=int(net_config.get("film_track_dim", 0)),
         film_shop_dim=int(net_config.get("film_shop_dim", 0)),
         use_gpu_legality=bool(net_config.get("use_gpu_legality", True)),
+        film_track_use_conv=bool(net_config.get("film_track_use_conv", False)),
+        film_global_inject_dim=int(net_config.get("film_global_inject_dim", 0)),
     )
 
 
