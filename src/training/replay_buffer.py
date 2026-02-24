@@ -259,7 +259,7 @@ class ReplayBuffer:
             merge_multimodal = "spatial_states" in first and is_multimodal
 
         total = sum(n for _, _, n in self._entries)
-        logger.info(f"Replay buffer merge: {total} total positions from {len(self._entries)} iterations")
+        logger.debug(f"Replay buffer merge: {total} total positions from {len(self._entries)} iterations")
 
         # Decide per-file sample counts
         target_total = min(total, self.max_size)
@@ -333,7 +333,7 @@ class ReplayBuffer:
                 # Preserve _entries order (oldest first)
                 for it, p, n in self._entries:
                     per_file.append((it, p, n, takes_by_it.get(it, 0)))
-                logger.info(
+                logger.debug(
                     f"Replay buffer: subsampling {total} -> {target_total} positions "
                     f"(newest={newest_take}, rest={rest_take}, newest_frac={self.newest_fraction:.0%})"
                 )
@@ -347,20 +347,20 @@ class ReplayBuffer:
                     base[frac_idx[k]] += 1
                 for (it, p, n), take in zip(self._entries, base):
                     per_file.append((it, p, n, take))
-                logger.info(f"Replay buffer: subsampling {total} -> {target_total} positions")
+                logger.debug(f"Replay buffer: subsampling {total} -> {target_total} positions")
 
         # KataGo Dual-Head: refuse legacy HDF5 without score_margins when training score head
         score_loss_weight = float(
             (self.config.get("training", {}) or {}).get("score_loss_weight", 0.0)
         )
 
-        # Stream-write merged file (no giant RAM concat)
-        rb = self.config.get("replay_buffer", {}) or {}
-        compression = rb.get("compression", "lzf") or "lzf"
-        if compression in ("none", "", "null"):
-            compression = None
-        comp_level = int(rb.get("compression_level", 0))
-        comp_opts = comp_level if compression == "gzip" else None
+        # Stream-write merged file (no giant RAM concat).
+        # The merged file is a temporary staging artifact loaded immediately into RAM
+        # (PatchworkDataset bulk-reads it then discards it). Compression costs ~90s write
+        # + forces decompression at load time — wasted CPU. Use no compression so writes
+        # and reads are purely disk-bandwidth bound (~10s total vs ~120s with lzf).
+        compression = None
+        comp_opts = None
         # Write to tmp then replace for atomicity
         with h5py.File(tmp_path, "w") as out:
             chunk_rows = min(4096, max(256, total // 8))
@@ -525,7 +525,7 @@ class ReplayBuffer:
             out.attrs["source_iterations"] = [it for it, _, _ in self._entries]
 
         os.replace(tmp_path, merged_path)
-        logger.info(
+        logger.debug(
             "Replay buffer: wrote %d positions to %s",
             cur, merged_path,
         )

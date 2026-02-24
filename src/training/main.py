@@ -37,6 +37,8 @@ import hashlib
 import io
 import json
 import logging
+import ctypes
+import gc
 import os
 import platform
 import random
@@ -51,6 +53,12 @@ from typing import Dict, Optional
 warnings.filterwarnings(
     "ignore",
     message="The PyTorch API of nested tensors is in prototype stage",
+    category=UserWarning,
+)
+# Suppress Flash Attention unavailable warning (Windows PyTorch binary; falls back to math attention)
+warnings.filterwarnings(
+    "ignore",
+    message=".*Torch was not compiled with flash attention.*",
     category=UserWarning,
 )
 
@@ -121,6 +129,134 @@ import torch
 import yaml
 from torch.utils.tensorboard import SummaryWriter
 
+# ── Colorama: pretty terminal output (graceful fallback if not installed) ────
+try:
+    from colorama import Fore, Style, init as _colorama_init
+    _colorama_init(autoreset=True)
+    _CLR_BAR   = "\033[38;5;208m"  # Orange (xterm-256 index 208)
+    _CLR_HDR   = Fore.CYAN + Style.BRIGHT
+    _CLR_DIM   = Style.DIM
+    _CLR_VAL   = Fore.YELLOW
+    _CLR_OK    = Fore.GREEN + Style.BRIGHT
+    _CLR_FAIL  = Fore.RED + Style.BRIGHT
+    _CLR_SECT  = Fore.CYAN
+    _CLR_RST   = Style.RESET_ALL
+except ImportError:
+    _CLR_BAR = _CLR_HDR = _CLR_DIM = _CLR_VAL = _CLR_OK = _CLR_FAIL = _CLR_SECT = _CLR_RST = ""
+
+_HBAR = "━" * 100
+
+
+def _fmt_k(n: int) -> str:
+    """Format a large integer as e.g. '301k' or '1.2M'."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n // 1_000}k"
+    return str(n)
+
+
+def _print_iter_header(
+    iteration: int,
+    total_iterations: int,
+    best_label: str,
+    buf_positions: int,
+    rejections: int,
+    applied_settings: dict,
+) -> None:
+    """Print the colorized iteration header directly to stdout (bypasses logger timestamps)."""
+    sp = applied_settings.get("selfplay", {})
+    tr = applied_settings.get("training", {})
+    sims  = int(sp.get("simulations", 0))
+    temp  = float(sp.get("temperature", 1.0))
+    alpha = float(sp.get("dirichlet_alpha", 0.0))
+    eps   = float(sp.get("noise_weight", 0.0))
+    cpuct = float(sp.get("cpuct", 1.5))
+    q_wt  = float(sp.get("q_value_weight", 0.0))
+    lr    = float(tr.get("lr", 0.0))
+    games = int(sp.get("games", 0))
+
+    bar  = _CLR_BAR + _HBAR + _CLR_RST
+    hdr  = (
+        f"  {_CLR_HDR}ITER {iteration:03d}/{total_iterations}{_CLR_RST}"
+        f"  ·  {_CLR_DIM}best={_CLR_RST}{_CLR_VAL}{best_label}{_CLR_RST}"
+        f"  ·  {_CLR_DIM}buf={_CLR_RST}{_CLR_VAL}{_fmt_k(buf_positions)} pos{_CLR_RST}"
+        f"  ·  {_CLR_DIM}rejects={_CLR_RST}{_CLR_VAL}{rejections}{_CLR_RST}"
+    )
+    params = (
+        f"  {_CLR_DIM}sims={_CLR_RST}{_CLR_VAL}{sims}{_CLR_RST}"
+        f"  {_CLR_DIM}temp={_CLR_RST}{_CLR_VAL}{temp:.2f}{_CLR_RST}"
+        f"  {_CLR_DIM}α={_CLR_RST}{_CLR_VAL}{alpha:.2f}{_CLR_RST}"
+        f"  {_CLR_DIM}ε={_CLR_RST}{_CLR_VAL}{eps:.2f}{_CLR_RST}"
+        f"  {_CLR_DIM}cpuct={_CLR_RST}{_CLR_VAL}{cpuct:.2f}{_CLR_RST}"
+        f"  {_CLR_DIM}q_wt={_CLR_RST}{_CLR_VAL}{q_wt:.2f}{_CLR_RST}"
+        f"  {_CLR_DIM}LR={_CLR_RST}{_CLR_VAL}{lr:.2e}{_CLR_RST}"
+        f"  {_CLR_DIM}games={_CLR_RST}{_CLR_VAL}{games}{_CLR_RST}"
+    )
+    print(f"\n{bar}\n{hdr}\n{params}\n{bar}", flush=True)
+
+
+def _print_auto_resume(
+    last_comm: int,
+    next_iter: int,
+    best_label: str,
+    best_model_path: str,
+    global_step: int,
+    rejections: int,
+    elo_count: int,
+) -> None:
+    """Print the colorized auto-resume banner directly to stdout."""
+    bar = _CLR_BAR + _HBAR + _CLR_RST
+    hdr = (
+        f"  {_CLR_HDR}AUTO-RESUME{_CLR_RST}"
+        f"  ·  {_CLR_DIM}last=iter{last_comm:03d}{_CLR_RST}"
+        f"  ·  {_CLR_DIM}next=iter{next_iter:03d}{_CLR_RST}"
+        f"  ·  {_CLR_DIM}best={best_label}{_CLR_RST}"
+        f"  ·  {_CLR_DIM}step={global_step:,}{_CLR_RST}"
+    )
+    lines = [
+        f"  {_CLR_DIM}Last committed :{_CLR_RST} iter{last_comm:03d}",
+        f"  {_CLR_DIM}Next iteration :{_CLR_RST} iter{next_iter:03d}",
+        f"  {_CLR_DIM}Best model     :{_CLR_RST} {best_label}  ({best_model_path})",
+        f"  {_CLR_DIM}Global step    :{_CLR_RST} {global_step:,}",
+        f"  {_CLR_DIM}Rejections     :{_CLR_RST} {rejections}",
+        f"  {_CLR_DIM}Elo ratings    :{_CLR_RST} {elo_count} players restored",
+        f"  {_CLR_DIM}Replay buffer  :{_CLR_RST} will be restored from state file",
+    ]
+    print(f"\n{bar}\n{hdr}\n" + "\n".join(lines) + f"\n{bar}\n", flush=True)
+
+
+def _print_section(label: str) -> None:
+    """Print a colorized [N/3] section header directly to stdout."""
+    print(f"{_CLR_SECT}{label}{_CLR_RST}", flush=True)
+
+
+def _print_iter_summary(
+    iteration: int,
+    accepted: bool,
+    iter_time: float,
+    wr_best_str: str,
+    margin_best: float,
+    wr_mcts_str: str,
+    train_metrics: dict,
+) -> None:
+    """Print the colorized iteration summary directly to stdout."""
+    status_clr = _CLR_OK if accepted else _CLR_FAIL
+    status_str = "✓ ACCEPTED" if accepted else "✗ REJECTED"
+    loss = train_metrics.get("total_loss", 0)
+    pol  = train_metrics.get("policy_accuracy", 0) * 100
+    print(
+        f"\n  {_CLR_HDR}ITER {iteration:03d}{_CLR_RST}  {status_clr}{status_str}{_CLR_RST}"
+        f"  {_CLR_DIM}time={_CLR_RST}{iter_time:.0f}s"
+        f"  {_CLR_DIM}WR(best)={_CLR_RST}{wr_best_str}"
+        f"  {_CLR_DIM}margin={_CLR_RST}{margin_best:+.1f}pts"
+        f"  {_CLR_DIM}WR(mcts)={_CLR_RST}{wr_mcts_str}"
+        f"  {_CLR_DIM}loss={_CLR_RST}{loss:.4f}"
+        f"  {_CLR_DIM}pol={_CLR_RST}{pol:.1f}%"
+        f"\n  {_CLR_SECT}{_HBAR}{_CLR_RST}",
+        flush=True,
+    )
+
 from src.training.evaluation import Evaluator, EloTracker
 from src.training.league import LeagueManager, LeagueConfig, GateResult
 from src.training.replay_buffer import ReplayBuffer
@@ -166,13 +302,40 @@ _safe_stdout = io.TextIOWrapper(
 # to staging/iter_N/training.log; only appended to permanent log at commit.
 _log_file_handler: Optional[logging.FileHandler] = None
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(_safe_stdout),
-    ],
+# ── Compact log formatter: 'YYYY-MM-DD HH:MM:SS - [TAG] - message' ──────────
+_LOG_TAGS = {
+    "__main__":                                        "MAIN",
+    "src.training.selfplay_optimized_integration":     "SELFPLAY",
+    "src.training.trainer":                            "TRAIN",
+    "src.training.evaluation":                         "EVAL",
+    "src.training.replay_buffer":                      "BUFFER",
+    "src.training.run_layout":                         "COMMIT",
+    "src.training.league":                             "LEAGUE",
+    "src.network.gpu_inference_server":                "GPU",
+    "src.network.model":                               "MODEL",
+    "src.mcts.alphazero_mcts_optimized":               "MCTS",
+}
+
+
+class _TidyFormatter(logging.Formatter):
+    """Compact formatter: no milliseconds, short module tag."""
+    def format(self, record: logging.LogRecord) -> str:
+        record.shorttag = _LOG_TAGS.get(record.name, record.name.rsplit(".", 1)[-1].upper()[:12])
+        return super().format(record)
+
+
+_TIDY_FMT = _TidyFormatter(
+    fmt="%(asctime)s - [%(shorttag)s] - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
+
+_console_handler = logging.StreamHandler(_safe_stdout)
+_console_handler.setFormatter(_TIDY_FMT)
+_console_handler.setLevel(logging.INFO)
+_root_logger = logging.getLogger()
+_root_logger.setLevel(logging.INFO)
+_root_logger.addHandler(_console_handler)
+
 logger = logging.getLogger(__name__)
 
 
@@ -188,7 +351,7 @@ def _attach_staging_log_handler(staging_path: Path) -> None:
     if staging_dir.exists() and not staging_dir.is_dir():
         raise RuntimeError(f"Staging path exists but is not a directory: {staging_dir}")
     _log_file_handler = logging.FileHandler(str(log_path), encoding="utf-8")
-    _log_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s"))
+    _log_file_handler.setFormatter(_TIDY_FMT)
     _log_file_handler.setLevel(logging.INFO)
     logging.getLogger().addHandler(_log_file_handler)
 
@@ -812,19 +975,19 @@ class AlphaZeroTrainer:
                     f"iter{self.best_model_iteration:03d}"
                     if self.best_model_iteration is not None else "N/A"
                 )
-                logger.info("")
-                logger.info("=" * 70)
-                logger.info("  AUTO-RESUME - Continuing previous run (iteration-boundary only)")
-                logger.info("=" * 70)
-                logger.info("  Last committed : iter%03d", last_comm)
-                logger.info("  Next iteration  : iter%03d (self-play -> train -> eval -> commit)", next_iter)
-                logger.info("  Best model      : %s (%s)", best_label, self.best_model_path)
-                logger.info("  Global step     : %d", self.global_step)
-                logger.info("  Rejections      : %d", self.consecutive_rejections)
-                logger.info("  Elo ratings     : %d players restored", len(self.elo_tracker.ratings))
-                logger.info("  Replay buffer   : will be restored from state file")
-                logger.info("=" * 70)
-                logger.info("")
+                _print_auto_resume(
+                    last_comm=last_comm,
+                    next_iter=next_iter,
+                    best_label=best_label,
+                    best_model_path=str(self.best_model_path),
+                    global_step=self.global_step,
+                    rejections=self.consecutive_rejections,
+                    elo_count=len(self.elo_tracker.ratings),
+                )
+                logger.info(
+                    "AUTO-RESUME: last=iter%03d next=iter%03d best=%s step=%d rejects=%d",
+                    last_comm, next_iter, best_label, self.global_step, self.consecutive_rejections,
+                )
                 return next_iter, checkpoint
         except Exception as e:
             logger.warning("Failed to auto-resume from %s: %s", self.run_state_path, e)
@@ -917,18 +1080,20 @@ class AlphaZeroTrainer:
                 else:
                     self.writer = _NoOpSummaryWriter()
 
-                logger.info("")
-                logger.info("=" * 70)
                 best_label = f"iter{self.best_model_iteration:03d}" if self.best_model_iteration is not None else "None"
-                logger.info(
-                    "  ITERATION %03d/%d  |  best=%s  |  rejections=%d  |  replay=%d pos",
-                    iteration,
-                    total_iterations,
-                    best_label,
-                    self.consecutive_rejections,
-                    self.replay_buffer.total_positions,
+                _print_iter_header(
+                    iteration=iteration,
+                    total_iterations=total_iterations,
+                    best_label=best_label,
+                    buf_positions=self.replay_buffer.total_positions,
+                    rejections=self.consecutive_rejections,
+                    applied_settings=applied_settings,
                 )
-                logger.info("=" * 70)
+                logger.info(
+                    "ITER %03d/%d  best=%s  rejects=%d  buf=%d pos",
+                    iteration, total_iterations, best_label,
+                    self.consecutive_rejections, self.replay_buffer.total_positions,
+                )
 
                 if iteration == start_iteration and resume_checkpoint:
                     selfplay_model = resume_checkpoint
@@ -940,7 +1105,7 @@ class AlphaZeroTrainer:
                 self._log_health_at_iteration_start(iteration, train_base)
 
                 sp_label = f"iter{self.best_model_iteration:03d}" if (selfplay_model and self.best_model_iteration is not None) else "random"
-                logger.info("\n[1/3] SELF-PLAY  (generator: %s)", sp_label)
+                _print_section(f"\n[1/3] SELF-PLAY  (generator: {sp_label})")
 
                 data_path, selfplay_stats = self._generate_selfplay_data(
                     iteration, selfplay_model, output_dir=staging_path
@@ -953,7 +1118,7 @@ class AlphaZeroTrainer:
                 )
 
                 train_label = f"iter{self.best_model_iteration:03d}" if (train_base and self.best_model_iteration is not None) else "scratch"
-                logger.info("\n[2/3] TRAINING  (warm-start from: %s)", train_label)
+                _print_section(f"\n[2/3] TRAINING  (warm-start: {train_label})")
                 checkpoint_path, train_metrics, global_step = self._train_network(
                     iteration, data_path, train_base, staging_dir=staging_path
                 )
@@ -975,21 +1140,58 @@ class AlphaZeroTrainer:
                         mid = self.league.model_id(iteration)
                         self.league.promote(mid, checkpoint_path)
 
-                logger.info("\n[3/3] EVALUATION")
+                # Only print EVALUATION section header when actual evaluation games will run
+                _eval_cfg_now = self.config.get("evaluation", {}) or {}
+                _eval_ngm = int(_eval_cfg_now.get("games_per_eval") or _eval_cfg_now.get("games_vs_pure_mcts", 0))
+                _eval_ngb = int(_eval_cfg_now.get("games_vs_best") or _eval_ngm)
+                _sprt_on  = bool((_eval_cfg_now.get("sprt", {}) or {}).get("enabled", False))
+                _micro_on = bool((_eval_cfg_now.get("micro_gate", {}) or {}).get("enabled", True))
+                _eval_active = _eval_ngm > 0 or (iteration > 0 and (_eval_ngb > 0 or _sprt_on or _micro_on))
+                if _eval_active:
+                    _print_section("\n[3/3] EVALUATION")
                 eval_results = self._evaluate_model(iteration, checkpoint_path)
 
-                # Log eval metrics to TensorBoard
+                # ── TensorBoard: iteration-level metrics ──────────────────────────────
+                # Eval metrics
                 if "elo_rating" in eval_results:
-                    self.writer.add_scalar("eval/elo_rating", eval_results["elo_rating"], global_step)
+                    self.writer.add_scalar("eval/elo_rating", eval_results["elo_rating"], iteration)
                 if "vs_pure_mcts" in eval_results:
-                    self.writer.add_scalar("eval/win_rate_vs_mcts", eval_results["vs_pure_mcts"]["win_rate"], global_step)
-                    self.writer.add_scalar("eval/score_diff_vs_mcts", eval_results["vs_pure_mcts"]["avg_score_diff"], global_step)
-                    self.writer.add_scalar("eval/score_margin_vs_mcts", eval_results["vs_pure_mcts"].get("avg_model_score_margin", 0), global_step)
+                    vm = eval_results["vs_pure_mcts"]
+                    self.writer.add_scalar("eval/win_rate_vs_mcts", vm["win_rate"], iteration)
+                    self.writer.add_scalar("eval/score_margin_vs_mcts", vm.get("avg_model_score_margin", 0), iteration)
+                    self.writer.add_scalar("eval/game_length_vs_mcts", vm.get("avg_game_length", 0), iteration)
+                    # P0/P1 position-bias signal
+                    _vm_results = vm.get("results", [])
+                    if _vm_results:
+                        _p0 = [r for r in _vm_results if r.get("model_plays_first", False)]
+                        _p1 = [r for r in _vm_results if not r.get("model_plays_first", False)]
+                        if _p0:
+                            self.writer.add_scalar("eval/win_rate_as_p0_vs_mcts", sum(1 for r in _p0 if r["model_won"]) / len(_p0), iteration)
+                        if _p1:
+                            self.writer.add_scalar("eval/win_rate_as_p1_vs_mcts", sum(1 for r in _p1 if r["model_won"]) / len(_p1), iteration)
                 if "vs_previous_best" in eval_results:
-                    self.writer.add_scalar("eval/win_rate_vs_best", eval_results["vs_previous_best"]["win_rate"], global_step)
-                    self.writer.add_scalar("eval/score_margin_vs_best", eval_results["vs_previous_best"].get("avg_model_score_margin", 0), global_step)
+                    vb = eval_results["vs_previous_best"]
+                    self.writer.add_scalar("eval/win_rate_vs_best", vb["win_rate"], iteration)
+                    self.writer.add_scalar("eval/score_margin_vs_best", vb.get("avg_model_score_margin", 0), iteration)
+                    # P0/P1 position-bias signal vs best model
+                    _vb_results = vb.get("results", [])
+                    if _vb_results:
+                        _p0b = [r for r in _vb_results if r.get("model_plays_first", False)]
+                        _p1b = [r for r in _vb_results if not r.get("model_plays_first", False)]
+                        if _p0b:
+                            self.writer.add_scalar("eval/win_rate_as_p0_vs_best", sum(1 for r in _p0b if r["model_won"]) / len(_p0b), iteration)
+                        if _p1b:
+                            self.writer.add_scalar("eval/win_rate_as_p1_vs_best", sum(1 for r in _p1b if r["model_won"]) / len(_p1b), iteration)
 
-                # Log training diagnostics
+                # Self-play stats
+                self.writer.add_scalar("selfplay/games_per_min", selfplay_stats.get("games_per_minute", 0), iteration)
+                self.writer.add_scalar("selfplay/num_positions", selfplay_stats.get("num_positions", 0), iteration)
+
+                # Replay buffer health
+                self.writer.add_scalar("buffer/total_positions", self.replay_buffer.total_positions, iteration)
+                self.writer.add_scalar("buffer/num_iterations", self.replay_buffer.num_iterations, iteration)
+
+                # Training diagnostics (epoch averages)
                 for k, v in train_metrics.items():
                     self.writer.add_scalar(f"iter/{k}", v, iteration)
 
@@ -1048,13 +1250,14 @@ class AlphaZeroTrainer:
                     global_step,
                 )
 
-        logger.info("")
-        logger.info("=" * 70)
         if _shutdown_requested:
-            logger.info("  STOPPED GRACEFULLY (last committed: iter%03d)", self.last_committed_iteration)
+            msg = f"  STOPPED GRACEFULLY  (last committed: iter{self.last_committed_iteration:03d})"
+            clr = _CLR_FAIL
         else:
-            logger.info("  TRAINING COMPLETE")
-        logger.info("=" * 70)
+            msg = "  TRAINING COMPLETE"
+            clr = _CLR_OK
+        print(f"\n{_CLR_BAR}{_HBAR}{_CLR_RST}\n{clr}{msg}{_CLR_RST}\n{_CLR_BAR}{_HBAR}{_CLR_RST}\n", flush=True)
+        logger.info(msg.strip())
 
     def _atomic_copy_checkpoint(self, src: Path, dest_name: str) -> Path:
         """Copy checkpoint atomically to checkpoints dir."""
@@ -1170,7 +1373,7 @@ class AlphaZeroTrainer:
         previous_checkpoint: Optional[str],
         staging_dir: Optional[Path] = None,
     ) -> tuple:
-        return train_iteration(
+        result = train_iteration(
             iteration,
             data_path,
             self.config,
@@ -1182,6 +1385,17 @@ class AlphaZeroTrainer:
             iteration_output_dir=staging_dir,
             merged_output_path=str(staging_dir / "merged_training.h5") if staging_dir else None,
         )
+        # Release training dataset memory (PatchworkDataset numpy arrays) back to the OS
+        # before self-play starts. With 2-3 GB datasets, Python's C heap retains freed pages
+        # unless explicitly trimmed, leaving only ~700 MB available for the GPU server subprocess.
+        gc.collect()
+        if sys.platform == "win32":
+            # SetProcessWorkingSetSize(-1, -1) trims the process working set on Windows,
+            # returning freed heap pages to the OS immediately (equivalent to malloc_trim on Linux).
+            ctypes.windll.kernel32.SetProcessWorkingSetSize(
+                ctypes.windll.kernel32.GetCurrentProcess(), -1, -1
+            )
+        return result
 
     def _evaluate_model(self, iteration: int, model_path: str) -> dict:
         eval_results = {}
@@ -1200,7 +1414,7 @@ class AlphaZeroTrainer:
             except Exception:
                 run_pure_mcts = True
 
-        if run_pure_mcts:
+        if run_pure_mcts and num_games_mcts > 0:
             logger.info(f"[EVAL] Playing {num_games_mcts} games vs pure MCTS...")
             pure_mcts_results = self.evaluator.evaluate_vs_baseline(
                 model_path, baseline_type="pure_mcts", num_games=num_games_mcts
@@ -1211,8 +1425,8 @@ class AlphaZeroTrainer:
                 f"avg_margin={pure_mcts_results.get('avg_model_score_margin', 0):.1f}pts  "
                 f"avg_len={pure_mcts_results['avg_game_length']:.0f} moves"
             )
-        else:
-            logger.info(
+        elif not run_pure_mcts and skip_after is not None:
+            logger.debug(
                 f"[EVAL] Skipping pure MCTS (iter {iteration} > skip_after={skip_after})"
             )
 
@@ -1237,7 +1451,8 @@ class AlphaZeroTrainer:
             elif bool(micro_cfg.get("enabled", True)):
                 prev_best_results = self._run_micro_gate(model_path, self.best_model_path, micro_cfg)
             else:
-                logger.info(f"[EVAL] Playing {num_games_best} fixed games vs previous best...")
+                if num_games_best > 0:
+                    logger.info(f"[EVAL] Playing {num_games_best} fixed games vs previous best...")
                 prev_best_results = self.evaluator.evaluate_vs_baseline(
                     model_path,
                     baseline_type="previous_best",
@@ -1255,12 +1470,14 @@ class AlphaZeroTrainer:
                     f"  SPRT={'ACCEPT' if sprt_info.get('accept') else 'REJECT' if sprt_info.get('reject') else 'INCONCLUSIVE'}  "
                     f"LLR={sprt_info.get('llr', 0):.3f}"
                 )
-            logger.info(
-                f"[EVAL] vs previous best: WR={wr:.1%}  "
-                f"avg_margin={margin:.1f}pts  "
-                f"games={prev_best_results.get('total_games', 0)}"
-                f"{sprt_str}"
-            )
+            total_games = prev_best_results.get("total_games", 0)
+            if total_games > 0:
+                logger.info(
+                    f"[EVAL] vs previous best: WR={wr:.1%}  "
+                    f"avg_margin={margin:.1f}pts  "
+                    f"games={total_games}"
+                    f"{sprt_str}"
+                )
 
         return eval_results
 
@@ -1365,7 +1582,7 @@ class AlphaZeroTrainer:
             self.consecutive_rejections = 0
             self.best_model_path = checkpoint_path
             self.best_model_iteration = iteration
-            logger.info("[GATE] >>> MODEL ACCEPTED — will promote to best at commit (iter%03d) <<<", iteration)
+            logger.debug("[GATE] >>> MODEL ACCEPTED — will promote to best at commit (iter%03d) <<<", iteration)
             # Register in league pool if league is active
             if self.league is not None:
                 mid = self.league.model_id(iteration)
@@ -1614,7 +1831,7 @@ class AlphaZeroTrainer:
             or 0
         )
         if num_eval_games <= 0:
-            logger.info("[GATE] Evaluation disabled (games_per_eval <= 0): auto-accepting.")
+            logger.debug("[GATE] Evaluation disabled (games_per_eval <= 0): auto-accepting.")
             return True
 
         if "vs_previous_best" in eval_results:
@@ -1686,7 +1903,7 @@ class AlphaZeroTrainer:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, summary_path)
-        logger.info("Saved iteration summary to %s", summary_path)
+        logger.debug("Saved iteration summary to %s", summary_path)
 
     def _commit_tensorboard_events(self, committed_path: Path) -> None:
         """Copy TensorBoard event files from a committed iteration dir to permanent log dir.
@@ -1761,9 +1978,17 @@ class AlphaZeroTrainer:
         margin_best = eval_results.get("vs_previous_best", {}).get("avg_model_score_margin", 0)
         wr_best_str = f"{wr_best:.1%}" if wr_best >= 0 else "N/A"
         wr_mcts_str = f"{wr_mcts:.1%}" if wr_mcts >= 0 else "N/A"
-        logger.info("")
-        logger.info(
-            "  ITER %03d SUMMARY  |  %s  |  time=%.0fs  |  WR(best)=%s  margin=%.1fpts  |  WR(mcts)=%s  |  loss=%.4f  pol_acc=%.1f%%",
+        _print_iter_summary(
+            iteration=iteration,
+            accepted=accepted,
+            iter_time=iter_time,
+            wr_best_str=wr_best_str,
+            margin_best=margin_best,
+            wr_mcts_str=wr_mcts_str,
+            train_metrics=train_metrics,
+        )
+        logger.debug(
+            "ITER %03d SUMMARY  |  %s  |  time=%.0fs  |  WR(best)=%s  margin=%.1fpts  |  WR(mcts)=%s  |  loss=%.4f  pol_acc=%.1f%%",
             iteration,
             "ACCEPTED" if accepted else "REJECTED",
             iter_time,
@@ -1773,7 +1998,6 @@ class AlphaZeroTrainer:
             train_metrics.get("total_loss", 0),
             train_metrics.get("policy_accuracy", 0) * 100,
         )
-        logger.info("-" * 70)
         _detach_staging_log_handler()
 
         applied_settings = summary.get("applied_settings", {})

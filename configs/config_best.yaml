@@ -97,9 +97,9 @@ training:
 selfplay:
   api_url: null   # Use queue-based GPU server (eval_client); HTTP API not wired
   inference_backend: null
-  api_timeout: 120   # Seconds per inference request; 14 workers + 192 sims need headroom
+  api_timeout: 120   # Seconds per inference request; 12 workers + 192 sims need headroom
   api_retry_attempts: 3
-  num_workers: 16  # 32ch spatial; async shard write enabled (bounded queue)
+  num_workers: 12  # GPU-optimal: ceil(512/48)=11 minimum to fill 1 batch; 12 gives 576 requests (1.1x batch) with ~2.4 GB less RAM vs 16
   max_game_length: 200
   games_per_iteration: 900  # Fallback only; overridden by iteration.games_schedule at every iter
   store_canonical_only: true   # 1 state/move; D4 applied at train time (dynamic)

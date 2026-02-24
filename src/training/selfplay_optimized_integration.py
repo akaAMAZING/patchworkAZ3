@@ -156,7 +156,7 @@ class SelfPlayGenerator:
                 self._worker_shm_names = {}
                 break
         if self._worker_shm_names:
-            logger.info(
+            logger.debug(
                 "Created %d shared memory buffers (%d slots × %d bytes each)",
                 num_workers, parallel_leaves, WorkerSharedBuffer.SLOT_BYTES,
             )
@@ -168,14 +168,14 @@ class SelfPlayGenerator:
             daemon=False,
         )
         self.gpu_process.start()
-        logger.info(f"GPU inference server process started (PID: {self.gpu_process.pid})")
-        logger.info("Waiting for GPU server to initialize...")
+        logger.debug(f"GPU inference server process started (PID: {self.gpu_process.pid})")
+        logger.debug("Waiting for GPU server to initialize...")
 
         # Wait for server to signal it's ready (or timeout after 30s)
         try:
             status = ready_q.get(timeout=30.0)
             if status == "ready":
-                logger.info("GPU inference server ready!")
+                logger.debug("GPU inference server ready!")
             elif status.startswith("error:"):
                 error_msg = status[6:]
                 raise RuntimeError(f"GPU server initialization failed: {error_msg}")
@@ -188,14 +188,14 @@ class SelfPlayGenerator:
     def _stop_gpu_server(self):
         """Stop GPU inference server and destroy shared memory buffers."""
         if self.gpu_process and self.gpu_process.is_alive():
-            logger.info("Stopping GPU inference server...")
+            logger.debug("Stopping GPU inference server...")
             self.stop_evt.set()
             self.gpu_process.join(timeout=5)
             if self.gpu_process.is_alive():
                 logger.warning("GPU server didn't stop gracefully, terminating...")
                 self.gpu_process.terminate()
                 self.gpu_process.join(timeout=2)
-            logger.info("GPU inference server stopped")
+            logger.debug("GPU inference server stopped")
 
         # Destroy shared memory buffers (must be done after GPU server exits)
         for wid, buf in list(self._worker_shm_bufs.items()):
@@ -272,7 +272,7 @@ class SelfPlayGenerator:
             # Log schedule changes
             temp = iteration_config["selfplay"]["mcts"]["temperature"]
             sims = iteration_config["selfplay"]["mcts"]["simulations"]
-            logger.info(
+            logger.debug(
                 "Generating %d games with %d workers (temp=%.2f, sims=%d)%s",
                 num_games,
                 num_workers,
@@ -418,8 +418,7 @@ class SelfPlayGenerator:
                         elapsed = time.time() - selfplay_start_time
                         games_per_min = (len(summaries) / elapsed) * 60.0 if elapsed > 0 else 0
                         logger.info(
-                            f"Completed {len(summaries)}/{num_games} games "
-                            f"({games_per_min:.1f} games/min)"
+                            f"{len(summaries)}/{num_games} ({games_per_min:.1f} games/min)"
                         )
             pool.close()
         except TimeoutError as e:
@@ -601,7 +600,7 @@ class SelfPlayGenerator:
             total_pos = 0
             for i, shard_path in enumerate(shard_files):
                 if i % 100 == 0 and i > 0:
-                    logger.info(f"Merged {i}/{len(shard_files)} shards ({total_pos} positions)")
+                    logger.debug(f"Merged {i}/{len(shard_files)} shards ({total_pos} positions)")
 
                 with np.load(shard_path) as shard:
                     n = shard["states"].shape[0]
@@ -756,7 +755,7 @@ class SelfPlayGenerator:
 
         if not quiet:
             mcts_cfg = config["selfplay"]["mcts"]
-            logger.info(
+            logger.debug(
                 f"Schedule: temp={mcts_cfg['temperature']:.2f}  sims={mcts_cfg['simulations']}  "
                 f"alpha={mcts_cfg['root_dirichlet_alpha']}  noise={mcts_cfg['root_noise_weight']}"
             )

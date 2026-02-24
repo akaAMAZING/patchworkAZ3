@@ -188,7 +188,7 @@ class PatchworkDataset(Dataset):
         self.d4_on_gpu = bool(train_cfg.get("d4_on_gpu", False))
 
         # Load entire dataset into RAM (one sequential read, fast even with LZF)
-        logger.info("Loading training data into RAM from %s ...", h5_path)
+        logger.debug("Loading training data into RAM from %s ...", h5_path)
         load_start = time.time()
         with h5py.File(self.h5_path, "r") as f:
             states_key = "spatial_states" if "spatial_states" in f else "states"
@@ -526,7 +526,7 @@ class Trainer:
             # Pre-split into flat lists for _foreach_lerp_ (avoids per-step tuple unpacking)
             self._ema_tensors: List[torch.Tensor] = [p[0] for p in self._ema_pairs]
             self._param_tensors: List[torch.Tensor] = [p[1] for p in self._ema_pairs]
-            logger.info(
+            logger.debug(
                 "[EMA] enabled decay=%.4f use_for_selfplay=%s use_for_eval=%s (%d params)",
                 self.ema_decay, self.ema_use_for_selfplay, self.ema_use_for_eval, len(self._ema_pairs),
             )
@@ -895,31 +895,28 @@ class Trainer:
                 )
 
             if self.global_step % 10 == 0:
-                # Core training metrics only — no noise
-                for k in ("total_loss", "policy_loss", "value_loss", "policy_accuracy", "policy_entropy"):
+                # Core training metrics
+                for k in ("total_loss", "policy_loss", "value_loss", "policy_accuracy", "policy_entropy",
+                          "policy_top5_accuracy"):
                     if k in metrics:
+                        self.writer.add_scalar(f"train/{k}", metrics[k], self.global_step)
+                # Auxiliary head losses (only log when non-zero)
+                for k in ("ownership_loss", "score_loss"):
+                    if metrics.get(k, 0.0) > 0:
                         self.writer.add_scalar(f"train/{k}", metrics[k], self.global_step)
                 self.writer.add_scalar("train/grad_norm", grad_norm.item(), self.global_step)
                 self.writer.add_scalar("train/learning_rate", self.scheduler.get_last_lr()[0], self.global_step)
-                # EMA L2 diff (small metric to confirm EMA is tracking)
-                if self.ema_enabled and self.ema_state_dict is not None and self.global_step % 100 == 0:
-                    l2_sum = 0.0
-                    with torch.no_grad():
-                        for k, v in self.network.state_dict().items():
-                            if k in self.ema_state_dict:
-                                diff = v - self.ema_state_dict[k]
-                                l2_sum += diff.float().pow(2).sum().item()
-                    l2_norm = math.sqrt(l2_sum)
-                    self.writer.add_scalar("train/ema_l2_diff", l2_norm, self.global_step)
 
             if val_loader is not None and self.global_step % self.config["training"]["val_frequency"] == 0:
                 val_metrics = self.validate(val_loader)
 
-                for k in ("total_loss", "policy_loss", "value_loss", "score_loss", "policy_accuracy", "policy_entropy"):
+                for k in ("total_loss", "policy_loss", "value_loss", "score_loss",
+                          "policy_accuracy", "policy_entropy", "policy_top5_accuracy",
+                          "ownership_loss"):
                     if k in val_metrics:
                         self.writer.add_scalar(f"val/{k}", val_metrics[k], self.global_step)
 
-                logger.info(f"Step {self.global_step}: Val loss = {val_metrics['total_loss']:.4f}")
+                logger.debug(f"Step {self.global_step}: Val loss = {val_metrics['total_loss']:.4f}")
 
                 if val_metrics["total_loss"] < self.best_val_loss:
                     self.best_val_loss = val_metrics["total_loss"]

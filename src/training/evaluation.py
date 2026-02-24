@@ -332,7 +332,7 @@ class Evaluator:
         logger.debug(f"Evaluating {candidate_name} vs {baseline_label}{extra}")
 
         if int(num_games) <= 0:
-            logger.info("num_games <= 0; skipping evaluation.")
+            logger.debug("num_games <= 0; skipping evaluation.")
             return {
                 "model_wins": 0,
                 "baseline_wins": 0,

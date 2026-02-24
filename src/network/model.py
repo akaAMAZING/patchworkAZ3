@@ -451,7 +451,7 @@ class PatchworkNetwork(nn.Module):
             try:
                 masks_np, areas_np = _build_piece_masks_5x5()
                 self.det_legality = DeterministicLegalityModule(masks_np, areas_np)
-                logger.info(
+                logger.debug(
                     "DeterministicLegalityModule initialised (%d filters, %dx%d kernels).",
                     self.det_legality.N_FILTERS, 5, 5,
                 )

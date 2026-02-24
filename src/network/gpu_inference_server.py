@@ -108,7 +108,7 @@ class GPUInferenceServer:
         self._expected_encoding = (
             _GV2_ENC if getattr(self.model, "use_film", False) else "full_clarity_v1"
         )
-        logger.info("GPU server expects encoding_version=%s", self._expected_encoding)
+        logger.debug("GPU server expects encoding_version=%s", self._expected_encoding)
 
         # Open per-worker shared memory buffers (zero-copy IPC path).
         # Workers write encoded state into SHM; server reads via numpy views.
@@ -123,7 +123,7 @@ class GPUInferenceServer:
                     except Exception as e:
                         logger.warning("Failed to open SHM wid=%d name=%s: %s", wid, name, e)
                 if self._worker_shm:
-                    logger.info("GPU server opened %d worker SHM buffers (zero-copy IPC active)",
+                    logger.debug("GPU server opened %d worker SHM buffers (zero-copy IPC active)",
                                 len(self._worker_shm))
             except ImportError:
                 logger.warning("shared_state_buffer not available — SHM IPC disabled")
@@ -139,7 +139,7 @@ class GPUInferenceServer:
         if self.device.type != "cuda":
             return
         t0 = time.time()
-        logger.info("GPU server: running cuDNN warmup inference...")
+        logger.debug("GPU server: running cuDNN warmup inference...")
         try:
             enc = self._expected_encoding
             B = min(self.settings.batch_size, 32)  # small but representative batch
@@ -172,7 +172,7 @@ class GPUInferenceServer:
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
 
-            logger.info("GPU server: cuDNN warmup done in %.1fs", time.time() - t0)
+            logger.debug("GPU server: cuDNN warmup done in %.1fs", time.time() - t0)
         except Exception as e:
             logger.warning("GPU server warmup failed (non-fatal): %s", e)
 
@@ -433,13 +433,13 @@ def run_gpu_inference_server(
     logger = logging.getLogger(__name__)
 
     try:
-        logger.info("Initializing GPU inference server (device=%s)...", device)
+        logger.debug("Initializing GPU inference server (device=%s)...", device)
         sys.stdout.flush()
         server = GPUInferenceServer(
             config=config, checkpoint_path=checkpoint_path, device=device,
             worker_shm_names=worker_shm_names,
         )
-        logger.info("GPU server initialized successfully, running warmup...")
+        logger.debug("GPU server initialized successfully, running warmup...")
         sys.stdout.flush()
         server._warmup_inference()
 
