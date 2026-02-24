@@ -171,9 +171,10 @@ class SelfPlayGenerator:
         logger.debug(f"GPU inference server process started (PID: {self.gpu_process.pid})")
         logger.debug("Waiting for GPU server to initialize...")
 
-        # Wait for server to signal it's ready (or timeout after 30s)
+        # Wait for server to signal it's ready (or timeout after 120s)
+        # cudnn.benchmark profiling can take 30-90s; 120s gives safe headroom.
         try:
-            status = ready_q.get(timeout=30.0)
+            status = ready_q.get(timeout=120.0)
             if status == "ready":
                 logger.debug("GPU inference server ready!")
             elif status.startswith("error:"):
@@ -297,7 +298,7 @@ class SelfPlayGenerator:
             generation_time = time.time() - start_time
             stats = self._compute_stats(game_summaries, generation_time)
 
-            logger.info(
+            logger.debug(
                 f"Generated {len(game_summaries)} games "
                 f"({stats.get('num_positions', 0)} positions) in {generation_time:.1f}s"
             )

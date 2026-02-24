@@ -1089,7 +1089,7 @@ class AlphaZeroTrainer:
                     rejections=self.consecutive_rejections,
                     applied_settings=applied_settings,
                 )
-                logger.info(
+                logger.debug(
                     "ITER %03d/%d  best=%s  rejects=%d  buf=%d pos",
                     iteration, total_iterations, best_label,
                     self.consecutive_rejections, self.replay_buffer.total_positions,
@@ -1249,6 +1249,15 @@ class AlphaZeroTrainer:
                     iter_time,
                     global_step,
                 )
+
+                # Flush GPU memory after training/eval before next iteration spawns a new CUDA
+                # context in the self-play GPU server. Without this, nvcuda64.dll can crash
+                # (STATUS_STACK_BUFFER_OVERRUN, 0xc0000409) if the driver teardown races with
+                # a new context init — confirmed via Windows Event Log at iter017.
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    time.sleep(3)
 
         if _shutdown_requested:
             msg = f"  STOPPED GRACEFULLY  (last committed: iter{self.last_committed_iteration:03d})"
@@ -1819,7 +1828,7 @@ class AlphaZeroTrainer:
         # net, but it MUST become latest_model_path so subsequent iterations have
         # a valid baseline for evaluation and self-play.
         if self.current_iteration == 0:
-            logger.info("[GATE] Iteration 0: auto-accepting model (bootstrap).")
+            logger.debug("[GATE] Iteration 0: auto-accepting model (bootstrap).")
             return True
 
         # [C2 FIX] When evaluation is disabled (games_per_eval/games_vs_* <= 0),

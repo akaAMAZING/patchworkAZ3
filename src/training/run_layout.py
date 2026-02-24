@@ -534,8 +534,8 @@ def commit_iteration(
             pass
 
     if manifest["commit_method"] == "rename":
-        logger.info("Committed iter%03d successfully; last_committed_iteration updated.", iteration)
+        logger.debug("Committed iter%03d successfully; last_committed_iteration updated.", iteration)
     else:
-        logger.info("Committed iter%03d successfully (copy); last_committed_iteration updated.", iteration)
+        logger.debug("Committed iter%03d successfully (copy); last_committed_iteration updated.", iteration)
 
     return manifest
