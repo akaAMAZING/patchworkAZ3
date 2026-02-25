@@ -256,17 +256,10 @@ iteration:
   - iteration: 300
     alpha: 0.03      # floor: never go below 0.03
 
-  # KataGo dynamic score utility ramp: start at 0 while score head is near-random,
-  # ramp to full 0.30 by iter80 once the score head has learned meaningful predictions.
-  # The mcts.dynamic_score_utility_weight value is the fallback when no schedule is defined.
+  # Dynamic score utility weight — flat 0.30 (KataGo self-play default).
+  # Ramp was only useful iter0-20 while score head was near-random; past that, hold at 0.30.
   dynamic_score_utility_weight_schedule:
   - iteration: 0
-    dynamic_score_utility_weight: 0.0
-  - iteration: 20
-    dynamic_score_utility_weight: 0.10
-  - iteration: 50
-    dynamic_score_utility_weight: 0.20
-  - iteration: 80
     dynamic_score_utility_weight: 0.30
 
   # Shifted up to prevent value overfitting (ML review)
