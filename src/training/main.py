@@ -2021,6 +2021,17 @@ class AlphaZeroTrainer:
             "elo_ratings": self.elo_tracker.ratings,
             "applied_settings": applied_settings,
         }
+        # Delete merged_training.h5 before commit — it's a temporary merge artifact
+        # (~8GB) used only during training. commit_iteration() moves the entire staging
+        # dir to committed/, so we must remove it beforehand to avoid accumulating GBs.
+        merged_tmp = staging_dir(self.run_root, iteration) / "merged_training.h5"
+        if merged_tmp.exists():
+            try:
+                merged_tmp.unlink()
+                logger.debug("Deleted staging merged_training.h5 for iter%03d", iteration)
+            except Exception as e:
+                logger.warning("Could not delete merged_training.h5: %s", e)
+
         commit_iteration(self.run_root, iteration, manifest)
 
         # Append staged training log to permanent log (only completed iterations)

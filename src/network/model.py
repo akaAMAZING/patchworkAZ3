@@ -342,7 +342,8 @@ class PolicyHead(nn.Module):
         else:
             self.fc = nn.Linear(policy_in, max_actions)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, g: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Legacy head ignores g; kept for call-site compatibility with StructuredConvPolicyHead."""
         x = F.relu(self.bn(self.conv(x)), inplace=True)
         p = x.flatten(start_dim=1)
         if self._use_factorized:
