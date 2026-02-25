@@ -542,7 +542,7 @@ def _get_num_games_for_iteration(config: dict, iteration: int) -> int:
 
 
 def _apply_q_value_weight_and_cpuct_schedules(config: dict, iteration: int) -> tuple:
-    """Apply q_value_weight and cpuct schedules; mutate config. Returns (qvw, cpuct)."""
+    """Apply q_value_weight, cpuct, and dynamic_score_utility_weight schedules; mutate config."""
     sp = config.get("selfplay", {}) or {}
     mcts = sp.get("mcts", {}) or {}
     eval_cfg = config.get("evaluation", {}) or {}
@@ -563,6 +563,14 @@ def _apply_q_value_weight_and_cpuct_schedules(config: dict, iteration: int) -> t
     lock_eval = bool(eval_cfg.get("lock_eval_cpuct_to_selfplay", True))
     if lock_eval and "eval_mcts" in eval_cfg:
         config["evaluation"]["eval_mcts"]["cpuct"] = cpuct
+
+    # KataGo dynamic score utility weight schedule: ramps up as score head matures.
+    # Prevents noisy early-iteration score predictions from corrupting MCTS search.
+    dsuw_base = float(mcts.get("dynamic_score_utility_weight", 0.3))
+    dsuw_sched = iter_cfg.get("dynamic_score_utility_weight_schedule", [])
+    dsuw = float(_step_schedule_lookup(dsuw_sched, iteration, "dynamic_score_utility_weight", dsuw_base))
+    dsuw = max(0.0, min(1.0, dsuw))
+    config["selfplay"]["mcts"]["dynamic_score_utility_weight"] = dsuw
 
     return qvw, cpuct
 
@@ -741,7 +749,7 @@ class AlphaZeroTrainer:
                 "simulations": int(mcts.get("simulations", 0)),
                 "q_value_weight": float(sp.get("q_value_weight", 0.0)),
                 "static_score_utility_weight": float(mcts.get("static_score_utility_weight", 0.0)),
-                "dynamic_score_utility_weight": float(mcts.get("dynamic_score_utility_weight", 0.3)),
+                "dynamic_score_utility_weight": float(mcts.get("dynamic_score_utility_weight", 0.3)),  # schedule-applied
             },
             "training": {
                 "lr": float(train.get("learning_rate", 0.0)),
