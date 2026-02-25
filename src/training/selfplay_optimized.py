@@ -543,7 +543,13 @@ class OptimizedSelfPlayWorker:
                 move_idx = i // aug_factor
                 if move_idx < len(move_root_qs):
                     q = move_root_qs[move_idx]
-                    values[i] = (1.0 - q_w) * z_value + q_w * q
+                    # Clamp Q to [-1, 1] before mixing into the value target.
+                    # MCTS utility (value + score_utility) can exceed ±1 at terminal/near-terminal
+                    # positions; the value head is bounded by tanh to [-1,1], so training on
+                    # targets outside this range causes gradient saturation.  Score information
+                    # already enters training via the dedicated score head target (z_score).
+                    q_clamped = max(-1.0, min(1.0, q))
+                    values[i] = (1.0 - q_w) * z_value + q_w * q_clamped
                 else:
                     values[i] = z_value
             else:

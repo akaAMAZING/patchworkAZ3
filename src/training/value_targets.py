@@ -11,9 +11,11 @@ KataGo Dual-Head Architecture:
   small differences (~5 pts) map to ~0.16 — preserving meaningful gradient
   signal throughout.
 
-  During MCTS the two signals are blended via:
-    utility = value + score_utility_weight * score
-  so the agent maximises margin while maintaining wins.
+  During MCTS the two signals are blended via KataGo's dual formula:
+    utility = value + static_w * score + dynamic_w * (score - root_score)
+  where root_score is the network's score prediction at the root of each search.
+  KataGo self-play defaults: static_w=0.0, dynamic_w=0.3 (pure dynamic).
+  Dynamic centering means MCTS always pushes to exceed the root's predicted margin.
 
   IMPORTANT: score targets stored in the replay buffer are tanh-normalised.
   Any existing replay data with raw integer targets is incompatible and must

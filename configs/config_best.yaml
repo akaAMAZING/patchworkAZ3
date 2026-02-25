@@ -109,7 +109,13 @@ selfplay:
   mcts:
     simulations: 192
     parallel_leaves: 48
-    score_utility_weight: 0.1     # Raised: tanh score in [-1,1] so 5× weight still safe; adds meaningful margin pressure
+    # KataGo dual-head score utility (self-play defaults from KataGo GitHub issue #344)
+    # Dynamic only (static=0.0) — KataGo self-play training rationale: "always trying to
+    # gain points seems like a decent instinct to train into the neural net."
+    # Dynamic centres on root_score so MCTS always pushes to exceed the predicted margin.
+    static_score_utility_weight: 0.0      # Pure dynamic (KataGo self-play config)
+    dynamic_score_utility_weight: 0.3     # KataGo self-play default: 0.3
+    score_utility_scale: 30.0             # tanh divisor; must match value_targets._SCORE_NORMALISE_DIVISOR
     cpuct: 1.47                       # Base; iteration.cpuct_schedule overrides
     temperature: 1.0
     temperature_threshold: 15

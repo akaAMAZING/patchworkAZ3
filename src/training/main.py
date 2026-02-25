@@ -740,7 +740,8 @@ class AlphaZeroTrainer:
                 "cpuct": float(mcts.get("cpuct", 1.5)),
                 "simulations": int(mcts.get("simulations", 0)),
                 "q_value_weight": float(sp.get("q_value_weight", 0.0)),
-                "score_utility_weight": float(mcts.get("score_utility_weight", 0.02)),
+                "static_score_utility_weight": float(mcts.get("static_score_utility_weight", 0.0)),
+                "dynamic_score_utility_weight": float(mcts.get("dynamic_score_utility_weight", 0.3)),
             },
             "training": {
                 "lr": float(train.get("learning_rate", 0.0)),

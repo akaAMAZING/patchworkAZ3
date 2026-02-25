@@ -377,8 +377,11 @@ class ValueHead(nn.Module):
         self.global_inject_dim = global_inject_dim
         self.fc1 = nn.Linear(value_channels * 9 * 9 + global_inject_dim, value_hidden)
         self.fc2 = nn.Linear(value_hidden, 1)
-        # KataGo-style score head: predicts tanh-normalised score margin
-        self.score_head = nn.Sequential(nn.Linear(value_hidden, 1)) if with_score_head else None
+        # KataGo-style score head: predicts tanh-normalised score margin in (-1, 1).
+        # Tanh output activation ensures the prediction is bounded to match training targets
+        # (tanh(margin/30)), preventing unbounded output from distorting MCTS utility blending.
+        # Zero-init on the Linear keeps value≈0 at training start (tanh(0)=0). ✓
+        self.score_head = nn.Sequential(nn.Linear(value_hidden, 1), nn.Tanh()) if with_score_head else None
 
     def forward(
         self,

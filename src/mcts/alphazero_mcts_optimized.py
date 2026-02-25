@@ -169,10 +169,14 @@ class MCTSConfig:
     # the network already evaluated highly, rather than exploring randomly.
     # 0.0 = no reduction (legacy), 0.25 = KataGo default for value head.
     fpu_reduction: float = 0.25
-    # KataGo Dual-Head: blend value [-1,1] and raw score margin into MCTS utility.
-    # utility = value + score_utility_weight * score
-    # Small weight because score magnitudes are much larger than value.
-    score_utility_weight: float = 0.02
+    # KataGo Dual-Head: blend value [-1,1] and tanh-normalised score into MCTS utility.
+    # utility = value + static_w * score + dynamic_w * (score - root_score)
+    # KataGo self-play defaults: static=0.0, dynamic=0.3 (dynamic only — always seek improvement).
+    # Dynamic centering: root_score set from the network's score estimate at the root position.
+    # This means MCTS always pushes to exceed the root's predicted margin, not just to be ahead.
+    static_score_utility_weight: float = 0.0   # Absolute score lead (disabled in self-play)
+    dynamic_score_utility_weight: float = 0.3  # Relative score gain vs. root prediction
+    score_utility_scale: float = 30.0          # tanh divisor; matches value_targets._SCORE_NORMALISE_DIVISOR
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +195,7 @@ class MCTSNode:
         "state", "to_move", "parent", "children",
         "_visit_count", "_total_value", "_prior", "_virtual_loss",
         "legal_actions", "_action_to_idx", "terminal", "terminal_value", "n_total",
+        "score_estimate",  # raw tanh-normalised score from last network evaluation; used for dynamic centering on tree reuse
     )
 
     def __init__(self, state, to_move: int, parent: Optional["MCTSNode"] = None):
@@ -208,6 +213,7 @@ class MCTSNode:
         self.terminal: bool = False
         self.terminal_value: Optional[float] = None
         self.n_total = 0
+        self.score_estimate: float = 0.0  # network score prediction; 0.0 = uninitialised / neutral
 
     def _init_arrays(self) -> None:
         """Allocate arrays once legal_actions are known."""
@@ -376,9 +382,47 @@ class OptimizedAlphaZeroMCTS:
         # Initialised with a default; callers can reset via set_noise_seed().
         self._noise_rng = np.random.default_rng(42)
 
+        # KataGo dynamic score centering: root's predicted score margin at the start of each search.
+        # Updated in search() from the root node's score_estimate (stored on MCTSNode).
+        # All non-terminal evaluations and terminal backups use this as the dynamic reference.
+        self._search_root_score: float = 0.0
+
     def set_noise_seed(self, seed: int) -> None:
         """Reset the Dirichlet noise RNG. Call before each game for reproducibility."""
         self._noise_rng = np.random.default_rng(seed)
+
+    # ------------------------------------------------------------------
+    # Score utility (KataGo dual-head)
+    # ------------------------------------------------------------------
+
+    def _compute_score_utility(self, score: float) -> float:
+        """
+        Compute the score component of MCTS utility (KataGo dual-head pattern).
+
+        Args:
+            score: tanh-normalised score margin in (-1, 1), from to_move perspective.
+                   For non-terminal nodes: the network's score head output (with tanh).
+                   For terminal nodes: tanh(raw_margin / score_utility_scale).
+
+        Returns:
+            Score utility to ADD to the value head output for MCTS backup.
+
+        Formula:
+            static  = static_w  * score
+            dynamic = dynamic_w * (score - root_score)
+            total   = static + dynamic
+
+        KataGo self-play defaults (this config):
+            static_w  = 0.0  (disabled — pure dynamic like KataGo self-play)
+            dynamic_w = 0.3  (always push to exceed root's predicted margin)
+
+        The dynamic component centres around self._search_root_score, set at the start
+        of each search from the root node's score_estimate. When root_score = 0 (first
+        batch before root is evaluated, or truly neutral position), dynamic == static.
+        """
+        static = self.config.static_score_utility_weight * score
+        dynamic = self.config.dynamic_score_utility_weight * (score - self._search_root_score)
+        return static + dynamic
 
     # ------------------------------------------------------------------
     # Public API
@@ -430,6 +474,12 @@ class OptimizedAlphaZeroMCTS:
         # Reused root may need expansion if it was a leaf (shouldn't happen, but be safe)
         if not root.is_expanded() and not root.terminal:
             self._expand_and_evaluate(root, precomputed_legal=root_legal_actions)
+
+        # KataGo dynamic score centering: set the reference score from the root's network prediction.
+        # _expand_and_evaluate stores root.score_estimate; for reused roots this carries over from
+        # the previous search (stable since the position hasn't changed).
+        # All MCTS backups this search will use (score - _search_root_score) as the dynamic component.
+        self._search_root_score = root.score_estimate
 
         # Use batched MCTS if parallel_leaves > 1 (both local network and eval_client modes)
         if self.config.parallel_leaves > 1 and (self.network is not None or self.eval_client is not None):
@@ -700,12 +750,14 @@ class OptimizedAlphaZeroMCTS:
 
             resp_priors = []
             resp_values = []
+            raw_scores = []  # tanh-normalised scores for score_estimate storage and dynamic centering
             for rid in req_rids:
                 priors_legal, value, score = self.eval_client.receive(rid)
+                raw_score = float(score)
                 resp_priors.append(priors_legal)
-                w = float(self.config.score_utility_weight)
-                utility = float(value) + w * float(score)
+                utility = float(value) + self._compute_score_utility(raw_score)
                 resp_values.append(utility)
+                raw_scores.append(raw_score)
 
             out_values = []
             nonterm_idx = 0
@@ -717,6 +769,7 @@ class OptimizedAlphaZeroMCTS:
                 priors_legal = resp_priors[nonterm_idx]
                 node._prior[:] = priors_legal[:len(node.legal_actions)]
                 node.normalize_priors()
+                node.score_estimate = raw_scores[nonterm_idx]  # store for tree-reuse dynamic centering
 
                 out_values.append(resp_values[nonterm_idx])
                 nonterm_idx += 1
@@ -764,8 +817,15 @@ class OptimizedAlphaZeroMCTS:
 
         value_t = value_t.squeeze(-1)
         score_t = score_t.squeeze(-1)
-        w = float(self.config.score_utility_weight)
-        utility_t = value_t + w * score_t
+        # KataGo dynamic score utility: static_w * score + dynamic_w * (score - root_score)
+        # Vectorised: root_score is a scalar constant for the whole batch.
+        w_s = self.config.static_score_utility_weight
+        w_d = self.config.dynamic_score_utility_weight
+        root_s = self._search_root_score
+        utility_t = value_t + w_s * score_t + w_d * (score_t - root_s)
+
+        # Extract scores to CPU for score_estimate storage (one .cpu() call for the whole batch)
+        score_cpu = score_t.float().cpu().numpy()  # (B,)
 
         out_values: List[float] = []
         nonterm_idx = 0
@@ -784,6 +844,7 @@ class OptimizedAlphaZeroMCTS:
 
             node._prior[:] = priors_cpu[:len(node.legal_actions)]
             node.normalize_priors()
+            node.score_estimate = float(score_cpu[nonterm_idx])  # store for tree-reuse dynamic centering
 
             out_values.append(float(utility_t[nonterm_idx].item()))
             nonterm_idx += 1
@@ -829,9 +890,9 @@ class OptimizedAlphaZeroMCTS:
                 )
             else:
                 priors_legal, v, s = self.eval_client.evaluate(state_np, action_mask, legal_idxs_np)
-            # Utility blend for MCTS backup
-            w = float(self.config.score_utility_weight)
-            value = float(v) + w * float(s)
+            raw_score = float(s)
+            node.score_estimate = raw_score  # store for tree-reuse dynamic centering
+            value = float(v) + self._compute_score_utility(raw_score)
             # Bulk set priors directly into array
             node._prior[:] = priors_legal[:len(node.legal_actions)]
         else:
@@ -871,8 +932,8 @@ class OptimizedAlphaZeroMCTS:
 
                 v = float(value_t.item())
                 s = float(score_t.item())
-                w = float(self.config.score_utility_weight)
-                value = v + w * s
+                node.score_estimate = s  # store for tree-reuse dynamic centering
+                value = v + self._compute_score_utility(s)
 
                 idx_t = torch.as_tensor(legal_action_indices, device=self.device, dtype=torch.long)
                 legal_logits = policy_logits.squeeze(0).index_select(0, idx_t)
@@ -910,19 +971,30 @@ class OptimizedAlphaZeroMCTS:
 
     def _get_terminal_value(self, state, to_move: int) -> float:
         """
-        Terminal utility from perspective of to_move.
-        Value is strictly -1/0/1; for terminals we use value as utility
-        (score_utility_weight only applies to non-terminal network evaluation).
+        Terminal utility from perspective of to_move (KataGo-consistent).
+
+        Includes score utility using the actual final score margin, centred on
+        self._search_root_score for the dynamic component.  This makes terminal
+        backups consistent with non-terminal network evaluations — both use the
+        same utility formula — so the MCTS value averages are numerically coherent.
+
+        Note: the resulting utility can exceed [-1, 1] (e.g. 1 + 0.3*(1 - root_s)).
+        Q-value mixing in selfplay clamps the root Q to [-1, 1] before blending
+        into value-head training targets, keeping the value head well-conditioned.
         """
         score0 = compute_score_fast(state, 0)
         score1 = compute_score_fast(state, 1)
         winner = int(get_winner_fast(state))
-        return terminal_value_from_scores(
+        value = terminal_value_from_scores(
             score0=score0,
             score1=score1,
             winner=winner,
             to_move=int(to_move),
         )
+        # Tanh-normalised score margin from to_move's perspective (same scale as network output)
+        raw_margin = float(int(score0) - int(score1)) if int(to_move) == 0 else float(int(score1) - int(score0))
+        score = math.tanh(raw_margin / self.config.score_utility_scale)
+        return value + self._compute_score_utility(score)
 
 
 # ---------------------------------------------------------------------------
@@ -951,7 +1023,14 @@ def create_optimized_mcts(
         root_noise_weight=float(mcts_cfg.get("root_noise_weight", 0.25)),
         virtual_loss=float(mcts_cfg.get("virtual_loss", 1.0)),
         fpu_reduction=float(mcts_cfg.get("fpu_reduction", 0.25)),  # KataGo default
-        score_utility_weight=float(mcts_cfg.get("score_utility_weight", 0.02)),
+        # KataGo dual-head score utility (self-play defaults: static=0.0, dynamic=0.3)
+        # Backward-compat: if only legacy score_utility_weight is set, treat it as static.
+        static_score_utility_weight=float(mcts_cfg.get(
+            "static_score_utility_weight",
+            mcts_cfg.get("score_utility_weight", 0.0),  # legacy key → static (0.0 if absent)
+        )),
+        dynamic_score_utility_weight=float(mcts_cfg.get("dynamic_score_utility_weight", 0.3)),
+        score_utility_scale=float(mcts_cfg.get("score_utility_scale", 30.0)),
         enable_tree_reuse=enable_tree_reuse if enable_tree_reuse is not None else bool(mcts_cfg.get("enable_tree_reuse", False)),
     )
 
