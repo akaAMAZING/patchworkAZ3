@@ -1,10 +1,10 @@
 # Patchwork AZ Run Metrics Export
 
-All metrics from runs iter000 through iter024. Source: logs/metadata.jsonl, logs/tensorboard/, runs/patchwork_production/committed/.
+All metrics from runs iter000 through iter33. Source: logs/metadata.jsonl, logs/tensorboard/, runs/patchwork_production/committed/.
 
 ## Files
 
-- **iter_metrics.csv**: One row per iteration (0–24). Columns:
+- **iter_metrics.csv**: One row per iteration (0–33). Columns:
   - `iteration`, `timestamp_utc`, `config_hash`, `config_path`, `best_model_hash`
   - `accepted`, `global_step`, `iter_time_s`, `replay_positions`, `consecutive_rejections`
   - `best_model`, `eval_vs_best_wr`, `eval_vs_best_margin`, `eval_vs_mcts_wr`
@@ -14,7 +14,10 @@ All metrics from runs iter000 through iter024. Source: logs/metadata.jsonl, logs
 - **tensorboard_scalars.csv**: TensorBoard scalar events. Columns: `step_or_iteration`, `tag`, `value`.
   - Tags include: train/* (per-step), val/*, iter/*, selfplay/*, buffer/*, eval/*
 
-- **training_epochs.csv**: Per-epoch training metrics from training.log (iters 12–24). Columns: iteration, epoch, epoch_time_s, loss, pol_loss, val_loss, own_loss, own_acc_pct, pol_acc_pct, top5_pct, val_mse, grad.
+- **training_epochs.csv**: Per-epoch training metrics from training.log. Columns: iteration, epoch, epoch_time_s, loss, pol_loss, val_loss, own_loss, own_acc_pct, pol_acc_pct, top5_pct, val_mse, grad.
+
+- **iter_metrics_25_33.csv**: Filtered to iterations 25–33 only (same columns as iter_metrics.csv).
+- **training_epochs_25_33.csv**: Filtered to iterations 25–33 only (same columns as training_epochs.csv).
 
 - **run_state.json**, **elo_state.json**, **environment.json**: Run context (hardware, config, ELO state).
 

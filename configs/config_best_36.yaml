@@ -1,0 +1,358 @@
+# PATCHWORK ALPHAZERO - PRODUCTION TRAINING (200-400 iterations)
+# ===============================================================
+# Hardware: RTX 3080 (10GB) / Ryzen 5900X (12 cores / 24 threads) / 16GB RAM
+# Goal: Maximum playing strength over 200-400 iterations
+# Strategy: No gating. Every model promoted immediately. Trust the process.
+#
+# LR: base 0.0016 @ iter 0; 0.0008 @ 80; 0.0004 @ 200 (step schedule, no interpolation).
+# Per-iteration cosine warmup still applies within each phase.
+#
+# USAGE:
+#   python tools/preflight.py --config "configs/config_best.yaml"
+#   python -m src.training.main --config "configs/config_best.yaml"
+
+seed: 42
+deterministic: false
+
+hardware:
+  device: cuda
+  pin_memory: true
+  persistent_workers: true
+  prefetch_batches: 2   # [PERF] Overlap next(data_iter) with GPU compute via background thread
+
+# Dataset/state channel compatibility (gold_v2_32ch)
+data:
+  allow_legacy_state_channels: false
+  encoding_version: gold_v2_32ch
+  expected_spatial_channels: 32
+  expected_global_dim: 61
+  expected_track_shape: [8, 54]
+  expected_shop_shapes: [33, 10]
+
+network:
+  input_channels: 56
+  num_res_blocks: 18
+  channels: 128
+  policy_channels: 48
+  policy_hidden: 512
+  use_factorized_policy_head: true
+  value_channels: 48
+  value_hidden: 512
+  max_actions: 2026
+  dropout: 0.0
+  weight_decay: 0.0002
+  use_batch_norm: true
+  activation: relu
+  se_ratio: 0.0625
+  ownership_channels: 48
+  # FiLM conditioning: gold_v2 multimodal (concat global + track + shop)
+  use_film: true
+  film_hidden: 256
+  film_global_dim: 61
+  film_track_dim: 432
+  film_shop_dim: 128
+  film_per_block: true
+  film_track_use_conv: true       # Conv1d over track sequence (8ch × 54 positions) instead of flat MLP
+  film_global_inject_dim: 64      # Direct global feature injection into value + pass-logit heads
+
+training:
+  optimizer: adamw
+  learning_rate: 0.0016              # Base LR; iteration.lr_schedule overrides per phase
+  lr_schedule: cosine_warmup_per_phase  # Phases from iteration.lr_schedule; warmup once per phase, no restart each iter
+  warmup_steps: 20
+  d4_augmentation: dynamic           # dynamic = apply D4 per sample; store = legacy pre-augmented
+  d4_on_gpu: false                  # CPU D4 is faster: vectorized numpy in dataset; GPU path has ~15s/batch loop overhead
+  d4_gpu_deterministic_test_mode: false  # If true: fixed seed per batch for reproducible D4 (testing only)
+  resume_optimizer_state: false     # false = fresh optimizer each iter (clean iter-boundary workflow)
+  resume_scheduler_state: false     # false = warm restart each iter; no mid-iter resume
+  resume_scaler_state: false        # follows optimizer
+  min_lr: 0.000032                   # ~50:1 ratio with base LR
+  batch_size: 1024
+  use_amp: true
+  amp_dtype: bfloat16
+  policy_loss_weight: 1.0
+  value_loss_weight: 1.0
+  score_loss_weight: 0.3          # Raised: tanh targets in [-1,1] have much smaller MSE than raw integers
+  ownership_loss_weight: 0.15
+  epochs_per_iteration: 2
+  val_split: 0.08
+  val_frequency: 1000
+  # profile_training_steps: 5   # Uncomment to log per-step timings for bottleneck diagnosis
+  checkpoint_frequency: 10000
+  keep_last_n_checkpoints: 200
+  save_best: false
+  best_metric: val_loss
+  early_stopping:
+    enabled: false
+    patience: 5
+    min_delta: 0.001
+  max_grad_norm: 1.0
+  allow_tf32: true   # Align with inference.allow_tf32 for matmul/cudnn
+  matmul_precision: high   # Throughput on RTX 3080 when TF32 allowed
+  ema:
+    enabled: true
+    decay: 0.999     # Polyak averaging; 0.999 ~ 1000-step half-life
+    use_for_selfplay: true
+    use_for_eval: true
+    save_checkpoint: true
+
+selfplay:
+  api_url: null   # Use queue-based GPU server (eval_client); HTTP API not wired
+  inference_backend: null
+  api_timeout: 120   # Seconds per inference request; 12 workers + 192 sims need headroom
+  api_retry_attempts: 3
+  num_workers: 12  # GPU-optimal: ceil(512/48)=11 minimum to fill 1 batch; 12 gives 576 requests (1.1x batch) with ~2.4 GB less RAM vs 16
+  max_game_length: 200
+  games_per_iteration: 900  # Fallback only; overridden by iteration.games_schedule at every iter
+  store_canonical_only: true   # 1 state/move; D4 applied at train time (dynamic)
+  augmentation: d4  # none | flip | d4 (default flip preserves current behavior)
+  mcts:
+    simulations: 192
+    parallel_leaves: 48
+    # KataGo dual-head score utility (self-play defaults from KataGo GitHub issue #344)
+    # Dynamic only (static=0.0) — KataGo self-play training rationale: "always trying to
+    # gain points seems like a decent instinct to train into the neural net."
+    # Dynamic centres on root_score so MCTS always pushes to exceed the predicted margin.
+    static_score_utility_weight: 0.0      # Pure dynamic (KataGo self-play config)
+    dynamic_score_utility_weight: 0.3     # KataGo self-play default: 0.3
+    score_utility_scale: 30.0             # tanh divisor; must match value_targets._SCORE_NORMALISE_DIVISOR
+    cpuct: 1.47                       # Base; iteration.cpuct_schedule overrides
+    temperature: 1.0
+    temperature_threshold: 15
+    root_dirichlet_alpha: 0.10       # Root node Dirichlet noise for exploration
+    root_noise_weight: 0.25
+    virtual_loss: 1.0
+    num_threads: 1
+    fpu_reduction: 0.25
+  playout_cap_randomization:
+    enabled: true
+    cap_fraction: 0.25
+    fast_probability: 0.75
+  bootstrap:
+    use_pure_mcts: true
+    mcts_simulations: 192
+    games: 900
+  stream_to_disk: true
+  hdf5_compression: lzf
+  hdf5_compression_level: 0
+  write_buffer_positions: 8192
+  policy_target_mode: visits         # visits = N/sum(N); visits_temperature_shaped = legacy T-shaped
+  q_value_weight: 0.25               # Base; iteration.q_value_weight_schedule overrides
+
+replay_buffer:
+  max_size: 300000   # 32ch ~23KB/pos => 7.5GB loaded (was 300k/9GB at 56ch). 320k gives headroom for window schedule peaks (iter200: 302k, iter400: 302k)
+  min_size: 4000
+  window_iterations: 8
+  newest_fraction: 0.25
+  prioritized: false
+  storage_format: hdf5
+  compression: lzf
+  compression_level: 0
+
+evaluation:
+  lock_eval_cpuct_to_selfplay: true  # Keep eval cpuct in sync with selfplay (default)
+  games_vs_best: 0
+  games_vs_pure_mcts: 0
+  eval_progress_interval: 10
+  paired_eval: true
+  skip_pure_mcts_after_iter: 0
+  eval_baselines:
+  - type: pure_mcts
+    simulations: 64
+  - type: previous_best
+  win_rate_threshold: 0.0
+  anti_regression_floor: 0.0
+  max_consecutive_rejections: 1
+  sprt:
+    enabled: false
+    p0: 0.50
+    p1: 0.55
+    alpha: 0.05
+    beta: 0.05
+    min_games: 12
+    max_games: 400
+  micro_gate:
+    enabled: false
+    start_games: 10
+    step_games: 10
+    max_games: 60
+    anti_regression_threshold: 0.42
+  eval_mcts:
+    simulations: 192
+    temperature: 0.0
+    cpuct: 1.75
+  elo:
+    enabled: false
+    initial_rating: 1500
+    k_factor: 32
+
+logging:
+  log_level: INFO
+  tensorboard:
+    enabled: true
+    log_dir: logs/tensorboard
+  wandb:
+    enabled: false
+    project: patchwork-alphazero
+    entity: null
+  log_file: logs/training.log
+
+paths:
+  checkpoints_dir: checkpoints
+  logs_dir: logs
+  run_root: runs
+  run_id: patchwork_production
+
+iteration:
+  max_iterations: 900
+  auto_resume: true
+
+  # GLOBAL LR SCHEDULE — decays peak LR across iterations (AlphaZero-style)
+  # Per-iteration cosine warmup still runs within each phase.
+  # Based on DeepMind AlphaZero step decay (0.2 → 0.02 → 0.002) translated to Adam scale.
+  lr_schedule:
+  - iteration: 0
+    lr: 0.0016                       # Full learning rate — network still improving fast
+  - iteration: 100
+    lr: 0.0008                       # Drop to half — refinement phase begins
+  - iteration: 200
+    lr: 0.0004                      # Fine-tuning — small updates, polishing play
+
+  temperature_schedule:
+  - iteration: 0
+    temperature: 1.0
+  - iteration: 50
+    temperature: 0.8
+  - iteration: 100
+    temperature: 0.5
+  - iteration: 150
+    temperature: 0.3
+  - iteration: 300
+    temperature: 0.25
+
+  mcts_schedule:
+  - iteration: 0
+    simulations: 192
+  - iteration: 100
+    simulations: 224
+  - iteration: 140
+    simulations: 256
+  - iteration: 200
+    simulations: 288
+  - iteration: 300
+    simulations: 320
+  - iteration: 400
+    simulations: 352
+
+  dirichlet_alpha_schedule:
+  - iteration: 0
+    alpha: 0.10
+  - iteration: 70
+    alpha: 0.08
+  - iteration: 120
+    alpha: 0.06      # floor: stay exploratory through mid-training
+  - iteration: 200
+    alpha: 0.04
+  - iteration: 300
+    alpha: 0.03      # floor: never go below 0.03
+
+  # Dynamic score utility weight — flat 0.30 (KataGo self-play default).
+  # Ramp was only useful iter0-20 while score head was near-random; past that, hold at 0.30.
+  dynamic_score_utility_weight_schedule:
+  - iteration: 0
+    dynamic_score_utility_weight: 0.30
+
+  # Shifted up to prevent value overfitting (ML review)
+  q_value_weight_schedule:
+  - iteration: 0
+    q_value_weight: 0.25
+  - iteration: 70
+    q_value_weight: 0.35
+  - iteration: 120
+    q_value_weight: 0.45
+  - iteration: 220
+    q_value_weight: 0.50
+
+  cpuct_schedule:
+  - iteration: 0
+    cpuct: 1.47
+  - iteration: 50
+    cpuct: 1.52
+  - iteration: 100
+    cpuct: 1.58
+  - iteration: 140
+    cpuct: 1.66
+  - iteration: 200
+    cpuct: 1.75
+
+  noise_weight_schedule:
+  - iteration: 0
+    weight: 0.25
+  - iteration: 100
+    weight: 0.22
+  - iteration: 120
+    weight: 0.18
+  - iteration: 140
+    weight: 0.18     # hold floor — keep exploration through mid-training
+  - iteration: 200
+    weight: 0.14
+  - iteration: 300
+    weight: 0.10     # floor: never go below 0.10
+
+  games_schedule:
+  - iteration: 0
+    games: 900    # canonical-only: 900×42 ≈ 37.8k pos/iter; window 8 ≈ 302k buffer
+  - iteration: 100
+    games: 900
+  - iteration: 140
+    games: 650    # 650×42 ≈ 27.3k; window 11 ≈ 300k
+  - iteration: 200
+    games: 600    # 600×42 ≈ 25.2k; window 12 ≈ 302k
+  - iteration: 300
+    games: 510    # 510×42 ≈ 21.4k; window 14 ≈ 300k
+  - iteration: 400
+    games: 480    # 480×42 ≈ 20.2k; window 15 ≈ 302k
+
+  window_iterations_schedule:
+  - iteration: 0
+    window_iterations: 8
+  - iteration: 100
+    window_iterations: 8
+  - iteration: 140
+    window_iterations: 11
+  - iteration: 200
+    window_iterations: 12
+  - iteration: 300
+    window_iterations: 14
+  - iteration: 400
+    window_iterations: 15
+
+inference:
+  batch_size: 512
+  max_batch_wait_ms: 3
+  use_amp: true
+  amp_dtype: bfloat16
+  torch_compile: false
+  allow_tf32: true
+
+league:
+  enabled: false
+  pfsp_alpha: 2.0
+  pfsp_uniform_prob: 0.10
+  sp_frac_vs_best: 0.40
+  sp_frac_vs_pfsp: 0.50
+  sp_frac_vs_uniform: 0.10
+  gate_threshold: 0.55
+  suite_threshold: 0.52
+  worst_threshold: 0.40
+  gate_eval_games: 100
+  suite_eval_games: 50
+  max_pool_size: 30
+  anchor_size: 6
+  anchor_refresh_interval: 5
+  payoff_max_models: 30
+  exploiter_enabled: false
+  exploiter_train_games: 100
+  exploiter_temp_boost: 1.5
+  recency_newest_frac: 0.70
+  recency_newest_window: 0.15

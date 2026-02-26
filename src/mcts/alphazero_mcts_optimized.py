@@ -395,7 +395,7 @@ class OptimizedAlphaZeroMCTS:
     # Score utility (KataGo dual-head)
     # ------------------------------------------------------------------
 
-    def _compute_score_utility(self, score: float) -> float:
+    def _compute_score_utility(self, score: float, is_root_player: bool = True) -> float:
         """
         Compute the score component of MCTS utility (KataGo dual-head pattern).
 
@@ -403,6 +403,7 @@ class OptimizedAlphaZeroMCTS:
             score: tanh-normalised score margin in (-1, 1), from to_move perspective.
                    For non-terminal nodes: the network's score head output (with tanh).
                    For terminal nodes: tanh(raw_margin / score_utility_scale).
+            is_root_player: True if the node's to_move matches the search root's to_move.
 
         Returns:
             Score utility to ADD to the value head output for MCTS backup.
@@ -421,7 +422,8 @@ class OptimizedAlphaZeroMCTS:
         batch before root is evaluated, or truly neutral position), dynamic == static.
         """
         static = self.config.static_score_utility_weight * score
-        dynamic = self.config.dynamic_score_utility_weight * (score - self._search_root_score)
+        root_s = self._search_root_score if is_root_player else -self._search_root_score
+        dynamic = self.config.dynamic_score_utility_weight * (score - root_s)
         return static + dynamic
 
     # ------------------------------------------------------------------
@@ -465,6 +467,7 @@ class OptimizedAlphaZeroMCTS:
                     break
         if root is None:
             root = MCTSNode(state, int(to_move))
+            self._root = root  # Ensure root is available for is_root_player checks
             self._expand_and_evaluate(root, precomputed_legal=root_legal_actions)
             if add_noise and root.legal_actions and len(root.legal_actions) > 0:
                 self._add_dirichlet_noise(root)
@@ -755,8 +758,7 @@ class OptimizedAlphaZeroMCTS:
                 priors_legal, value, score = self.eval_client.receive(rid)
                 raw_score = float(score)
                 resp_priors.append(priors_legal)
-                utility = float(value) + self._compute_score_utility(raw_score)
-                resp_values.append(utility)
+                resp_values.append(float(value))
                 raw_scores.append(raw_score)
 
             out_values = []
@@ -771,7 +773,9 @@ class OptimizedAlphaZeroMCTS:
                 node.normalize_priors()
                 node.score_estimate = raw_scores[nonterm_idx]  # store for tree-reuse dynamic centering
 
-                out_values.append(resp_values[nonterm_idx])
+                is_root = (int(node.to_move) == int(self._root.to_move)) if self._root is not None else True
+                utility = resp_values[nonterm_idx] + self._compute_score_utility(raw_scores[nonterm_idx], is_root)
+                out_values.append(utility)
                 nonterm_idx += 1
 
             return out_values
@@ -817,14 +821,9 @@ class OptimizedAlphaZeroMCTS:
 
         value_t = value_t.squeeze(-1)
         score_t = score_t.squeeze(-1)
-        # KataGo dynamic score utility: static_w * score + dynamic_w * (score - root_score)
-        # Vectorised: root_score is a scalar constant for the whole batch.
-        w_s = self.config.static_score_utility_weight
-        w_d = self.config.dynamic_score_utility_weight
-        root_s = self._search_root_score
-        utility_t = value_t + w_s * score_t + w_d * (score_t - root_s)
 
-        # Extract scores to CPU for score_estimate storage (one .cpu() call for the whole batch)
+        # Extract values and scores to CPU for score_estimate storage and utility computation
+        value_cpu = value_t.float().cpu().numpy()
         score_cpu = score_t.float().cpu().numpy()  # (B,)
 
         out_values: List[float] = []
@@ -846,7 +845,9 @@ class OptimizedAlphaZeroMCTS:
             node.normalize_priors()
             node.score_estimate = float(score_cpu[nonterm_idx])  # store for tree-reuse dynamic centering
 
-            out_values.append(float(utility_t[nonterm_idx].item()))
+            is_root = (int(node.to_move) == int(self._root.to_move)) if self._root is not None else True
+            utility = float(value_cpu[nonterm_idx]) + self._compute_score_utility(node.score_estimate, is_root)
+            out_values.append(utility)
             nonterm_idx += 1
 
         return out_values
@@ -892,7 +893,8 @@ class OptimizedAlphaZeroMCTS:
                 priors_legal, v, s = self.eval_client.evaluate(state_np, action_mask, legal_idxs_np)
             raw_score = float(s)
             node.score_estimate = raw_score  # store for tree-reuse dynamic centering
-            value = float(v) + self._compute_score_utility(raw_score)
+            is_root = (int(node.to_move) == int(self._root.to_move)) if self._root is not None else True
+            value = float(v) + self._compute_score_utility(raw_score, is_root)
             # Bulk set priors directly into array
             node._prior[:] = priors_legal[:len(node.legal_actions)]
         else:
@@ -933,7 +935,8 @@ class OptimizedAlphaZeroMCTS:
                 v = float(value_t.item())
                 s = float(score_t.item())
                 node.score_estimate = s  # store for tree-reuse dynamic centering
-                value = v + self._compute_score_utility(s)
+                is_root = (int(node.to_move) == int(self._root.to_move)) if self._root is not None else True
+                value = v + self._compute_score_utility(s, is_root)
 
                 idx_t = torch.as_tensor(legal_action_indices, device=self.device, dtype=torch.long)
                 legal_logits = policy_logits.squeeze(0).index_select(0, idx_t)
@@ -994,7 +997,8 @@ class OptimizedAlphaZeroMCTS:
         # Tanh-normalised score margin from to_move's perspective (same scale as network output)
         raw_margin = float(int(score0) - int(score1)) if int(to_move) == 0 else float(int(score1) - int(score0))
         score = math.tanh(raw_margin / self.config.score_utility_scale)
-        return value + self._compute_score_utility(score)
+        is_root = (int(to_move) == int(self._root.to_move)) if self._root is not None else True
+        return value + self._compute_score_utility(score, is_root)
 
 
 # ---------------------------------------------------------------------------

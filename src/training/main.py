@@ -173,6 +173,7 @@ def _print_iter_header(
     eps   = float(sp.get("noise_weight", 0.0))
     cpuct = float(sp.get("cpuct", 1.5))
     q_wt  = float(sp.get("q_value_weight", 0.0))
+    dsuw  = float(sp.get("dynamic_score_utility_weight", 0.3))
     lr    = float(tr.get("lr", 0.0))
     games = int(sp.get("games", 0))
 
@@ -192,6 +193,7 @@ def _print_iter_header(
         f"  {_CLR_DIM}q_wt={_CLR_RST}{_CLR_VAL}{q_wt:.2f}{_CLR_RST}"
         f"  {_CLR_DIM}LR={_CLR_RST}{_CLR_VAL}{lr:.2e}{_CLR_RST}"
         f"  {_CLR_DIM}games={_CLR_RST}{_CLR_VAL}{games}{_CLR_RST}"
+        f"  {_CLR_DIM}dsuw={_CLR_RST}{_CLR_VAL}{dsuw:.2f}{_CLR_RST}"
     )
     print(f"\n{bar}\n{hdr}\n{params}\n{bar}", flush=True)
 

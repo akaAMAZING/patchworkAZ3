@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Export all run metrics (iter000-iter024) from metadata.jsonl and TensorBoard events
+Export all run metrics from metadata.jsonl and TensorBoard events
 to comprehensive CSVs for downstream AI consumption.
 Output: patchworkaz_root/run_metrics_export/
 """
@@ -132,6 +132,33 @@ def main() -> None:
 
     print(f"Wrote {meta_path} ({len(meta_rows)} rows)")
 
+    # --- 1b. Filtered iter25-33 CSV ---
+    filtered = [r for r in meta_rows if 25 <= r["iteration"] <= 33]
+    if filtered:
+        filtered_path = OUT_DIR / "iter_metrics_25_33.csv"
+        with open(filtered_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=meta_columns, extrasaction="ignore")
+            w.writeheader()
+            for r in filtered:
+                row = {"iteration": r["iteration"], "timestamp_utc": r["timestamp_utc"],
+                       "config_hash": r.get("config_hash"), "config_path": r.get("config_path"),
+                       "best_model_hash": r.get("best_model_hash"), "accepted": r.get("accepted"),
+                       "global_step": r.get("global_step"), "iter_time_s": r.get("iter_time_s"),
+                       "replay_positions": r.get("replay_positions"),
+                       "consecutive_rejections": r.get("consecutive_rejections"),
+                       "best_model": r.get("best_model"),
+                       "eval_vs_best_wr": r.get("eval_vs_best_wr"),
+                       "eval_vs_best_margin": r.get("eval_vs_best_margin"),
+                       "eval_vs_mcts_wr": r.get("eval_vs_mcts_wr")}
+                if "train" in r:
+                    for k, v in r["train"].items():
+                        row[f"train_{k}"] = v
+                if "selfplay" in r:
+                    for k, v in r["selfplay"].items():
+                        row[f"selfplay_{k}"] = v
+                w.writerow(row)
+        print(f"Wrote {filtered_path} ({len(filtered)} rows, iter25-33)")
+
     # --- 2. TensorBoard scalars CSV (per-step / per-iteration) ---
     tb_data = extract_tb_scalars(TB_DIR)
     if tb_data:
@@ -153,7 +180,7 @@ def main() -> None:
     else:
         print("TensorBoard extraction skipped (no tensorboard or no events).")
 
-    # --- 3. Training epochs from training.log (committed iters 12-24) ---
+    # --- 3. Training epochs from training.log (committed iters) ---
     epoch_rows = []
     for d in sorted(COMMITTED_DIR.iterdir()):
         if not d.is_dir() or not d.name.startswith("iter_"):
@@ -189,14 +216,24 @@ def main() -> None:
                     })
 
     if epoch_rows:
+        cols = ["iteration", "epoch", "epoch_time_s", "loss", "pol_loss", "val_loss", "own_loss", "own_acc_pct", "pol_acc_pct", "top5_pct", "val_mse", "grad"]
         epoch_path = OUT_DIR / "training_epochs.csv"
         with open(epoch_path, "w", newline="", encoding="utf-8") as f:
-            cols = ["iteration", "epoch", "epoch_time_s", "loss", "pol_loss", "val_loss", "own_loss", "own_acc_pct", "pol_acc_pct", "top5_pct", "val_mse", "grad"]
             w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
             w.writeheader()
             for r in epoch_rows:
                 w.writerow({c: r.get(c, "") for c in cols})
         print(f"Wrote {epoch_path} ({len(epoch_rows)} rows)")
+        # Filtered iter25-33 epochs
+        epoch_25_33 = [r for r in epoch_rows if 25 <= r["iteration"] <= 33]
+        if epoch_25_33:
+            ep_path = OUT_DIR / "training_epochs_25_33.csv"
+            with open(ep_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+                w.writeheader()
+                for r in epoch_25_33:
+                    w.writerow({c: r.get(c, "") for c in cols})
+            print(f"Wrote {ep_path} ({len(epoch_25_33)} rows, iter25-33)")
 
     # --- 4. Run/ELO state (context) ---
     for name, path in [
@@ -214,13 +251,14 @@ def main() -> None:
 
     # --- 5. README for AI consumers ---
     readme = OUT_DIR / "README.md"
-    readme.write_text("""# Patchwork AZ Run Metrics Export
+    max_iter = max(r["iteration"] for r in meta_rows) if meta_rows else 0
+    readme.write_text(f"""# Patchwork AZ Run Metrics Export
 
-All metrics from runs iter000 through iter024. Source: logs/metadata.jsonl, logs/tensorboard/, runs/patchwork_production/committed/.
+All metrics from runs iter000 through iter{max_iter}. Source: logs/metadata.jsonl, logs/tensorboard/, runs/patchwork_production/committed/.
 
 ## Files
 
-- **iter_metrics.csv**: One row per iteration (0–24). Columns:
+- **iter_metrics.csv**: One row per iteration (0–{max_iter}). Columns:
   - `iteration`, `timestamp_utc`, `config_hash`, `config_path`, `best_model_hash`
   - `accepted`, `global_step`, `iter_time_s`, `replay_positions`, `consecutive_rejections`
   - `best_model`, `eval_vs_best_wr`, `eval_vs_best_margin`, `eval_vs_mcts_wr`
@@ -230,7 +268,10 @@ All metrics from runs iter000 through iter024. Source: logs/metadata.jsonl, logs
 - **tensorboard_scalars.csv**: TensorBoard scalar events. Columns: `step_or_iteration`, `tag`, `value`.
   - Tags include: train/* (per-step), val/*, iter/*, selfplay/*, buffer/*, eval/*
 
-- **training_epochs.csv**: Per-epoch training metrics from training.log (iters 12–24). Columns: iteration, epoch, epoch_time_s, loss, pol_loss, val_loss, own_loss, own_acc_pct, pol_acc_pct, top5_pct, val_mse, grad.
+- **training_epochs.csv**: Per-epoch training metrics from training.log. Columns: iteration, epoch, epoch_time_s, loss, pol_loss, val_loss, own_loss, own_acc_pct, pol_acc_pct, top5_pct, val_mse, grad.
+
+- **iter_metrics_25_33.csv**: Filtered to iterations 25–33 only (same columns as iter_metrics.csv).
+- **training_epochs_25_33.csv**: Filtered to iterations 25–33 only (same columns as training_epochs.csv).
 
 - **run_state.json**, **elo_state.json**, **environment.json**: Run context (hardware, config, ELO state).
 
