@@ -1,0 +1,141 @@
+# Minimal E2E smoke: 1–2 iters, tiny sims/games, schedules that change at iter 1
+# Used by: python -m tools.smoke_e2e
+seed: 42
+deterministic: true
+hardware:
+  device: cpu
+  pin_memory: false
+  persistent_workers: false
+data:
+  allow_legacy_state_channels: false
+  encoding_version: gold_v2_32ch
+  expected_spatial_channels: 32
+  expected_global_dim: 61
+  expected_track_shape: [8, 54]
+  expected_shop_shapes: [33, 10]
+network:
+  input_channels: 56
+  num_res_blocks: 2
+  channels: 32
+  policy_channels: 16
+  policy_hidden: 64
+  use_factorized_policy_head: true
+  value_channels: 16
+  value_hidden: 64
+  max_actions: 2026
+  dropout: 0.0
+  weight_decay: 0.0001
+  use_batch_norm: true
+  se_ratio: 0.0625
+  activation: relu
+  use_film: true
+  film_hidden: 64
+  film_global_dim: 61
+  film_track_dim: 432
+  film_shop_dim: 128
+  film_per_block: true
+  film_track_use_conv: true
+  film_global_inject_dim: 0
+training:
+  optimizer: adamw
+  learning_rate: 0.001
+  lr_schedule: cosine_warmup_per_phase
+  warmup_steps: 2
+  min_lr: 0.00001
+  batch_size: 32
+  d4_augmentation: dynamic
+  use_amp: false
+  policy_loss_weight: 1.0
+  value_loss_weight: 1.0
+  ownership_loss_weight: 0.1
+  score_loss_weight: 0.0
+  resume_optimizer_state: true
+  resume_scheduler_state: true
+  resume_from_committed_state: true
+  epochs_per_iteration: 1
+  val_split: 0.1
+  val_frequency: 100
+  checkpoint_frequency: 99999
+  max_grad_norm: 1.0
+selfplay:
+  num_workers: 1
+  max_game_length: 50
+  games_per_iteration: 4
+  store_canonical_only: true
+  augmentation: d4
+  mcts:
+    simulations: 8
+    parallel_leaves: 4
+    cpuct: 1.4
+    temperature: 1.0
+    temperature_threshold: 5
+    root_dirichlet_alpha: 0.1
+    root_noise_weight: 0.25
+    dynamic_score_utility_weight: 0.2
+  bootstrap:
+    use_pure_mcts: true
+    mcts_simulations: 8
+    games: 4
+  q_value_weight: 0.2
+replay_buffer:
+  max_size: 2000
+  min_size: 20
+  window_iterations: 2
+  newest_fraction: 0.25
+paths:
+  checkpoints_dir: artifacts/smoke_e2e/checkpoints
+  logs_dir: artifacts/smoke_e2e/logs
+  run_root: artifacts/smoke_e2e/runs
+  run_id: smoke_e2e
+evaluation:
+  games_vs_best: 0
+  games_vs_pure_mcts: 0
+  win_rate_threshold: 0.0
+  paired_eval: true
+  micro_gate:
+    enabled: false
+  eval_mcts:
+    simulations: 16
+    temperature: 0.0
+    cpuct: 1.5
+  elo:
+    enabled: false
+    initial_rating: 1500
+    k_factor: 32
+iteration:
+  max_iterations: 2
+  auto_resume: true
+  lr_schedule:
+    - iteration: 0
+      lr: 0.001
+    - iteration: 1
+      lr: 0.0005
+  games_schedule:
+    - iteration: 0
+      games: 4
+    - iteration: 1
+      games: 6
+  mcts_schedule:
+    - iteration: 0
+      simulations: 8
+    - iteration: 1
+      simulations: 10
+  temperature_schedule:
+    - iteration: 0
+      temperature: 1.0
+    - iteration: 1
+      temperature: 0.8
+  cpuct_schedule:
+    - iteration: 0
+      cpuct: 1.4
+    - iteration: 1
+      cpuct: 1.5
+  window_iterations_schedule:
+    - iteration: 0
+      window_iterations: 2
+    - iteration: 1
+      window_iterations: 2
+logging:
+  log_level: WARNING
+  tensorboard:
+    enabled: false

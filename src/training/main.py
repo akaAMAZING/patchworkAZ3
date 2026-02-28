@@ -108,7 +108,9 @@ def _request_shutdown() -> None:
 
 
 def _get_lr_phase_info(config: dict, iteration: int) -> tuple[int, int, float]:
-    """Return (phase_start_iter, phase_end_iter, base_lr) for the current phase."""
+    """Return (phase_start_iter, phase_end_iter, base_lr) for the current phase.
+    base_lr is from iteration.lr_schedule (same lookup as Trainer._create_scheduler).
+    """
     entries = sorted(
         config.get("iteration", {}).get("lr_schedule", []) or [{"iteration": 0, "lr": 0.001}],
         key=lambda x: x["iteration"],
@@ -122,6 +124,17 @@ def _get_lr_phase_info(config: dict, iteration: int) -> tuple[int, int, float]:
             base_lr = float(ent.get("lr", base_lr))
             phase_end = entries[i + 1]["iteration"] if i + 1 < len(entries) else 999999
     return phase_start, phase_end, base_lr
+
+
+def _is_committed_checkpoint_path(path: Optional[str]) -> bool:
+    """True if path is under committed/ or checkpoints/ (not staging). Used so we never resume from staging."""
+    if not path:
+        return False
+    resolved = Path(path).resolve()
+    parts = resolved.parts
+    if "staging" in parts:
+        return False
+    return "committed" in parts or "checkpoints" in parts
 
 
 import numpy as np
@@ -303,6 +316,10 @@ _safe_stdout = io.TextIOWrapper(
 # Staged training log: NO file handler at startup. FileHandler is added per-iteration
 # to staging/iter_N/training.log; only appended to permanent log at commit.
 _log_file_handler: Optional[logging.FileHandler] = None
+# Checkpoint monotonicity log: file-only (training.log), never to terminal.
+_checkpoint_logger = logging.getLogger(__name__ + ".checkpoint")
+_checkpoint_logger.propagate = False
+_checkpoint_file_handler: Optional[logging.FileHandler] = None
 
 # ── Compact log formatter: 'YYYY-MM-DD HH:MM:SS - [TAG] - message' ──────────
 _LOG_TAGS = {
@@ -341,9 +358,14 @@ _root_logger.addHandler(_console_handler)
 logger = logging.getLogger(__name__)
 
 
+def _log_checkpoint_file_only(msg: str) -> None:
+    """Log [CHECKPOINT] lines to training.log only (never to terminal). No-op if no file handler attached."""
+    _checkpoint_logger.info(msg)
+
+
 def _attach_staging_log_handler(staging_path: Path) -> None:
     """Add FileHandler to write training log to staging. Only staged data; committed at iteration end."""
-    global _log_file_handler
+    global _log_file_handler, _checkpoint_file_handler
     _detach_staging_log_handler()
     # Use pathlib throughout; resolve to absolute for Windows compatibility
     staging_dir = Path(staging_path).resolve()
@@ -356,11 +378,16 @@ def _attach_staging_log_handler(staging_path: Path) -> None:
     _log_file_handler.setFormatter(_TIDY_FMT)
     _log_file_handler.setLevel(logging.INFO)
     logging.getLogger().addHandler(_log_file_handler)
+    # Checkpoint lines go to same file but never to terminal (separate logger, no console)
+    _checkpoint_file_handler = logging.FileHandler(str(log_path), encoding="utf-8")
+    _checkpoint_file_handler.setFormatter(_TIDY_FMT)
+    _checkpoint_file_handler.setLevel(logging.INFO)
+    _checkpoint_logger.addHandler(_checkpoint_file_handler)
 
 
 def _detach_staging_log_handler() -> None:
     """Remove and close staging log FileHandler. Call before commit so file is flushed."""
-    global _log_file_handler
+    global _log_file_handler, _checkpoint_file_handler
     if _log_file_handler is not None:
         try:
             logging.getLogger().removeHandler(_log_file_handler)
@@ -368,6 +395,13 @@ def _detach_staging_log_handler() -> None:
         except Exception:
             pass
         _log_file_handler = None
+    if _checkpoint_file_handler is not None:
+        try:
+            _checkpoint_logger.removeHandler(_checkpoint_file_handler)
+            _checkpoint_file_handler.close()
+        except Exception:
+            pass
+        _checkpoint_file_handler = None
 
 
 @contextlib.contextmanager
@@ -1082,6 +1116,13 @@ class AlphaZeroTrainer:
             with _staging_log_context(staging_path):
                 # Apply iteration schedules (q_value_weight, cpuct) and collect for provenance
                 self._apply_iteration_schedules(iteration)
+                # A) Set peak LR from iteration.lr_schedule so Trainer uses it for optimizer + scheduler
+                _, _, iter_lr = _get_lr_phase_info(self.config, iteration)
+                self.config["training"]["learning_rate"] = iter_lr
+                logger.debug(
+                    "[LR_SCHEDULE] iteration=%d iter_lr=%.2e (peak LR for this phase)",
+                    iteration, iter_lr,
+                )
                 applied_settings = self._collect_applied_settings(iteration)
 
                 # Transactional TensorBoard: stage events here, commit to permanent dir at iteration end
@@ -1115,6 +1156,11 @@ class AlphaZeroTrainer:
 
                 self._log_health_at_iteration_start(iteration, train_base)
 
+                if selfplay_model:
+                    assert Path(selfplay_model).exists(), f"Self-play checkpoint missing: {selfplay_model}"
+                    _log_checkpoint_file_only(
+                        f"[CHECKPOINT] selfplay iter {iteration} using weights checkpoint: {selfplay_model}"
+                    )
                 sp_label = f"iter{self.best_model_iteration:03d}" if (selfplay_model and self.best_model_iteration is not None) else "random"
                 _print_section(f"\n[1/3] SELF-PLAY  (generator: {sp_label})")
 
@@ -1128,10 +1174,48 @@ class AlphaZeroTrainer:
                     selfplay_stats.get("games_per_minute", 0),
                 )
 
+                if train_base:
+                    assert Path(train_base).exists(), f"Training checkpoint missing: {train_base}"
+                    _log_checkpoint_file_only(
+                        f"[CHECKPOINT] training iter {iteration} starting from checkpoint: {train_base}"
+                    )
                 train_label = f"iter{self.best_model_iteration:03d}" if (train_base and self.best_model_iteration is not None) else "scratch"
                 _print_section(f"\n[2/3] TRAINING  (warm-start: {train_label})")
+                resume_from_committed_cfg = bool(
+                    (self.config.get("training", {}) or {}).get("resume_from_committed_state", False)
+                )
+                # B) Resume optimizer/scheduler/scaler/EMA from previous checkpoint every iteration when
+                # config says so; only from committed paths when resume_from_committed_state is true
+                # (staging is discarded on restart, so we never load from staging).
+                train_cfg = (self.config.get("training", {}) or {})
+                allow_resume = (
+                    _is_committed_checkpoint_path(train_base)
+                    if resume_from_committed_cfg
+                    else bool(train_base)
+                )
+                force_resume_optimizer_state = allow_resume and bool(train_cfg.get("resume_optimizer_state", False))
+                force_resume_scheduler_state = allow_resume and bool(train_cfg.get("resume_scheduler_state", False))
+                force_resume_scaler_state = allow_resume and bool(train_cfg.get("resume_scaler_state", force_resume_optimizer_state))
+                force_resume_ema = allow_resume and bool(train_cfg.get("resume_ema_state", force_resume_optimizer_state))
+                if resume_from_committed_cfg and train_base and "staging" in Path(train_base).resolve().parts:
+                    raise ValueError(
+                        f"[RESUME] resume_from_committed_state=True but train_base is staging: {train_base}. "
+                        "Only committed/ or checkpoints/ are allowed."
+                    )
+                if force_resume_optimizer_state or force_resume_scheduler_state:
+                    logger.debug(
+                        "[RESUME] loading optimizer/scheduler from committed checkpoint (iteration=%d train_base=%s)",
+                        iteration, train_base,
+                    )
                 checkpoint_path, train_metrics, global_step = self._train_network(
-                    iteration, data_path, train_base, staging_dir=staging_path
+                    iteration,
+                    data_path,
+                    train_base,
+                    staging_dir=staging_path,
+                    force_resume_optimizer_state=force_resume_optimizer_state,
+                    force_resume_scheduler_state=force_resume_scheduler_state,
+                    force_resume_scaler_state=force_resume_scaler_state,
+                    force_resume_ema=force_resume_ema,
                 )
                 self.global_step = global_step
                 logger.info(
@@ -1392,6 +1476,11 @@ class AlphaZeroTrainer:
         data_path: str,
         previous_checkpoint: Optional[str],
         staging_dir: Optional[Path] = None,
+        *,
+        force_resume_optimizer_state: bool = False,
+        force_resume_scheduler_state: bool = False,
+        force_resume_scaler_state: bool = False,
+        force_resume_ema: bool = False,
     ) -> tuple:
         result = train_iteration(
             iteration,
@@ -1404,6 +1493,10 @@ class AlphaZeroTrainer:
             global_step_offset=self.global_step,
             iteration_output_dir=staging_dir,
             merged_output_path=str(staging_dir / "merged_training.h5") if staging_dir else None,
+            force_resume_optimizer_state=force_resume_optimizer_state,
+            force_resume_scheduler_state=force_resume_scheduler_state,
+            force_resume_scaler_state=force_resume_scaler_state,
+            force_resume_ema=force_resume_ema,
         )
         # Release training dataset memory (PatchworkDataset numpy arrays) back to the OS
         # before self-play starts. With 2-3 GB datasets, Python's C heap retains freed pages

@@ -482,6 +482,22 @@ def _inverse_pos(r: int, c: int, transform_idx: int) -> Tuple[int, int]:
     return _POS_TRANSFORMS[inv_ti](r, c)
 
 
+def _recompute_valid_7x7_from_plane(occ_plane: np.ndarray) -> np.ndarray:
+    """Recompute valid_7x7 from an occupancy plane after D4 transform.
+
+    valid_7x7 is per-region: (r,c) in {0,1,2}x{0,1,2} is 1 iff the 7x7 block with
+    top-left (r,c) is empty. After a spatial transform we must recompute from the
+    transformed occupancy, not transform the old valid_7x7 plane.
+    occ_plane: (9, 9) float, 1=filled 0=empty. Returns (9, 9) valid_7x7.
+    """
+    out = np.zeros((9, 9), dtype=np.float32)
+    for top in range(3):
+        for left in range(3):
+            if occ_plane[top : top + 7, left : left + 7].sum() < 0.5:
+                out[top, left] = 1.0
+    return out
+
+
 def transform_state(
     state: np.ndarray,
     transform_idx: int,
@@ -499,6 +515,10 @@ def transform_state(
     # 0-7: boards, coords, frontier, valid_7x7
     for ch in range(8):
         out[ch] = _transform_board_plane(state[ch], ti)
+    # valid_7x7 (ch 6-7) is per-region: must recompute from transformed occupancy
+    if ti != 0:
+        out[6] = _recompute_valid_7x7_from_plane(out[0])
+        out[7] = _recompute_valid_7x7_from_plane(out[1])
 
     # 8-31: slot×orient shape planes
     orient_maps = _get_orient_maps()
@@ -734,6 +754,16 @@ def _transform_state_batch_uniform(
     # 0-7: boards, coords, frontier, valid_7x7
     for ch in range(8):
         out[:, ch] = _transform_board_plane_batch(states[:, ch], ti)
+    # valid_7x7 (ch 6-7) is per-region: must recompute from transformed occupancy
+    if ti != 0:
+        out[:, 6] = 0.0
+        out[:, 7] = 0.0
+        for top in range(3):
+            for left in range(3):
+                block_cur = out[:, 0, top : top + 7, left : left + 7].reshape(out.shape[0], -1)
+                out[:, 6, top, left] = (block_cur.sum(axis=1) < 0.5).astype(np.float32)
+                block_opp = out[:, 1, top : top + 7, left : left + 7].reshape(out.shape[0], -1)
+                out[:, 7, top, left] = (block_opp.sum(axis=1) < 0.5).astype(np.float32)
 
     # 8-31: shape planes
     for slot, pid in enumerate([p0, p1, p2]):

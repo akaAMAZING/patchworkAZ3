@@ -50,6 +50,7 @@ from .selfplay_optimized import (
     play_game_optimized,
 )
 from src.mcts.shared_state_buffer import WorkerSharedBuffer
+from src.training.replay_buffer import _validate_score_margins, SCORE_MARGIN_MAX_ABS
 
 
 def _init_worker_ignore_sigint(*args):
@@ -616,6 +617,14 @@ class SelfPlayGenerator:
                         )
                     has_slot_ids = "slot_piece_ids" in shard
                     has_scores = "score_margins" in shard
+                    score_loss_weight = float(
+                        (self.config.get("training", {}) or {}).get("score_loss_weight", 0.0)
+                    )
+                    if score_loss_weight > 0 and not has_scores:
+                        raise ValueError(
+                            f"Shard {shard_path} has no score_margins but training has score_loss_weight > 0. "
+                            "Regenerate self-play with score head enabled."
+                        )
                     if canonical_mode is None:
                         canonical_mode = has_slot_ids
                     elif canonical_mode != has_slot_ids:
@@ -653,7 +662,13 @@ class SelfPlayGenerator:
                     policies_ds[total_pos:new_size] = shard["policies"]
                     values_ds[total_pos:new_size] = shard["values"]
                     if has_scores:
-                        score_margins_ds[total_pos:new_size] = shard["score_margins"]
+                        sc = np.asarray(shard["score_margins"], dtype=np.float32)
+                        _validate_score_margins(
+                            sc,
+                            max_abs=SCORE_MARGIN_MAX_ABS,
+                            source=str(shard_path),
+                        )
+                        score_margins_ds[total_pos:new_size] = sc
                     else:
                         score_margins_ds[total_pos:new_size] = np.zeros(n, dtype=np.float32)
                     ownerships_ds[total_pos:new_size] = shard["ownerships"]
@@ -747,6 +762,15 @@ class SelfPlayGenerator:
                 config["selfplay"]["mcts"]["root_noise_weight"] = entry["weight"]
                 break
 
+        # Apply parallel_leaves schedule (batch width for MCTS inference)
+        pl_schedule = self.config.get("iteration", {}).get("parallel_leaves_schedule", [])
+        for entry in sorted(pl_schedule, key=lambda x: x["iteration"], reverse=True):
+            if iteration >= entry["iteration"]:
+                config["selfplay"]["mcts"]["parallel_leaves"] = int(entry["parallel_leaves"])
+                if not quiet:
+                    logger.debug("[SCHEDULE] iter=%d parallel_leaves=%d", iteration, config["selfplay"]["mcts"]["parallel_leaves"])
+                break
+
         # Bootstrap override: use bootstrap.mcts_simulations for iteration 0
         bootstrap_cfg = config["selfplay"].get("bootstrap", {})
         if iteration == 0 and bootstrap_cfg.get("use_pure_mcts"):
@@ -758,7 +782,8 @@ class SelfPlayGenerator:
             mcts_cfg = config["selfplay"]["mcts"]
             logger.debug(
                 f"Schedule: temp={mcts_cfg['temperature']:.2f}  sims={mcts_cfg['simulations']}  "
-                f"alpha={mcts_cfg['root_dirichlet_alpha']}  noise={mcts_cfg['root_noise_weight']}"
+                f"alpha={mcts_cfg['root_dirichlet_alpha']}  noise={mcts_cfg['root_noise_weight']}  "
+                f"parallel_leaves={mcts_cfg.get('parallel_leaves', '?')}"
             )
 
         return config

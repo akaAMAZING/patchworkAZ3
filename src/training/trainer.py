@@ -30,6 +30,7 @@ from torch.utils.data import Dataset, DataLoader, IterableDataset, Sampler
 from torch.utils.tensorboard import SummaryWriter
 
 from src.network.model import PatchworkNetwork, create_network, load_model_checkpoint
+from src.training.replay_buffer import _validate_score_margins, SCORE_MARGIN_MAX_ABS
 from src.network.d4_augmentation import (
     apply_d4_augment_batch,
     apply_ownership_transform_batch,
@@ -238,6 +239,11 @@ class PatchworkDataset(Dataset):
                 )
             if self.has_score_margins:
                 self._score_margins = np.array(f["score_margins"], dtype=np.float32)
+                _validate_score_margins(
+                    self._score_margins,
+                    max_abs=SCORE_MARGIN_MAX_ABS,
+                    source=str(h5_path),
+                )
             else:
                 self._score_margins = np.zeros(self.num_samples, dtype=np.float32)
             if "slot_piece_ids" in f:
@@ -452,6 +458,11 @@ class Trainer:
         optimizer_state_checkpoint: Optional[str] = None,
         model_source_checkpoint: Optional[str] = None,
         current_iteration: int = 0,
+        *,
+        force_resume_optimizer_state: bool = False,
+        force_resume_scheduler_state: bool = False,
+        force_resume_scaler_state: bool = False,
+        force_resume_ema: bool = False,
     ):
         self.network = network
         self.config = config
@@ -499,6 +510,7 @@ class Trainer:
             self.writer = SummaryWriter(log_dir=log_dir / "tensorboard")
             self._owns_writer = True
         self.global_step = global_step_offset
+        self._lr_log_step_ceiling = global_step_offset + 5  # Log LR/scheduler for first 5 steps of this iteration
         self.current_epoch = 0
         self.best_val_loss = float("inf")
 
@@ -535,19 +547,35 @@ class Trainer:
             self._ema_tensors: List[torch.Tensor] = []
             self._param_tensors: List[torch.Tensor] = []
 
-        # Resume optimizer/scheduler/scaler from checkpoint (only when enabled)
+        # Resume optimizer/scheduler/scaler/EMA from checkpoint (when enabled or boundary-resume)
         resume_opt = bool(train_config.get("resume_optimizer_state", False))
         resume_sched = bool(train_config.get("resume_scheduler_state", False))
         resume_scaler = bool(train_config.get("resume_scaler_state", resume_opt))
-        if resume_opt or resume_sched:
+        if force_resume_optimizer_state:
+            resume_opt = True
+        if force_resume_scheduler_state:
+            resume_sched = True
+        if force_resume_scaler_state:
+            resume_scaler = True
+        if resume_opt or resume_sched or force_resume_ema:
             if optimizer_state_checkpoint and Path(optimizer_state_checkpoint).exists():
                 self._try_load_optimizer_state(
                     optimizer_state_checkpoint,
                     resume_opt=resume_opt,
                     resume_sched=resume_sched,
                     resume_scaler=resume_scaler,
+                    resume_ema=force_resume_ema,
                     model_source=model_source_checkpoint or optimizer_state_checkpoint,
                 )
+
+        # Log phase LR and scheduler state at iteration start (debug only, not terminal)
+        iter_lr = float(train_config.get("learning_rate", 0.0))
+        opt_lr = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 0.0
+        sched_step = getattr(self.scheduler, "last_epoch", None)
+        logger.debug(
+            "[LR] iteration_start current_iteration=%d iter_lr=%.2e optimizer_lr=%.2e scheduler_last_epoch=%s",
+            self.current_iteration, iter_lr, opt_lr, sched_step,
+        )
 
     def close(self) -> None:
         """Release resources (TensorBoard writer if owned by this Trainer)."""
@@ -587,15 +615,26 @@ class Trainer:
             )
         raise ValueError(f"Unknown optimizer: {opt_name}")
 
+    def _is_phase_boundary(self) -> bool:
+        """True if current_iteration is the start of a new LR phase (iteration in lr_schedule).
+        Used to skip loading scheduler state so the new phase gets full warmup."""
+        entries = sorted(
+            self.config.get("iteration", {}).get("lr_schedule", []) or [{"iteration": 0}],
+            key=lambda x: x["iteration"],
+        )
+        phase_starts = {ent["iteration"] for ent in entries}
+        return self.current_iteration in phase_starts
+
     def _try_load_optimizer_state(
         self,
         checkpoint_path: str,
         resume_opt: bool,
         resume_sched: bool,
         resume_scaler: bool,
+        resume_ema: bool = False,
         model_source: Optional[str] = None,
     ) -> None:
-        """Load optimizer/scheduler/scaler from checkpoint with compatibility checks.
+        """Load optimizer/scheduler/scaler/EMA from checkpoint with compatibility checks.
         Requires source=train_base (optimizer and model weights from same checkpoint).
         """
         try:
@@ -603,14 +642,32 @@ class Trainer:
         except Exception as e:
             logger.warning("[OPT_RESUME] Failed to load checkpoint %s: %s", checkpoint_path, e)
             return
-        opt_loaded = sched_loaded = scaler_loaded = False
+        opt_loaded = sched_loaded = scaler_loaded = ema_loaded = False
         if resume_opt and "optimizer_state_dict" in ckpt:
             try:
                 self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                 opt_loaded = True
+                # Peak LR must follow iteration.lr_schedule; load_state_dict restores checkpoint LR
+                # and overwrites the phase LR we set in config. Force phase LR after load.
+                iter_lr = float(self.config.get("training", {}).get("learning_rate", 0.0))
+                for pg in self.optimizer.param_groups:
+                    pg["lr"] = iter_lr
+                opt_lr_after = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 0.0
+                logger.debug(
+                    "[OPT_RESUME] LR after load: iter_lr=%.2e optimizer_lr_after_load=%.2e checkpoint=%s",
+                    iter_lr, opt_lr_after, checkpoint_path,
+                )
             except Exception as e:
                 logger.warning("[OPT_RESUME] Optimizer state mismatch, using fresh: %s", e)
-        if resume_sched and "scheduler_state_dict" in ckpt:
+        # At phase boundaries we want warmup for the new phase; loading scheduler state would
+        # continue last_epoch and skip warmup. Skip loading scheduler when starting a new phase.
+        at_phase_boundary = self._is_phase_boundary()
+        if at_phase_boundary and resume_sched:
+            logger.debug(
+                "[OPT_RESUME] phase boundary iter=%d: not loading scheduler state (fresh warmup for this phase)",
+                self.current_iteration,
+            )
+        if resume_sched and "scheduler_state_dict" in ckpt and not at_phase_boundary:
             try:
                 self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
                 sched_loaded = True
@@ -622,15 +679,30 @@ class Trainer:
                 scaler_loaded = True
             except Exception as e:
                 logger.warning("[OPT_RESUME] Scaler state mismatch, using fresh: %s", e)
+        if resume_ema and self.ema_enabled and self.ema_state_dict is not None and "ema_state_dict" in ckpt:
+            try:
+                for k, v in ckpt["ema_state_dict"].items():
+                    if k in self.ema_state_dict:
+                        self.ema_state_dict[k].copy_(v.to(self.device))
+                ema_loaded = True
+            except Exception as e:
+                logger.warning("[OPT_RESUME] EMA state mismatch, using fresh: %s", e)
         # Only overwrite global_step when we actually resumed (keeps TensorBoard continuity)
         if opt_loaded or sched_loaded:
             self.global_step = int(ckpt.get("global_step", self.global_step))
         train_base = model_source if model_source is not None else checkpoint_path
         logger.info(
-            "[OPT_RESUME] source=%s train_base=%s (must match)  enabled=opt:%s sched:%s scaler:%s  loaded=opt:%s sched:%s scaler:%s",
-            checkpoint_path, train_base,
-            resume_opt, resume_sched, resume_scaler,
-            opt_loaded, sched_loaded, scaler_loaded,
+            "[OPT_RESUME] source=%s train_base=%s (must match)  enabled=opt:%s sched:%s scaler:%s ema:%s  loaded=opt:%s sched:%s scaler:%s ema:%s",
+            checkpoint_path,
+            train_base,
+            resume_opt,
+            resume_sched,
+            resume_scaler,
+            resume_ema,
+            opt_loaded,
+            sched_loaded,
+            scaler_loaded,
+            ema_loaded,
         )
 
     def _create_scheduler(self, config: dict):
@@ -879,6 +951,19 @@ class Trainer:
 
             num_batches += 1
             self.global_step += 1
+
+            # Log LR/scheduler for first few steps (debug only, not terminal). warmup is heuristic:
+            # lr < 0.999*peak can mislabel post-warmup as True when cosine has already decayed slightly.
+            if self.global_step < self._lr_log_step_ceiling:
+                step_in_iter = self.global_step - (self._lr_log_step_ceiling - 5)
+                current_lr = self.scheduler.get_last_lr()[0]
+                sched_step = getattr(self.scheduler, "last_epoch", None)
+                iter_lr = float(self.config.get("training", {}).get("learning_rate", 0.0))
+                in_warmup = current_lr < iter_lr * 0.999 if iter_lr > 0 else False
+                logger.debug(
+                    "[LR] step %d (step_in_iter=%d) lr=%.2e scheduler_last_epoch=%s warmup=%s",
+                    self.global_step, step_in_iter, current_lr, sched_step, in_warmup,
+                )
 
             if _t0 is not None and _t1 is not None and _t2 is not None and _t3 is not None and _t4 is not None and _t5 is not None:
                 total_ms = (time.perf_counter() - _t0) * 1000
@@ -1151,6 +1236,11 @@ def train_iteration(
     global_step_offset: int = 0,
     iteration_output_dir: Optional[Path] = None,
     merged_output_path: Optional[str] = None,
+    *,
+    force_resume_optimizer_state: bool = False,
+    force_resume_scheduler_state: bool = False,
+    force_resume_scaler_state: bool = False,
+    force_resume_ema: bool = False,
 ) -> Tuple[str, Dict, int]:
     """
     Train the network for one iteration.
@@ -1290,13 +1380,20 @@ def train_iteration(
             "got optimizer=%s model=%s"
         ) % (optimizer_state_ckpt, previous_checkpoint)
     trainer = Trainer(
-        network, config, device, log_dir,
+        network,
+        config,
+        device,
+        log_dir,
         total_train_steps=total_train_steps,
         writer=writer,
         global_step_offset=global_step_offset,
         optimizer_state_checkpoint=optimizer_state_ckpt,
         model_source_checkpoint=previous_checkpoint,
         current_iteration=iteration,
+        force_resume_optimizer_state=force_resume_optimizer_state,
+        force_resume_scheduler_state=force_resume_scheduler_state,
+        force_resume_scaler_state=force_resume_scaler_state,
+        force_resume_ema=force_resume_ema,
     )
     logger.debug(f"TensorBoard logging from global_step={trainer.global_step}")
 

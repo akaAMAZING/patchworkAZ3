@@ -701,6 +701,12 @@ def init_optimized_worker(
     """Initialize worker (called once per process)."""
     global _WORKER, _RETURN_MODE, _SHARD_DIR, _SHARD_WRITER
 
+    # Limit PyTorch threads per worker to avoid oversubscription (many workers × default threads)
+    mcts_cfg = (config.get("selfplay", {}) or {}).get("mcts", {}) or {}
+    n_threads = max(1, int(mcts_cfg.get("num_threads", 1)))
+    torch.set_num_threads(n_threads)
+    torch.set_num_interop_threads(n_threads)
+
     _RETURN_MODE = return_mode or "dict"
     _SHARD_DIR = shard_dir
     if _RETURN_MODE == "shard":

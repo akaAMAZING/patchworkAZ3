@@ -13,6 +13,7 @@ from src.network.d4_augmentation import (
     get_orient_before_transform,
     transform_position,
     _transform_coord_planes,
+    _recompute_valid_7x7_from_plane,
     D4_NAMES,
     D4_COUNT,
     SPATIAL_CHANNELS,
@@ -160,6 +161,9 @@ def test_d4_invertibility_round_trip():
 
     np.random.seed(42)
     state = np.random.randn(C_SPATIAL_ENC, 9, 9).astype(np.float32) * 0.1
+    # valid_7x7 (ch 6-7) must be consistent with ch 0-1 so round-trip preserves them
+    state[6] = _recompute_valid_7x7_from_plane(state[0])
+    state[7] = _recompute_valid_7x7_from_plane(state[1])
     mask = (np.random.rand(2026) > 0.7).astype(np.float32)
     mask[0] = 1.0
     policy = np.random.rand(2026).astype(np.float32)
@@ -235,3 +239,25 @@ def test_legality_preserved_for_buy_actions():
 
         from src.game.patchwork_engine import apply_action_unchecked
         st = apply_action_unchecked(st, legal[0])
+
+
+# ============== Valid 7x7 D4 recompute (ch 6-7 from transformed occupancy) ==============
+def test_valid_7x7_recompute_after_d4_transform():
+    """After any D4 transform, valid_7x7 (ch 6-7) must equal recompute from transformed ch 0-1.
+    valid_7x7 is per-region: (r,c) in {0,1,2}x{0,1,2} is 1 iff 7x7 block with TL (r,c) is empty.
+    Spatially transforming the old valid_7x7 plane is wrong; we must recompute from transformed occupancy."""
+    slot_piece_ids = [1, 2, 3]
+    for ti in range(D4_COUNT):
+        state = np.zeros((32, 9, 9), dtype=np.float32)
+        state[0] = np.random.rand(9, 9).astype(np.float32)
+        state[1] = np.random.rand(9, 9).astype(np.float32)
+        state[2:4] = 0.5
+        state[4:8] = 0.0
+        state[6] = _recompute_valid_7x7_from_plane(state[0])
+        state[7] = _recompute_valid_7x7_from_plane(state[1])
+        state[8:32] = 0.0
+        out = transform_state(state, ti, slot_piece_ids)
+        ref_6 = _recompute_valid_7x7_from_plane(out[0])
+        ref_7 = _recompute_valid_7x7_from_plane(out[1])
+        assert np.allclose(out[6], ref_6), f"ti={ti} ({D4_NAMES[ti]}): ch6 should match recompute from transformed ch0"
+        assert np.allclose(out[7], ref_7), f"ti={ti} ({D4_NAMES[ti]}): ch7 should match recompute from transformed ch1"

@@ -136,6 +136,15 @@ def _transform_state_group_gpu(
 
     for ch in range(8):
         out[:, ch] = _transform_spatial_plane_gpu(states[:, ch], ti, spatial_perm)
+    # valid_7x7 (ch 6-7) is per-region: recompute from transformed occupancy (always, to avoid host sync on ti)
+    out[:, 6] = 0.0
+    out[:, 7] = 0.0
+    for top in range(3):
+        for left in range(3):
+            block_cur = out[:, 0, top : top + 7, left : left + 7].reshape(out.shape[0], -1)
+            out[:, 6, top, left] = (block_cur.sum(dim=1) < 0.5).to(out.dtype)
+            block_opp = out[:, 1, top : top + 7, left : left + 7].reshape(out.shape[0], -1)
+            out[:, 7, top, left] = (block_opp.sum(dim=1) < 0.5).to(out.dtype)
 
     for slot in range(NUM_SLOTS):
         pid = pid_safe[slot]

@@ -27,6 +27,33 @@ logger = logging.getLogger(__name__)
 # Dual-Head: refuse to merge legacy HDF5 (no score_margins) when training score head
 _REJECT_LEGACY_IF_SCORE_HEAD = True
 
+# Score margin validation: raw integer margin in points (KataGo Dual-Head)
+SCORE_MARGIN_MAX_ABS = 120
+
+
+def _validate_score_margins(
+    score_margins: np.ndarray,
+    max_abs: float = SCORE_MARGIN_MAX_ABS,
+    source: str = "",
+) -> None:
+    """Validate score_margins: finite and in range. Raise with clear message on failure."""
+    if score_margins.size == 0:
+        return
+    if not np.all(np.isfinite(score_margins)):
+        bad = np.logical_not(np.isfinite(score_margins)).sum()
+        raise ValueError(
+            f"score_margins validation failed{': ' + source if source else ''}: "
+            f"{bad} non-finite value(s). "
+            "Wipe runs/<run_id>/staging and committed and regenerate self-play."
+        )
+    abs_max = float(np.abs(score_margins).max())
+    if abs_max > max_abs:
+        raise ValueError(
+            f"score_margins validation failed{': ' + source if source else ''}: "
+            f"max |score_margin| = {abs_max} > {max_abs}. "
+            "Wipe runs/<run_id>/staging and committed and regenerate self-play."
+        )
+
 
 class ReplayBuffer:
     """
@@ -353,6 +380,9 @@ class ReplayBuffer:
         score_loss_weight = float(
             (self.config.get("training", {}) or {}).get("score_loss_weight", 0.0)
         )
+        score_margin_max_abs = float(
+            (self.config.get("data", {}) or {}).get("score_margin_max_abs", SCORE_MARGIN_MAX_ABS)
+        )
 
         # Stream-write merged file (no giant RAM concat).
         # The merged file is a temporary staging artifact loaded immediately into RAM
@@ -465,6 +495,7 @@ class ReplayBuffer:
                             va = np.asarray(f["values"][sl], dtype=np.float32)
                             if file_has_scores:
                                 sc = np.asarray(f["score_margins"][sl], dtype=np.float32)
+                                _validate_score_margins(sc, max_abs=score_margin_max_abs, source=h5_path)
                             else:
                                 sc = np.zeros(st.shape[0], dtype=np.float32)
                             if file_has_ownership:

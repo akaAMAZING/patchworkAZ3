@@ -63,9 +63,12 @@ training:
   d4_augmentation: dynamic           # dynamic = apply D4 per sample; store = legacy pre-augmented
   d4_on_gpu: false                  # CPU D4 is faster: vectorized numpy in dataset; GPU path has ~15s/batch loop overhead
   d4_gpu_deterministic_test_mode: false  # If true: fixed seed per batch for reproducible D4 (testing only)
-  resume_optimizer_state: false     # false = fresh optimizer each iter (clean iter-boundary workflow)
-  resume_scheduler_state: false     # false = warm restart each iter; no mid-iter resume
-  resume_scaler_state: false        # follows optimizer
+  # Set to true to preserve optimizer/scheduler/scaler/EMA across iteration boundaries (load from previous committed checkpoint each iter).
+  resume_optimizer_state: true     # true = load optimizer state every iter from train_base (committed only if resume_from_committed_state)
+  resume_scheduler_state: true     # true = continue LR schedule across iters (warmup once per phase)
+  resume_scaler_state: true        # follows optimizer when resuming
+  resume_ema_state: true           # true = load EMA from checkpoint each iter (default: same as resume_optimizer_state)
+  resume_from_committed_state: true  # true = only load optimizer/scheduler/EMA from committed/ or checkpoints/ (never staging)
   min_lr: 0.000032                   # ~50:1 ratio with base LR
   batch_size: 1024
   use_amp: true
@@ -204,128 +207,161 @@ paths:
   run_id: patchwork_production
 
 iteration:
-  max_iterations: 900
+  max_iterations: 500
   auto_resume: true
 
   # GLOBAL LR SCHEDULE — decays peak LR across iterations (AlphaZero-style)
   # Per-iteration cosine warmup still runs within each phase.
   # Based on DeepMind AlphaZero step decay (0.2 → 0.02 → 0.002) translated to Adam scale.
+  # LR: step down 2x then 2x then 2x, with a polish tail.
   lr_schedule:
   - iteration: 0
-    lr: 0.0016                       # Full learning rate — network still improving fast
-  - iteration: 80
-    lr: 0.0008                       # Drop to half — refinement phase begins
-  - iteration: 200
-    lr: 0.0004                      # Fine-tuning — small updates, polishing play
+    lr: 0.0016
+  - iteration: 100
+    lr: 0.0008
+  - iteration: 250
+    lr: 0.0004
+  - iteration: 400
+    lr: 0.0002                # Fine-tuning — small updates, polishing play
 
+  # Exploration temperature (first N moves only; you already have temperature_threshold=15)
   temperature_schedule:
   - iteration: 0
-    temperature: 1.0
-  - iteration: 30
-    temperature: 0.8
+    temperature: 1.00
   - iteration: 80
-    temperature: 0.5
-  - iteration: 150
-    temperature: 0.3
-  - iteration: 300
+    temperature: 0.80
+  - iteration: 160
+    temperature: 0.60
+  - iteration: 260
+    temperature: 0.40
+  - iteration: 360
+    temperature: 0.30
+  - iteration: 430
     temperature: 0.25
+  - iteration: 470
+    temperature: 0.20
 
+  # MCTS sims ramp (quality up over time)
   mcts_schedule:
   - iteration: 0
     simulations: 192
   - iteration: 80
     simulations: 224
-  - iteration: 140
+  - iteration: 180
     simulations: 256
-  - iteration: 200
-    simulations: 288
   - iteration: 300
+    simulations: 288
+  - iteration: 420
     simulations: 320
-  - iteration: 400
-    simulations: 352
 
+  # Keep batching stable early; reduce parallelism later as sims increase (less need for wide leaf batching)
+  parallel_leaves_schedule:
+  - iteration: 0
+    parallel_leaves: 64
+  - iteration: 200
+    parallel_leaves: 48
+  - iteration: 380
+    parallel_leaves: 32
+
+  # Root Dirichlet alpha: decay slowly; never go to zero
   dirichlet_alpha_schedule:
   - iteration: 0
     alpha: 0.10
-  - iteration: 50
+  - iteration: 120
     alpha: 0.08
-  - iteration: 100
-    alpha: 0.06      # floor: stay exploratory through mid-training
-  - iteration: 200
+  - iteration: 220
+    alpha: 0.06
+  - iteration: 320
+    alpha: 0.05
+  - iteration: 400
     alpha: 0.04
-  - iteration: 300
-    alpha: 0.03      # floor: never go below 0.03
+  - iteration: 460
+    alpha: 0.03
 
-  # Dynamic score utility weight — flat 0.30 (KataGo self-play default).
-  # Ramp was only useful iter0-20 while score head was near-random; past that, hold at 0.30.
+  # KataGo dynamic score utility ramp: start at 0 while score head is near-random,
+  # ramp to full 0.30 by iter80 once the score head has learned meaningful predictions.
+  # The mcts.dynamic_score_utility_weight value is the fallback when no schedule is defined.
+  # Score utility: WR-safe ramp then hold (you have the better logit-space score loss now)
   dynamic_score_utility_weight_schedule:
   - iteration: 0
+    dynamic_score_utility_weight: 0.00
+  - iteration: 10
+    dynamic_score_utility_weight: 0.10
+  - iteration: 25
+    dynamic_score_utility_weight: 0.20
+  - iteration: 40
     dynamic_score_utility_weight: 0.30
 
-  # Shifted up to prevent value overfitting (ML review)
+  # Trust search Q more later (reduces value overfitting; helps strength in mature regime)
   q_value_weight_schedule:
   - iteration: 0
-    q_value_weight: 0.25
+    q_value_weight: 0.20
   - iteration: 50
+    q_value_weight: 0.25
+  - iteration: 120
     q_value_weight: 0.35
-  - iteration: 100
-    q_value_weight: 0.45
   - iteration: 220
-    q_value_weight: 0.50
+    q_value_weight: 0.45
+  - iteration: 340
+    q_value_weight: 0.52
+  - iteration: 420
+    q_value_weight: 0.55
 
+  # PUCT: gently increase as priors get sharper (prevents overconfident collapse)
   cpuct_schedule:
   - iteration: 0
-    cpuct: 1.47
-  - iteration: 30
-    cpuct: 1.52
+    cpuct: 1.45
   - iteration: 80
-    cpuct: 1.58
-  - iteration: 140
-    cpuct: 1.66
-  - iteration: 200
-    cpuct: 1.75
+    cpuct: 1.52
+  - iteration: 180
+    cpuct: 1.60
+  - iteration: 300
+    cpuct: 1.70
+  - iteration: 400
+    cpuct: 1.78
+  - iteration: 470
+    cpuct: 1.85
 
+  # Root noise weight: mirror exploration decay; keep a floor
   noise_weight_schedule:
   - iteration: 0
     weight: 0.25
-  - iteration: 80
-    weight: 0.22
-  - iteration: 100
-    weight: 0.18
   - iteration: 140
-    weight: 0.18     # hold floor — keep exploration through mid-training
-  - iteration: 200
+    weight: 0.22
+  - iteration: 260
+    weight: 0.18
+  - iteration: 360
     weight: 0.14
-  - iteration: 300
-    weight: 0.10     # floor: never go below 0.10
+  - iteration: 430
+    weight: 0.12
+  - iteration: 470
+    weight: 0.10
 
+  # Games schedule: enforce sims×games ≈ 172,800 constant wall-clock
   games_schedule:
   - iteration: 0
-    games: 900    # canonical-only: 900×42 ≈ 37.8k pos/iter; window 8 ≈ 302k buffer
+    games: 900   # 192*900 = 172,800
   - iteration: 80
-    games: 900
-  - iteration: 140
-    games: 650    # 650×42 ≈ 27.3k; window 11 ≈ 300k
-  - iteration: 200
-    games: 600    # 600×42 ≈ 25.2k; window 12 ≈ 302k
+    games: 771   # 224*771 = 172,704 (close; or 770 -> 172,480)
+  - iteration: 180
+    games: 675   # 256*675 = 172,800
   - iteration: 300
-    games: 510    # 510×42 ≈ 21.4k; window 14 ≈ 300k
-  - iteration: 400
-    games: 480    # 480×42 ≈ 20.2k; window 15 ≈ 302k
+    games: 600   # 288*600 = 172,800
+  - iteration: 420
+    games: 540   # 320*540 = 172,800
 
+  # Window: widen to keep ~300k buffer as positions/iter shrink (positions ≈ games*42)
   window_iterations_schedule:
   - iteration: 0
-    window_iterations: 8
+    window_iterations: 8    # 900*42*8 = 302,400
   - iteration: 80
-    window_iterations: 8
-  - iteration: 140
-    window_iterations: 11
-  - iteration: 200
-    window_iterations: 12
+    window_iterations: 10   # 771*42*10 = 323,820 (capped by max_size)
+  - iteration: 180
+    window_iterations: 11   # 675*42*11 = 311,850
   - iteration: 300
-    window_iterations: 14
-  - iteration: 400
-    window_iterations: 15
+    window_iterations: 12   # 600*42*12 = 302,400
+  - iteration: 420
+    window_iterations: 14   # 540*42*14 = 317,520 (capped)
 
 inference:
   batch_size: 512

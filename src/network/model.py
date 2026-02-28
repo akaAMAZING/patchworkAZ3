@@ -387,7 +387,7 @@ class ValueHead(nn.Module):
         self,
         x: torch.Tensor,
         g: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = F.relu(self.bn(self.conv(x)), inplace=True)
         flat = x.flatten(start_dim=1)  # (B, value_channels * 81)
         if g is not None and self.global_inject_dim > 0:
@@ -395,8 +395,9 @@ class ValueHead(nn.Module):
         hidden = F.relu(self.fc1(flat), inplace=True)
         value = torch.tanh(self.fc2(hidden))
         if self.score_head is not None:
-            score = self.score_head(hidden)  # tanh-normalised score margin target
-            return value, score
+            z_lin = self.score_head[0](hidden)
+            score = torch.tanh(z_lin)
+            return value, score, z_lin
         return value
 
 
@@ -786,7 +787,7 @@ class PatchworkNetwork(nn.Module):
             policy_logits = policy_logits.masked_fill(action_mask == 0, float("-inf"))
         value_out = self.value_head(trunk, g=g_heads)
         if isinstance(value_out, tuple):
-            value, score = value_out
+            value, score = value_out[0], value_out[1]
         else:
             value = value_out
             score = torch.zeros_like(value)
@@ -850,10 +851,12 @@ class PatchworkNetwork(nn.Module):
             policy_logits = policy_logits.masked_fill(action_mask == 0, float("-inf"))
         value_out = self.value_head(trunk, g=g_heads)
         if isinstance(value_out, tuple):
-            value, score = value_out
+            value, score = value_out[0], value_out[1]
+            z_lin = value_out[2] if len(value_out) >= 3 else None
         else:
             value = value_out
             score = torch.zeros_like(value)
+            z_lin = None
 
         # Policy loss (cross-entropy)
         target_policy_sum = target_policy.sum(dim=-1, keepdim=True)
@@ -869,13 +872,26 @@ class PatchworkNetwork(nn.Module):
         # Value loss (MSE)
         value_loss = F.mse_loss(value, target_value)
 
-        # Score loss (Huber, small weight because score magnitudes are large)
-        # CRITICAL: squeeze(-1) to avoid (B,1) vs (B,) broadcasting into (B,B) silent bug
+        # Score loss in logit space (Huber on z) to avoid gradient saturation for large margins.
+        # When clamp does not activate, gradient matches tanh-space Huber; clamp uses dtype of tensor being clamped.
         score_loss = torch.tensor(0.0, device=state.device)
         if target_score is not None and score_loss_weight > 0 and self.value_head.score_head is not None:
             predicted_flat = score.squeeze(-1)  # (B, 1) -> (B,)
             target_flat = target_score if target_score.dim() <= 1 else target_score.squeeze(-1)  # (B,)
-            score_loss = F.huber_loss(predicted_flat, target_flat, delta=0.5)
+            if z_lin is not None:
+                z_pred = z_lin.squeeze(-1)
+            else:
+                eps = torch.finfo(predicted_flat.dtype).eps
+                clamp_val = 1.0 - 2.0 * eps
+                z_pred = torch.atanh(
+                    predicted_flat.float().clamp(-clamp_val, clamp_val)
+                ).to(predicted_flat.dtype)
+            eps_t = torch.finfo(target_flat.dtype).eps
+            clamp_val_t = 1.0 - 2.0 * eps_t
+            z_t = torch.atanh(
+                target_flat.float().clamp(-clamp_val_t, clamp_val_t)
+            ).to(target_flat.dtype)
+            score_loss = F.huber_loss(z_pred, z_t, delta=1.0)  # ~30 pts in raw-margin units; conservative WR-safe default
 
         # Ownership loss (auxiliary, KataGo-style adapted for dual-board)
         ownership_loss = torch.tensor(0.0, device=state.device)
