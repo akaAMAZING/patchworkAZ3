@@ -187,6 +187,7 @@ def _print_iter_header(
     cpuct = float(sp.get("cpuct", 1.5))
     q_wt  = float(sp.get("q_value_weight", 0.0))
     dsuw  = float(sp.get("dynamic_score_utility_weight", 0.3))
+    pl    = int(sp.get("parallel_leaves", 32))
     lr    = float(tr.get("lr", 0.0))
     games = int(sp.get("games", 0))
 
@@ -207,6 +208,7 @@ def _print_iter_header(
         f"  {_CLR_DIM}LR={_CLR_RST}{_CLR_VAL}{lr:.2e}{_CLR_RST}"
         f"  {_CLR_DIM}games={_CLR_RST}{_CLR_VAL}{games}{_CLR_RST}"
         f"  {_CLR_DIM}dsuw={_CLR_RST}{_CLR_VAL}{dsuw:.2f}{_CLR_RST}"
+        f"  {_CLR_DIM}pl={_CLR_RST}{_CLR_VAL}{pl}{_CLR_RST}"
     )
     print(f"\n{bar}\n{hdr}\n{params}\n{bar}", flush=True)
 
@@ -786,6 +788,7 @@ class AlphaZeroTrainer:
                 "q_value_weight": float(sp.get("q_value_weight", 0.0)),
                 "static_score_utility_weight": float(mcts.get("static_score_utility_weight", 0.0)),
                 "dynamic_score_utility_weight": float(mcts.get("dynamic_score_utility_weight", 0.3)),  # schedule-applied
+                "parallel_leaves": int(mcts.get("parallel_leaves", 32)),
             },
             "training": {
                 "lr": float(train.get("learning_rate", 0.0)),
