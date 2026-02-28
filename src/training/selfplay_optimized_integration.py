@@ -140,15 +140,22 @@ class SelfPlayGenerator:
         self.stop_evt = ctx.Event()
         ready_q = ctx.Queue(maxsize=1)
 
-        # Create per-worker shared memory buffers for zero-copy IPC
-        parallel_leaves = int(
+        # Create per-worker shared memory buffers for zero-copy IPC.
+        # Size buffers for the max parallel_leaves that will ever be used (schedule or base).
+        parallel_leaves_base = int(
             self.config.get("selfplay", {}).get("mcts", {}).get("parallel_leaves", 32)
         )
+        pl_schedule = self.config.get("iteration", {}).get("parallel_leaves_schedule", [])
+        if pl_schedule:
+            max_scheduled = max(int(e.get("parallel_leaves", parallel_leaves_base)) for e in pl_schedule)
+            n_slots = max(parallel_leaves_base, max_scheduled)
+        else:
+            n_slots = parallel_leaves_base
         self._worker_shm_bufs = {}
         self._worker_shm_names = {}
         for wid in range(num_workers):
             try:
-                buf = WorkerSharedBuffer(n_slots=parallel_leaves, worker_id=wid, create=True)
+                buf = WorkerSharedBuffer(n_slots=n_slots, worker_id=wid, create=True)
                 self._worker_shm_bufs[wid] = buf
                 self._worker_shm_names[wid] = buf.name
             except Exception as e:
@@ -159,7 +166,7 @@ class SelfPlayGenerator:
         if self._worker_shm_names:
             logger.debug(
                 "Created %d shared memory buffers (%d slots × %d bytes each)",
-                num_workers, parallel_leaves, WorkerSharedBuffer.SLOT_BYTES,
+                num_workers, n_slots, WorkerSharedBuffer.SLOT_BYTES,
             )
 
         self.gpu_process = ctx.Process(

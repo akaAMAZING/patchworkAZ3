@@ -111,7 +111,7 @@ selfplay:
   augmentation: d4  # none | flip | d4 (default flip preserves current behavior)
   mcts:
     simulations: 192
-    parallel_leaves: 48
+    parallel_leaves: 64
     # KataGo dual-head score utility (self-play defaults from KataGo GitHub issue #344)
     # Dynamic only (static=0.0) — KataGo self-play training rationale: "always trying to
     # gain points seems like a decent instinct to train into the neural net."

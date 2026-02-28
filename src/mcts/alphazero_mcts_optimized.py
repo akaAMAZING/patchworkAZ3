@@ -623,6 +623,9 @@ class OptimizedAlphaZeroMCTS:
     def _simulate_batched(self, root: MCTSNode) -> None:
         sims_remaining = int(self.config.simulations)
         batch_n = max(1, int(self.config.parallel_leaves))
+        # Never use more SHM slots than allocated (schedule may request more than buffer size)
+        if self._shm_buf is not None:
+            batch_n = min(batch_n, self._shm_buf.n_slots)
 
         while sims_remaining > 0:
             k = min(batch_n, sims_remaining)
@@ -701,6 +704,9 @@ class OptimizedAlphaZeroMCTS:
             if _use_shm:
                 # Zero-copy path: encode directly into shared memory slot n_nonterminal.
                 slot = n_nonterminal
+                assert slot < self._shm_buf.n_slots, (
+                    f"SHM slot {slot} >= n_slots {self._shm_buf.n_slots}"
+                )
                 enc = self._gold_v2_encoder
                 enc.encode_into(
                     node.state, node.to_move,

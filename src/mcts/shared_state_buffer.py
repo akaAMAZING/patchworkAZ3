@@ -75,7 +75,17 @@ class WorkerSharedBuffer:
             assert name is not None, "name required when create=False"
             self._shm = SharedMemory(create=False, name=name)
             # Derive n_slots from actual SHM size (caller may pass n_slots for verification)
+            if self._shm.size < self.SLOT_BYTES:
+                raise ValueError(
+                    f"SHM buffer too small: size={self._shm.size} < SLOT_BYTES={self.SLOT_BYTES}"
+                )
+            if self._shm.size % self.SLOT_BYTES != 0:
+                raise ValueError(
+                    f"SHM size {self._shm.size} is not a multiple of SLOT_BYTES {self.SLOT_BYTES}"
+                )
             derived = self._shm.size // self.SLOT_BYTES
+            if derived < 1:
+                raise ValueError(f"SHM buffer has no full slots: derived={derived}")
             self.n_slots = n_slots if n_slots is not None else derived
 
         self.name = self._shm.name
