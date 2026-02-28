@@ -15,6 +15,7 @@ ARCHITECTURE:
 
 import logging
 import multiprocessing as mp
+import queue
 import os
 import signal
 import shutil
@@ -179,15 +180,32 @@ class SelfPlayGenerator:
         logger.debug(f"GPU inference server process started (PID: {self.gpu_process.pid})")
         logger.debug("Waiting for GPU server to initialize...")
 
-        # Wait for server to signal it's ready (or timeout after 120s)
-        # cudnn.benchmark profiling can take 30-90s; 120s gives safe headroom.
+        # Wait for server to signal it's ready (or timeout). cuDNN warmup can take 1-2 min.
+        gpu_ready_timeout = float(self.config.get("selfplay", {}).get("gpu_server_ready_timeout_s", 180))
         try:
-            status = ready_q.get(timeout=120.0)
+            status = ready_q.get(timeout=gpu_ready_timeout)
             if status == "ready":
                 logger.debug("GPU inference server ready!")
             elif status.startswith("error:"):
                 error_msg = status[6:]
                 raise RuntimeError(f"GPU server initialization failed: {error_msg}")
+        except queue.Empty:
+            if self.gpu_process.is_alive():
+                self.gpu_process.terminate()
+                self.gpu_process.join(timeout=5)
+                msg = (
+                    f"GPU server did not signal ready within {gpu_ready_timeout:.0f}s (timeout). "
+                    "It may still be initializing (cuDNN warmup can take 1-2 min). "
+                    "Increase selfplay.gpu_server_ready_timeout_s in config to wait longer."
+                )
+            else:
+                exitcode = getattr(self.gpu_process, "exitcode", None)
+                msg = (
+                    f"GPU server process exited before signalling ready (exit code: {exitcode}). "
+                    "Check for CUDA/GPU errors, out-of-memory, or missing checkpoint. "
+                    "Run with a single worker to avoid GPU server (selfplay.num_workers=1) as a workaround."
+                )
+            raise RuntimeError(msg)
         except Exception as e:
             if self.gpu_process.is_alive():
                 self.gpu_process.terminate()

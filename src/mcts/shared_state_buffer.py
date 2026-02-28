@@ -74,14 +74,11 @@ class WorkerSharedBuffer:
         else:
             assert name is not None, "name required when create=False"
             self._shm = SharedMemory(create=False, name=name)
-            # Derive n_slots from actual SHM size (caller may pass n_slots for verification)
+            # Derive n_slots from actual SHM size. On Windows, the OS may round size up to a
+            # page boundary, so size % SLOT_BYTES can be non-zero; use only full slots.
             if self._shm.size < self.SLOT_BYTES:
                 raise ValueError(
                     f"SHM buffer too small: size={self._shm.size} < SLOT_BYTES={self.SLOT_BYTES}"
-                )
-            if self._shm.size % self.SLOT_BYTES != 0:
-                raise ValueError(
-                    f"SHM size {self._shm.size} is not a multiple of SLOT_BYTES {self.SLOT_BYTES}"
                 )
             derived = self._shm.size // self.SLOT_BYTES
             if derived < 1:

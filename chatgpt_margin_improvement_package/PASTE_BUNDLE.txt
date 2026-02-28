@@ -1,0 +1,126 @@
+============= SECTION 1: MAIN PROMPT (paste this first) =============
+
+# Task: Optimize the codebase for margin in all situations
+
+## Goal
+
+We want the agent to **maximize score margin from its own perspective in every situation**:
+
+- **When winning**: win by as much as possible (maximize positive margin).
+- **When losing**: lose by as little as possible (minimize the negative margin — i.e. maximize the margin from the current player's perspective, which is negative but closer to 0).
+
+The hypothesis: by training the agent to always optimize for "largest possible margin from my perspective" (whether that's +50 or -5 instead of -78), it will both win more games and, when it loses, lose by smaller margins. So the single objective is: **maximize (my_score − opponent_score)** in expectation, which implies winning more and losing by less.
+
+---
+
+## Current behavior (what to change)
+
+The codebase uses a **KataGo-style dual-head** setup:
+
+1. **Value head**
+   - **Target**: strictly binary: +1 (win), -1 (loss), 0 (tie).
+   - **Training**: MSE between value head output and this binary target.
+   - **Effect**: The value head gets no signal about *how much* the agent won or lost. A loss by 1 and a loss by 78 both use target -1. So the agent is not encouraged to "lose by less."
+
+2. **Score head**
+   - **Target**: tanh-normalised margin: `tanh((my_score - opp_score) / 30)` in (-1, 1).
+   - **Training**: Huber loss in logit space on this target.
+   - **Effect**: The score head *does* learn margin. But the **policy and value targets** are driven by value target = binary win/loss (no margin when losing). MCTS utility = value + dynamic_w * (score - root_score).
+
+3. **MCTS**
+   - Terminal backup: `utility = value + dynamic_w * (score - root_score)` where `value` is ±1/0 and `score` is tanh(margin/30). So when losing, a loss by 5 gives a *better* (less negative) utility than a loss by 78, and MCTS does prefer lines that "lose by less" during search. But the **training labels** for the value head are still binary (all losses → -1).
+
+4. **Self-play**
+   - For each position, `value_and_score_from_scores()` sets `values[i]` = binary (+1 / -1 / 0), optionally mixed with root Q; `score_margins[i]` = tanh(margin/30). So the **value target** fed to the value head is never the margin.
+
+**Summary of the gap**: The value head is trained only on win/loss/tie. So the agent has no gradient to "lose by less." We want the agent to maximize margin in all cases.
+
+---
+
+## Constraints and compatibility
+
+- **MCTS**: Must remain consistent. Terminal backup and non-terminal evaluation use `utility = value + score_utility`. If we change what "value" means, we must keep MCTS and self-play in sync.
+- **Replay data**: Existing HDF5 has `values` (float) and `score_margins` (tanh-normalised). Any change to the *semantics* of `values` may make old replays incompatible unless we support a version flag or migration.
+- **Scale**: Value head output is tanh, so in [-1, 1]. Any new value target should stay in a comparable range.
+
+---
+
+## What we need from you
+
+1. **Concrete design**: Propose a clear rule for the **value target** (and if needed the **score target**) so that the agent is trained to maximize margin from its own perspective in all situations (win by more, lose by less). MCTS and self-play must stay consistent. Consider: Option A = replace value target with tanh(margin/30) for all terminals; Option B = keep value head win/loss but add combined loss so gradient pushes "lose by less"; Option C = single head for expected margin; or propose another.
+
+2. **Exact code changes**: List every file and function to change, with current behavior, new behavior, and suggested code edits. Key files: value_targets.py, selfplay_optimized.py, alphazero_mcts_optimized.py (_get_terminal_value, _compute_score_utility), model.py (value/score loss), config.
+
+3. **Backward compatibility**: If new replays have different `values` semantics, propose a version flag or dataset attribute or transition.
+
+4. **Testing / sanity**: Suggest one or two sanity checks (e.g. "lose by 5" should have less negative value target than "lose by 78").
+
+---
+
+## Delivered context (sections below)
+
+The following sections contain the actual code/context files. Repo path mapping:
+- value_targets.py → src/training/value_targets.py
+- model value/score loss → src/network/model.py
+- selfplay value assignment → src/training/selfplay_optimized.py
+- MCTS utility/terminal → src/mcts/alphazero_mcts_optimized.py
+- config → configs/config_best.yaml
+
+
+============= SECTION 2: context/value_targets.py (repo: src/training/value_targets.py) =============
+
+"""
+Shared terminal value utilities for self-play and MCTS.
+Value head: strictly 1.0 (win), -1.0 (loss), 0.0 (tie)
+Score head: tanh(margin / 30.0) in (-1, 1)
+"""
+
+from __future__ import annotations
+import math
+
+def terminal_value_from_scores(score0: int, score1: int, winner: int, to_move: int) -> float:
+    """Returns +1.0 if to_move won, -1.0 if lost, 0.0 on tie. CRITICAL: same in selfplay and MCTS."""
+    if int(score0) == int(score1):
+        return 0.0
+    return 1.0 if int(winner) == int(to_move) else -1.0
+
+_SCORE_NORMALISE_DIVISOR = 30.0
+
+def value_and_score_from_scores(score0: int, score1: int, winner: int, to_move: int) -> tuple[float, float]:
+    """Returns (value, score_margin). value = +1/-1/0; score_margin = tanh((to_move_score - opp_score) / 30.0)."""
+    value = terminal_value_from_scores(score0, score1, winner, to_move)
+    if int(to_move) == 0:
+        raw_margin = float(int(score0) - int(score1))
+    else:
+        raw_margin = float(int(score1) - int(score0))
+    score_margin = math.tanh(raw_margin / _SCORE_NORMALISE_DIVISOR)
+    return value, score_margin
+
+
+============= SECTION 3: context/model_value_and_score_loss.py (repo: src/network/model.py) =============
+
+# Value loss: F.mse_loss(value, target_value)  <- target_value is currently BINARY ±1/0
+# Score loss: when target_score not None, Huber in logit space: z_pred = atanh(pred), z_t = atanh(target); score_loss = F.huber_loss(z_pred, z_t, delta=1.0)
+# total_loss = policy_weight*policy_loss + value_weight*value_loss + score_loss_weight*score_loss + ...
+
+
+============= SECTION 4: context/selfplay_value_assignment.py (repo: src/training/selfplay_optimized.py) =============
+
+# For each stored position i:
+#   z_value, z_score = value_and_score_from_scores(score0, score1, winner, to_move=p)
+#   score_margins[i] = z_score
+#   values[i] = (1 - q_w)*z_value + q_w*q_clamped  if q_value_weight>0 else z_value
+# So value target is always binary (or mix with Q); no "lose by less" in values.
+
+
+============= SECTION 5: context/mcts_utility_and_terminal.py (repo: src/mcts/alphazero_mcts_optimized.py) =============
+
+# utility = value + static_w*score + dynamic_w*(score - root_score); static_w=0, dynamic_w=0.3
+# _get_terminal_value: value = terminal_value_from_scores(...); score = tanh(raw_margin/30); return value + _compute_score_utility(score, is_root)
+# So terminal utility = binary value + score_utility. Backup uses this; root Q = average of utility (clamped to [-1,1] for value-head mixing).
+
+
+============= SECTION 6: context/config_snippet.yaml (repo: configs/config_best.yaml) =============
+
+# training: value_loss_weight: 1.0, score_loss_weight: 0.3
+# selfplay.mcts: static_score_utility_weight: 0.0, dynamic_score_utility_weight: 0.3, score_utility_scale: 30.0

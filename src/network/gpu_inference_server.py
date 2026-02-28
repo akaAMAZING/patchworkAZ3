@@ -432,6 +432,7 @@ def run_gpu_inference_server(
     logging.basicConfig(level=logging.INFO, format='[GPU Server] %(message)s')
     logger = logging.getLogger(__name__)
 
+    error_status = None  # Set to "error:..." on exception so parent gets a message
     try:
         logger.debug("Initializing GPU inference server (device=%s)...", device)
         sys.stdout.flush()
@@ -442,20 +443,17 @@ def run_gpu_inference_server(
         logger.debug("GPU server initialized successfully, running warmup...")
         sys.stdout.flush()
         server._warmup_inference()
-
-        # Signal ready to parent process (after warmup so workers never see cold-start latency)
         if ready_q is not None:
             ready_q.put("ready")
-
         server.serve(req_q=req_q, resp_qs=resp_qs, stop_evt=stop_evt)
     except Exception as e:
         logger.error(f"GPU server failed: {e}", exc_info=True)
         sys.stdout.flush()
-
-        # Signal error to parent process
-        if ready_q is not None:
-            try:
-                ready_q.put(f"error:{str(e)}")
-            except:
-                pass
+        error_status = f"error:{str(e)}"
         raise
+    finally:
+        if ready_q is not None and error_status is not None:
+            try:
+                ready_q.put(error_status)
+            except Exception:
+                pass
