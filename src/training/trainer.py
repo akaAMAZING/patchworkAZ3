@@ -580,17 +580,12 @@ class Trainer:
             self._ema_tensors: List[torch.Tensor] = []
             self._param_tensors: List[torch.Tensor] = []
 
-        # Resume optimizer/scheduler/scaler/EMA from checkpoint (when enabled or boundary-resume)
-        resume_opt = bool(train_config.get("resume_optimizer_state", False))
-        resume_sched = bool(train_config.get("resume_scheduler_state", False))
-        resume_scaler = bool(train_config.get("resume_scaler_state", resume_opt))
-        if force_resume_optimizer_state:
-            resume_opt = True
-        if force_resume_scheduler_state:
-            resume_sched = True
-        if force_resume_scaler_state:
-            resume_scaler = True
-        if resume_opt or resume_sched or force_resume_ema:
+        # Resume optimizer/scheduler/scaler/EMA from checkpoint.
+        # Main sets force_resume_* (e.g. False for seed warm-start); that is the definitive decision.
+        resume_opt = force_resume_optimizer_state
+        resume_sched = force_resume_scheduler_state
+        resume_scaler = force_resume_scaler_state
+        if resume_opt or resume_sched or resume_scaler or force_resume_ema:
             if optimizer_state_checkpoint and Path(optimizer_state_checkpoint).exists():
                 self._try_load_optimizer_state(
                     optimizer_state_checkpoint,
@@ -677,8 +672,27 @@ class Trainer:
             return
         opt_loaded = sched_loaded = scaler_loaded = ema_loaded = False
         if resume_opt and "optimizer_state_dict" in ckpt:
+            # Defensive: skip load if checkpoint optimizer state has different param shapes (e.g. seed from another arch).
             try:
-                self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                od = ckpt["optimizer_state_dict"]
+                ckpt_states = od.get("state", [])
+                if isinstance(ckpt_states, dict):
+                    ckpt_states = list(ckpt_states.values())
+                current_params = [p for pg in self.optimizer.param_groups for p in pg["params"]]
+                if len(ckpt_states) != len(current_params):
+                    raise ValueError(
+                        f"optimizer state param count {len(ckpt_states)} != current {len(current_params)}"
+                    )
+                for i, p in enumerate(current_params):
+                    if i >= len(ckpt_states):
+                        break
+                    st = ckpt_states[i]
+                    exp_avg = st.get("exp_avg")
+                    if exp_avg is not None and hasattr(exp_avg, "shape") and exp_avg.shape != p.shape:
+                        raise ValueError(
+                            f"param {i} shape mismatch: ckpt {exp_avg.shape} vs current {p.shape}"
+                        )
+                self.optimizer.load_state_dict(od)
                 opt_loaded = True
                 # Peak LR must follow iteration.lr_schedule; load_state_dict restores checkpoint LR
                 # and overwrites the phase LR we set in config. Force phase LR after load.

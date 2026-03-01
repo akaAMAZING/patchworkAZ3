@@ -75,7 +75,7 @@ training:
   amp_dtype: bfloat16
   policy_loss_weight: 1.0
   value_loss_weight: 1.0
-  score_loss_weight: 0.3          # Raised: tanh targets in [-1,1] have much smaller MSE than raw integers
+  score_loss_weight: 0.1          # Raised: tanh targets in [-1,1] have much smaller MSE than raw integers
   ownership_loss_weight: 0.15
   epochs_per_iteration: 2
   val_split: 0.08
@@ -147,7 +147,7 @@ selfplay:
     cap_fraction: 0.00
     fast_probability: 0.00
   bootstrap:
-    use_pure_mcts: true
+    use_pure_mcts: true   # iter 0: pure MCTS only; train from scratch (avoids seed checkpoint optimizer shape mismatch)
     mcts_simulations: 192
     games: 900
   stream_to_disk: true

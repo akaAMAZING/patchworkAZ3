@@ -1164,7 +1164,12 @@ class AlphaZeroTrainer:
                     _log_checkpoint_file_only(
                         f"[CHECKPOINT] selfplay iter {iteration} using weights checkpoint: {selfplay_model}"
                     )
-                sp_label = f"iter{self.best_model_iteration:03d}" if (selfplay_model and self.best_model_iteration is not None) else "random"
+                if selfplay_model and self.best_model_iteration is not None:
+                    sp_label = f"iter{self.best_model_iteration:03d}"
+                elif iteration == start_iteration and resume_checkpoint and selfplay_model == resume_checkpoint:
+                    sp_label = "seed"
+                else:
+                    sp_label = "random"
                 _print_section(f"\n[1/3] SELF-PLAY  (generator: {sp_label})")
 
                 data_path, selfplay_stats = self._generate_selfplay_data(
@@ -1200,6 +1205,27 @@ class AlphaZeroTrainer:
                 force_resume_scheduler_state = allow_resume and bool(train_cfg.get("resume_scheduler_state", False))
                 force_resume_scaler_state = allow_resume and bool(train_cfg.get("resume_scaler_state", force_resume_optimizer_state))
                 force_resume_ema = allow_resume and bool(train_cfg.get("resume_ema_state", force_resume_optimizer_state))
+                # When warm-starting from an external seed (e.g. checkpoints/seed_model.pt), load model weights only;
+                # optimizer state from a seed may have different param shapes (e.g. scalar vs 201-bin head).
+                # Do NOT treat our own committed checkpoints (runs/.../committed/) as seed — always resume optimizer there.
+                is_external_seed = (
+                    bool(resume_checkpoint)
+                    and train_base == resume_checkpoint
+                    and not (
+                        self.run_root is not None
+                        and str(self.run_root) in str(Path(resume_checkpoint).resolve())
+                        and "committed" in Path(resume_checkpoint).resolve().parts
+                    )
+                )
+                if iteration == start_iteration and is_external_seed:
+                    force_resume_optimizer_state = False
+                    force_resume_scheduler_state = False
+                    force_resume_scaler_state = False
+                    force_resume_ema = False
+                    logger.info(
+                        "[RESUME] seed warm-start: loading model weights only (optimizer/scheduler/EMA fresh) from %s",
+                        train_base,
+                    )
                 if resume_from_committed_cfg and train_base and "staging" in Path(train_base).resolve().parts:
                     raise ValueError(
                         f"[RESUME] resume_from_committed_state=True but train_base is staging: {train_base}. "
