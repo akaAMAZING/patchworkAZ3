@@ -9,13 +9,12 @@ Design goals:
 - Handles out-of-order responses
 
 Protocol (dict payload):
-- encoding_version, action_mask, legal_idxs (as before)
-- score_center_points: float32 (point space, for dynamic score utility)
-- effective_static_w, effective_dynamic_w: float32 (DSU-gated weights)
-- Gold v2 SHM: slot=int, n_legal=int (data in shared memory)
-
-Response: (rid, priors_legal, value, mean_points, score_utility) — 5-tuple from server.
-receive() returns (priors_legal, value, mean_points, score_utility) — 4 values.
+- encoding_version: str ("gold_v2_32ch" | "full_clarity_v1")
+- action_mask: (2026,) float32
+- legal_idxs: (K,) int32
+- Legacy (deprecated): spatial-only state — use gold_v2 instead
+- Gold v2 pickle: x_spatial (32,9,9), x_global (61,), x_track (8,54), shop_ids (33,), shop_feats (33,10)
+- Gold v2 SHM:   encoding_version="gold_v2_32ch", slot=int, n_legal=int (data in shared memory)
 
 FIX CHANGELOG:
 - [C2] Request IDs are now globally unique: (pid << 32) | counter.
@@ -26,6 +25,7 @@ FIX CHANGELOG:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import queue
 import time
@@ -35,11 +35,20 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Safe bound for score_center_points (tripwire assert)
+CENTER_SAFE_ABS_BOUND = 200.0
+
 ENCODING_LEGACY = "full_clarity_v1"
 ENCODING_GOLD_V2 = "gold_v2_32ch"
 
 
 class GPUEvalClient:
+    """Worker-side client for GPU inference.
+
+    Protocol: server returns (rid, priors_legal, value_scalar, mean_points_scalar, score_utility_scalar).
+    mean_points: expected score margin in POINTS. score_utility: KataGo-style sat() utility (already computed on server).
+    """
+
     def __init__(
         self,
         req_q,
@@ -54,11 +63,12 @@ class GPUEvalClient:
         self.timeout_s = timeout_s
         self.retry_attempts = int(retry_attempts)
 
-        # [C2 FIX] Globally unique IDs: embed PID in high bits so workers
-        # sharing the same resp_q never collide.
         self._pid_prefix = (os.getpid() & 0xFFFF) << 32
         self._next_counter = 1
         self._stash: Dict[int, Tuple[np.ndarray, float, float, float]] = {}
+        # Tripwire counters for regression diagnostics
+        self._total_responses = 0
+        self._client_suspect_fallback_count = 0
 
     def _next_id(self) -> int:
         rid = self._pid_prefix | self._next_counter
@@ -75,11 +85,14 @@ class GPUEvalClient:
         mask_np: np.ndarray,
         legal_idxs_np: np.ndarray,
         score_center_points: float = 0.0,
-        effective_static_w: float = 0.0,
-        effective_dynamic_w: float = 0.3,
     ) -> int:
         """Enqueue legacy (full_clarity_v1) inference request."""
+        assert math.isfinite(score_center_points) and abs(score_center_points) <= CENTER_SAFE_ABS_BOUND, (
+            f"score_center_points must be finite and |center|<=200, got {score_center_points}"
+        )
         rid = self._next_id()
+        if os.environ.get("PW_DEBUG_MCTS") == "1":
+            logger.info("[CENTER_SUBMIT] rid=%s center=%.2f (legacy)", rid, score_center_points)
         if state_np.dtype != np.float32:
             state_np = state_np.astype(np.float32, copy=False)
         mask_np = np.asarray(mask_np, dtype=np.float32)
@@ -92,8 +105,6 @@ class GPUEvalClient:
             "action_mask": mask_np,
             "legal_idxs": legal_idxs_np,
             "score_center_points": float(score_center_points),
-            "effective_static_w": float(effective_static_w),
-            "effective_dynamic_w": float(effective_dynamic_w),
         }
         self.req_q.put(payload)
         return rid
@@ -108,11 +119,14 @@ class GPUEvalClient:
         mask_np: np.ndarray,
         legal_idxs_np: np.ndarray,
         score_center_points: float = 0.0,
-        effective_static_w: float = 0.0,
-        effective_dynamic_w: float = 0.3,
     ) -> int:
         """Enqueue gold_v2_multimodal inference request."""
+        assert math.isfinite(score_center_points) and abs(score_center_points) <= CENTER_SAFE_ABS_BOUND, (
+            f"score_center_points must be finite and |center|<=200, got {score_center_points}"
+        )
         rid = self._next_id()
+        if os.environ.get("PW_DEBUG_MCTS") == "1":
+            logger.info("[CENTER_SUBMIT] rid=%s center=%.2f (multimodal)", rid, score_center_points)
         x_spatial = np.asarray(x_spatial, dtype=np.float32)
         x_global = np.asarray(x_global, dtype=np.float32)
         x_track = np.asarray(x_track, dtype=np.float32)
@@ -132,25 +146,22 @@ class GPUEvalClient:
             "action_mask": mask_np,
             "legal_idxs": legal_idxs_np,
             "score_center_points": float(score_center_points),
-            "effective_static_w": float(effective_static_w),
-            "effective_dynamic_w": float(effective_dynamic_w),
         }
         self.req_q.put(payload)
         return rid
 
-    def submit_shm(
-        self,
-        slot: int,
-        n_legal: int,
-        score_center_points: float = 0.0,
-        effective_static_w: float = 0.0,
-        effective_dynamic_w: float = 0.3,
-    ) -> int:
+    def submit_shm(self, slot: int, n_legal: int, score_center_points: float = 0.0) -> int:
         """Enqueue SHM inference request. Data is already written to WorkerSharedBuffer slot.
 
-        Sends only a tiny metadata dict; GPU server reads state from shared memory (wid, slot).
+        Sends only a tiny metadata dict (~100 bytes) instead of pickled arrays (~30KB).
+        GPU server reads state from the shared memory buffer identified by (wid, slot).
         """
+        assert math.isfinite(score_center_points) and abs(score_center_points) <= CENTER_SAFE_ABS_BOUND, (
+            f"score_center_points must be finite and |center|<=200, got {score_center_points}"
+        )
         rid = self._next_id()
+        if os.environ.get("PW_DEBUG_MCTS") == "1":
+            logger.info("[CENTER_SUBMIT] rid=%s center=%.2f (shm)", rid, score_center_points)
         self.req_q.put({
             "rid": rid,
             "wid": self.worker_id,
@@ -158,22 +169,19 @@ class GPUEvalClient:
             "slot": slot,
             "n_legal": n_legal,
             "score_center_points": float(score_center_points),
-            "effective_static_w": float(effective_static_w),
-            "effective_dynamic_w": float(effective_dynamic_w),
         })
         return rid
 
     def receive(self, rid: int) -> Tuple[np.ndarray, float, float, float]:
         """Block until response for rid arrives (handles out-of-order).
 
-        Returns (priors_legal, value, mean_points, score_utility) — 4 values.
-        Server sends 5-tuple (rid, priors_legal, value, mean_points, score_utility).
+        Returns (priors_legal, value, mean_points, score_utility).
         """
         rid = int(rid)
 
         if rid in self._stash:
-            pri, val, mean_pts, su = self._stash.pop(rid)
-            return pri, val, mean_pts, su
+            pri, val, mp, su = self._stash.pop(rid)
+            return pri, val, mp, su
 
         deadline = (time.time() + float(self.timeout_s)) if self.timeout_s is not None else None
         while True:
@@ -190,21 +198,22 @@ class GPUEvalClient:
                 continue
 
             resp_rid = int(resp_rid)
-            if resp_rid == rid:
-                return (
-                    np.asarray(priors_legal, dtype=np.float32),
-                    float(value),
-                    float(mean_points),
-                    float(score_utility),
+            mp = float(mean_points)
+            su = float(score_utility)
+            self._total_responses += 1
+            # Suspect fallback: server returned all-zero scalars (common error response)
+            if value == 0.0 and mp == 0.0 and su == 0.0:
+                self._client_suspect_fallback_count += 1
+            if self._total_responses > 0 and self._total_responses % 1000 == 0:
+                rate = self._client_suspect_fallback_count / max(1, self._total_responses)
+                logger.info(
+                    "[CLIENT_STATS] total=%d suspect_fallback=%d rate=%.6f",
+                    self._total_responses, self._client_suspect_fallback_count, rate,
                 )
+            if resp_rid == rid:
+                return np.asarray(priors_legal, dtype=np.float32), float(value), mp, su
 
-            # out-of-order: stash it
-            self._stash[resp_rid] = (
-                np.asarray(priors_legal, dtype=np.float32),
-                float(value),
-                float(mean_points),
-                float(score_utility),
-            )
+            self._stash[resp_rid] = (np.asarray(priors_legal, dtype=np.float32), float(value), mp, su)
 
     def evaluate(
         self,
@@ -212,16 +221,11 @@ class GPUEvalClient:
         mask_np: np.ndarray,
         legal_idxs_np: np.ndarray,
         score_center_points: float = 0.0,
-        effective_static_w: float = 0.0,
-        effective_dynamic_w: float = 0.3,
     ) -> Tuple[np.ndarray, float, float, float]:
-        """Blocking convenience: submit_legacy + receive, with retries. Returns (priors, value, mean_points, score_utility)."""
+        """Blocking convenience: submit_legacy + receive, with retries."""
         last_err: Optional[Exception] = None
         for attempt in range(self.retry_attempts):
-            rid = self.submit_legacy(
-                state_np, mask_np, legal_idxs_np,
-                score_center_points, effective_static_w, effective_dynamic_w,
-            )
+            rid = self.submit_legacy(state_np, mask_np, legal_idxs_np, score_center_points)
             try:
                 return self.receive(rid)
             except TimeoutError as e:
@@ -250,15 +254,13 @@ class GPUEvalClient:
         mask_np: np.ndarray,
         legal_idxs_np: np.ndarray,
         score_center_points: float = 0.0,
-        effective_static_w: float = 0.0,
-        effective_dynamic_w: float = 0.3,
     ) -> Tuple[np.ndarray, float, float, float]:
-        """Blocking convenience: submit_multimodal + receive, with retries. Returns (priors, value, mean_points, score_utility)."""
+        """Blocking convenience: submit_multimodal + receive, with retries."""
         last_err: Optional[Exception] = None
         for attempt in range(self.retry_attempts):
             rid = self.submit_multimodal(
                 x_spatial, x_global, x_track, shop_ids, shop_feats, mask_np, legal_idxs_np,
-                score_center_points, effective_static_w, effective_dynamic_w,
+                score_center_points,
             )
             try:
                 return self.receive(rid)

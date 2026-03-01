@@ -127,6 +127,21 @@ selfplay:
     virtual_loss: 1.0
     num_threads: 1
     fpu_reduction: 0.25
+    # Win-first (Stockfish-like): maximize win security first; margin only when safe / forced loss.
+    win_first:
+      enabled: true
+      value_delta_min: 0.01
+      value_delta_max: 0.06
+      value_delta_win_start: 0.60
+      value_delta_win_full: 0.90
+      gate_dsu_enabled: true
+      gate_dsu_win_start: 0.65
+      gate_dsu_win_full: 0.90
+      gate_dsu_power: 2.0
+      gate_dsu_loss_start: -0.90
+      gate_dsu_loss_full: -0.98
+      tiebreak: score_then_visits
+      filter_before_sampling: true
   playout_cap_randomization:
     enabled: false
     cap_fraction: 0.00

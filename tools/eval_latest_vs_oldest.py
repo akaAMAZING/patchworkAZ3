@@ -17,6 +17,7 @@ With --elo (default): persists Glicko-2 ratings to elo_ratings.json.
 """
 
 import argparse
+import copy
 import logging
 import re
 import sys
@@ -156,6 +157,16 @@ def torch_load(path: str, device: torch.device):
         return torch.load(path, map_location=device)
 
 
+def _worst_pct_loss_tail(loss_margins: list[float], pct: float = 5.0) -> float:
+    """Mean of the worst (most negative) pct% of loss margins. Empty list -> 0.0."""
+    if not loss_margins:
+        return 0.0
+    sorted_losses = sorted(loss_margins)  # most negative last in ascending order
+    n = max(1, int(len(sorted_losses) * pct / 100.0))
+    worst = sorted_losses[:n]
+    return sum(worst) / len(worst)
+
+
 def run_eval(
     cfg: dict,
     model_a_path: Path,
@@ -167,8 +178,17 @@ def run_eval(
     log: logging.Logger,
     elo_file: Path | None = None,
     elo_style: str = "glicko2",
+    win_first_enabled: bool | None = None,
 ) -> dict | None:
-    """Run head-to-head evaluation between two checkpoints."""
+    """Run head-to-head evaluation between two checkpoints.
+    If win_first_enabled is not None, overrides config selfplay.mcts.win_first.enabled for this run (A/B testing).
+    """
+    cfg = copy.deepcopy(cfg)
+    if win_first_enabled is not None:
+        mcts_cfg = cfg.setdefault("selfplay", {}).setdefault("mcts", {})
+        wf = mcts_cfg.setdefault("win_first", {})
+        wf["enabled"] = bool(win_first_enabled)
+
     id_a = model_elo_id(model_a_path)
     id_b = model_elo_id(model_b_path)
     ratings = load_ratings(elo_file) if elo_file else {}
@@ -269,6 +289,7 @@ def run_eval(
     loss_margins = [m for m in margins if m < 0]
     avg_win_margin = sum(win_margins) / len(win_margins) if win_margins else 0.0
     avg_loss_margin = sum(loss_margins) / len(loss_margins) if loss_margins else 0.0
+    worst_5pct_loss = _worst_pct_loss_tail(loss_margins, 5.0)
 
     # Win rate standard error (approx ±1.96*SE = 95% CI)
     wr_se = (wr * (1 - wr) / total) ** 0.5 if total else 0.0
@@ -289,7 +310,7 @@ def run_eval(
     wr_p1 = ((a_wins - a_wins_as_p0) / a_games_as_p1 * 100) if a_games_as_p1 else 0.0
 
     log.info(f"\nSUMMARY: A wins={a_wins}, B wins={b_wins}, A winrate={wr*100:.1f}% (SE ±{wr_se*100:.1f}%, n={total})")
-    log.info(f"  Score margin (A - B): avg={avg_margin:+.1f} ±{margin_std:.1f} pts  |  when A wins: +{avg_win_margin:.1f}  |  when A loses: {avg_loss_margin:.1f}")
+    log.info(f"  Score margin (A - B): avg={avg_margin:+.1f} ±{margin_std:.1f} pts  |  when A wins: +{avg_win_margin:.1f}  |  when A loses: {avg_loss_margin:.1f}  |  worst-5%% loss tail: {worst_5pct_loss:.1f}")
     log.info(f"  Largest margin: A +{max_win:.0f}  |  A {max_loss:+.0f}")
     log.info(f"  Game length: avg={avg_moves:.0f} moves  (min={min_moves}, max={max_moves_actual})")
     log.info(f"  A as P0: {a_wins_as_p0}/{a_games_as_p0} ({wr_p0:.0f}%)  |  A as P1: {a_wins - a_wins_as_p0}/{a_games_as_p1} ({wr_p1:.0f}%)")
@@ -322,7 +343,69 @@ def run_eval(
         "wr": wr,
         "wr_se": wr_se,
         "implied_elo": implied_elo,
+        "avg_margin": avg_margin,
+        "avg_win_margin": avg_win_margin,
+        "avg_loss_margin": avg_loss_margin,
+        "worst_5pct_loss": worst_5pct_loss,
     }
+
+
+def run_ab_win_first(
+    cfg: dict,
+    model_a_path: Path,
+    model_b_path: Path,
+    games: int,
+    sims: int,
+    cpuct: float,
+    device: torch.device,
+    log: logging.Logger,
+) -> None:
+    """
+    A/B test: same match twice (same weights, seeds, sims, cpuct).
+    Baseline: win_first.enabled = False
+    New:      win_first.enabled = True
+    Compare: Win rate, avg margin, avg loss margin, worst-5% loss tail.
+    """
+    log.info("=" * 60)
+    log.info("A/B WIN-FIRST: Baseline (win_first=false) vs New (win_first=true)")
+    log.info("  Same models, same games=%d, same sims=%d, same cpuct=%.2f", games, sims, cpuct)
+    log.info("  A: %s  |  B: %s", model_a_path.name, model_b_path.name)
+    log.info("  (Reference: previous iter007 vs iter001 n=200: WR 71.5%%, avg +7.6, win margin +19.0, loss margin -21.1)")
+    log.info("=" * 60)
+
+    log.info("\n--- Baseline (win_first.enabled = False) ---")
+    res_baseline = run_eval(
+        cfg, model_a_path, model_b_path, games, sims, cpuct, device, log,
+        elo_file=None,
+        win_first_enabled=False,
+    )
+    if not res_baseline:
+        return
+
+    log.info("\n--- New (win_first.enabled = True) ---")
+    res_new = run_eval(
+        cfg, model_a_path, model_b_path, games, sims, cpuct, device, log,
+        elo_file=None,
+        win_first_enabled=True,
+    )
+    if not res_new:
+        return
+
+    # Comparison
+    log.info("\n" + "=" * 60)
+    log.info("A/B COMPARISON (A = %s, B = %s, n=%d)", model_a_path.name, model_b_path.name, games)
+    log.info("=" * 60)
+    log.info("  Metric                    | Baseline (no WF) | New (WF on)   | Delta")
+    log.info("  -------------------------|------------------|---------------|--------")
+    wr_b, wr_n = res_baseline["wr"] * 100, res_new["wr"] * 100
+    log.info("  Win rate (A%%)             | %6.1f%%           | %6.1f%%        | %+.1f%%", wr_b, wr_n, wr_n - wr_b)
+    am_b, am_n = res_baseline.get("avg_margin", 0), res_new.get("avg_margin", 0)
+    log.info("  Avg final margin          | %+6.1f pts        | %+6.1f pts     | %+.1f", am_b, am_n, am_n - am_b)
+    al_b, al_n = res_baseline.get("avg_loss_margin", 0), res_new.get("avg_loss_margin", 0)
+    log.info("  Avg margin (losses only)  | %6.1f pts        | %6.1f pts     | %+.1f (better if less negative)", al_b, al_n, al_n - al_b)
+    w5_b, w5_n = res_baseline.get("worst_5pct_loss", 0), res_new.get("worst_5pct_loss", 0)
+    log.info("  Worst-5%% loss tail        | %6.1f pts        | %6.1f pts     | %+.1f (better if less negative)", w5_b, w5_n, w5_n - w5_b)
+    log.info("=" * 60)
 
 
 def run_champion_vs_field(
@@ -567,6 +650,10 @@ def main():
                     help="glicko2: Glicko-2 (gaps ~2–3x standard Elo); standard: 64.5%% WR -> ~104 Elo (default)")
     ap.add_argument("--show-elo", action="store_true", help="Print ELO leaderboard and exit")
 
+    # A/B win-first: same match twice (baseline win_first=false vs new win_first=true)
+    ap.add_argument("--ab-win-first", action="store_true",
+                    help="A/B test: run same match with win_first false then true; compare WR, margins, worst-5%% loss tail")
+
     # Legacy: latest vs oldest in window
     ap.add_argument("--ckpt_dir", help="(Legacy) Only search this dir for checkpoints")
     ap.add_argument("--window", type=int, default=0, help="(Legacy) Use last N checkpoints; 0=disable")
@@ -718,7 +805,10 @@ def main():
     log.info(f"Model B: {path_b.name}")
     log.info(f"Games: {args.games}\n")
 
-    run_eval(cfg, path_a, path_b, args.games, sims, cpuct, device, log, elo_file=elo_file, elo_style=args.elo_style)
+    if getattr(args, "ab_win_first", False):
+        run_ab_win_first(cfg, path_a, path_b, args.games, sims, cpuct, device, log)
+    else:
+        run_eval(cfg, path_a, path_b, args.games, sims, cpuct, device, log, elo_file=elo_file, elo_style=args.elo_style)
 
 
 if __name__ == "__main__":

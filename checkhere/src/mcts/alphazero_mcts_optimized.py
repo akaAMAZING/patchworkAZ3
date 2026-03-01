@@ -7,16 +7,16 @@ Neural evaluation uses slot-based encoding.
 
 from __future__ import annotations
 
-import logging
+import json
 import math
+import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-
-logger = logging.getLogger(__name__)
+import torch.nn.functional as F_torch
 
 from src.game.patchwork_engine import (
     apply_action,
@@ -156,69 +156,9 @@ def encode_legal_actions_fast(legal_actions: list) -> tuple:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class WinFirstConfig:
-    """Win-first (Stockfish-like) root selection and DSUW gating. All fields validated at parse time."""
-    enabled: bool = False
-    value_delta_min: float = 0.01
-    value_delta_max: float = 0.06
-    value_delta_win_start: float = 0.60
-    value_delta_win_full: float = 0.90
-    gate_dsu_enabled: bool = True
-    gate_dsu_win_start: float = 0.65
-    gate_dsu_win_full: float = 0.90
-    gate_dsu_power: float = 2.0
-    gate_dsu_loss_start: float = -0.90
-    gate_dsu_loss_full: float = -0.98
-    tiebreak: str = "score_then_visits"  # "score_then_visits" | "visits_then_score"
-    filter_before_sampling: bool = True
-    # Validation only: log root selection once (best_Qv, delta, candidate count, top-3 by Qv, Qs_points, Nv)
-    debug_log_one_game: bool = False
-
-
-def _parse_and_validate_win_first(cfg: dict) -> WinFirstConfig:
-    """Parse win_first block; clamp ranges and enforce start < full."""
-    w = cfg or {}
-    enabled = bool(w.get("enabled", False))
-    v_min = max(0.0, min(0.5, float(w.get("value_delta_min", 0.01))))
-    v_max = max(v_min, min(0.5, float(w.get("value_delta_max", 0.06))))
-    win_start = max(-1.0, min(1.0, float(w.get("value_delta_win_start", 0.60))))
-    win_full = max(win_start, min(1.0, float(w.get("value_delta_win_full", 0.90))))
-    gate_enabled = bool(w.get("gate_dsu_enabled", True))
-    g_win_start = max(-1.0, min(1.0, float(w.get("gate_dsu_win_start", 0.65))))
-    g_win_full = max(g_win_start, min(1.0, float(w.get("gate_dsu_win_full", 0.90))))
-    g_power = max(0.1, min(10.0, float(w.get("gate_dsu_power", 2.0))))
-    g_loss_start = max(-1.0, min(1.0, float(w.get("gate_dsu_loss_start", -0.90))))
-    g_loss_full = min(g_loss_start, min(1.0, float(w.get("gate_dsu_loss_full", -0.98))))
-    if g_loss_full >= g_loss_start:
-        g_loss_full = g_loss_start - 0.01  # ensure denominator (start - full) > 0
-    tiebreak = str(w.get("tiebreak", "score_then_visits")).lower()
-    if tiebreak not in ("score_then_visits", "visits_then_score"):
-        tiebreak = "score_then_visits"
-    filter_before_sampling = bool(w.get("filter_before_sampling", True))
-    debug_log_one_game = bool(w.get("debug_log_one_game", False))
-    return WinFirstConfig(
-        enabled=enabled,
-        value_delta_min=v_min,
-        value_delta_max=v_max,
-        value_delta_win_start=win_start,
-        value_delta_win_full=win_full,
-        gate_dsu_enabled=gate_enabled,
-        gate_dsu_win_start=g_win_start,
-        gate_dsu_win_full=g_win_full,
-        gate_dsu_power=g_power,
-        gate_dsu_loss_start=g_loss_start,
-        gate_dsu_loss_full=g_loss_full,
-        tiebreak=tiebreak,
-        filter_before_sampling=filter_before_sampling,
-        debug_log_one_game=debug_log_one_game,
-    )
-
-
-@dataclass
 class MCTSConfig:
     simulations: int = 800
     parallel_leaves: int = 32
-    # Tree reuse (permanent brain): when True, reuse subtree across searches. GUI/API only; training uses False.
     enable_tree_reuse: bool = False
     cpuct: float = 1.5
     temperature: float = 1.0
@@ -226,20 +166,19 @@ class MCTSConfig:
     root_dirichlet_alpha: float = 0.3
     root_noise_weight: float = 0.25
     virtual_loss: float = 1.0
-    # FPU Reduction (KataGo-style): penalize unexplored children by reducing
-    # their initial Q estimate. This encourages the search to prefer actions
-    # the network already evaluated highly, rather than exploring randomly.
-    # 0.0 = no reduction (legacy), 0.25 = KataGo default for value head.
     fpu_reduction: float = 0.25
-    # KataGo Dual-Head (201-bin): score_estimate and _search_root_score are in POINT SPACE.
-    # utility = value + score_utility (score_utility computed on GPU from distribution; or locally from score_logits).
-    # Dynamic centering: root's mean_points; DSU gate scales effective weights for WIN_FIRST.
-    static_score_utility_weight: float = 0.0   # Absolute score lead (disabled in self-play)
-    dynamic_score_utility_weight: float = 0.3   # Relative score gain vs. root prediction
-    score_utility_scale: float = 30.0           # sat() scale; matches value_targets
+    # If True, unvisited actions use constant -fpu_reduction instead of parent_q - fpu_reduction (ablation).
+    fpu_constant_only: bool = False
+    # KataGo Dual-Head with distributional score utility.
+    # sat(x) = (2/pi) * atan(x)
+    # dynamic_component = E_s[sat((s - center) / scale)]
+    # static_component  = E_s[sat(s / scale)]
+    # score_utility = static_w * static + dynamic_w * dynamic
+    static_score_utility_weight: float = 0.0
+    dynamic_score_utility_weight: float = 0.3
     score_min: int = -100
     score_max: int = 100
-    win_first: WinFirstConfig = field(default_factory=WinFirstConfig)
+    score_utility_point_scale: float = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -257,9 +196,8 @@ class MCTSNode:
     __slots__ = (
         "state", "to_move", "parent", "children",
         "_visit_count", "_total_value", "_prior", "_virtual_loss",
-        "_value_sum", "_score_sum",  # Win-first: per-child value and score (root-perspective at backup)
         "legal_actions", "_action_to_idx", "terminal", "terminal_value", "n_total",
-        "score_estimate",  # raw tanh-normalised score from last network evaluation; used for dynamic centering on tree reuse
+        "score_estimate",  # mean score in POINTS from last evaluation (to_move perspective); used for dynamic centering
     )
 
     def __init__(self, state, to_move: int, parent: Optional["MCTSNode"] = None):
@@ -272,8 +210,6 @@ class MCTSNode:
         self._total_value: Optional[np.ndarray] = None
         self._prior: Optional[np.ndarray] = None
         self._virtual_loss: Optional[np.ndarray] = None
-        self._value_sum: Optional[np.ndarray] = None
-        self._score_sum: Optional[np.ndarray] = None
         self.legal_actions: Optional[List[tuple]] = None
         self._action_to_idx: Optional[Dict[tuple, int]] = None
         self.terminal: bool = False
@@ -288,8 +224,6 @@ class MCTSNode:
         self._total_value = np.zeros(n, dtype=np.float64)
         self._prior = np.zeros(n, dtype=np.float64)
         self._virtual_loss = np.zeros(n, dtype=np.float64)
-        self._value_sum = np.zeros(n, dtype=np.float64)
-        self._score_sum = np.zeros(n, dtype=np.float64)
         self._action_to_idx = {a: i for i, a in enumerate(self.legal_actions)}
 
     def is_expanded(self) -> bool:
@@ -333,29 +267,47 @@ class MCTSNode:
             elif self.legal_actions:
                 self._prior[:] = 1.0 / len(self.legal_actions)
 
-    def get_ucb(self, action: tuple, cpuct: float, fpu_reduction: float = 0.0) -> float:
+    def get_ucb(self, action: tuple, cpuct: float, fpu_reduction: float = 0.0, fpu_constant_only: bool = False) -> float:
         idx = self._action_to_idx[action]
         n = self._visit_count[idx]
         p = self._prior[idx]
         vl = self._virtual_loss[idx]
         effective_n = n + vl
         if effective_n == 0:
-            q_value = -fpu_reduction if self.parent else 0.0
+            # KataGo FPU: unvisited children inherit parent's mean Q minus a penalty.
+            if fpu_constant_only:
+                q_value = -fpu_reduction
+            elif self.n_total > 0:
+                parent_q = self._total_value.sum() / self.n_total
+                q_value = parent_q - fpu_reduction
+            elif self.parent:
+                q_value = -fpu_reduction
+            else:
+                q_value = 0.0
         else:
             q_value = (self._total_value[idx] - vl) / effective_n
         exploration = cpuct * p * math.sqrt(self.n_total + 1) / (1 + n)
         return q_value + exploration
 
-    def select_action(self, cpuct: float, fpu_reduction: float = 0.0) -> tuple:
+    def select_action(self, cpuct: float, fpu_reduction: float = 0.0, fpu_constant_only: bool = False) -> tuple:
         """Vectorized UCB action selection."""
         n = self._visit_count.astype(np.float64)
         vl = self._virtual_loss
         effective_n = n + vl
-        # Q values
+        # KataGo FPU: unvisited children inherit parent's mean Q minus a penalty.
+        if fpu_constant_only:
+            fpu_value = -fpu_reduction
+        elif self.n_total > 0:
+            parent_q = self._total_value.sum() / self.n_total
+            fpu_value = parent_q - fpu_reduction
+        elif self.parent:
+            fpu_value = -fpu_reduction
+        else:
+            fpu_value = 0.0
         with np.errstate(divide='ignore', invalid='ignore'):
             q = np.where(effective_n > 0,
                           (self._total_value - vl) / effective_n,
-                          -fpu_reduction if self.parent else 0.0)
+                          fpu_value)
         # Exploration
         sqrt_total = math.sqrt(self.n_total + 1)
         exploration = cpuct * self._prior * sqrt_total / (1.0 + n)
@@ -371,16 +323,10 @@ class MCTSNode:
         idx = self._action_to_idx[action]
         self._virtual_loss[idx] = max(0.0, self._virtual_loss[idx] - loss)
 
-    def update(self, action: tuple, value: float, score: float = 0.0, utility: Optional[float] = None) -> None:
-        """Update with (value, score, utility) from leaf. If utility is None, utility = value (backward compat)."""
+    def update(self, action: tuple, value: float) -> None:
         idx = self._action_to_idx[action]
         self._visit_count[idx] += 1
-        u = utility if utility is not None else value
-        self._total_value[idx] += u
-        if self._value_sum is not None:
-            self._value_sum[idx] += value
-        if self._score_sum is not None:
-            self._score_sum[idx] += score
+        self._total_value[idx] += value
         self.n_total += 1
 
 
@@ -456,70 +402,94 @@ class OptimizedAlphaZeroMCTS:
         # Initialised with a default; callers can reset via set_noise_seed().
         self._noise_rng = np.random.default_rng(42)
 
-        # KataGo dynamic score centering: root's mean_points (POINT SPACE) at the start of each search.
         self._search_root_score: float = 0.0
-        # Win-first: root's value estimate (from initial NN eval) for DSUW gating.
-        self._search_root_value: float = 0.0
-        # Effective score-utility weights (DSU-gated) for this search; set after root is evaluated.
-        self._search_effective_static_w: float = 0.0
-        self._search_effective_dynamic_w: float = 0.3
-        # 201-bin local eval: bins and scale for distributional score_utility (mirror server).
+
+        # Cache bins tensor for distributional score utility
         self._score_bins_t = torch.arange(
             config.score_min, config.score_max + 1,
             device=self.device, dtype=torch.float32,
         )
-        # WIN_FIRST validation: log root selection once when debug_log_one_game is True
-        self._win_first_debug_logged = False
-        self._score_utility_scale = float(config.score_utility_scale)
 
     def set_noise_seed(self, seed: int) -> None:
         """Reset the Dirichlet noise RNG. Call before each game for reproducibility."""
         self._noise_rng = np.random.default_rng(seed)
 
     # ------------------------------------------------------------------
-    # Score utility (KataGo dual-head)
+    # Score utility (KataGo distributional dual-head)
     # ------------------------------------------------------------------
 
-    def _compute_dsu_gate(self) -> float:
-        """Win-first: gate in [0,1]. g=0 => DSUW off (fight to win); g=1 => DSUW on (convert or defend margin)."""
-        wf = self.config.win_first
-        if not wf.enabled or not wf.gate_dsu_enabled:
-            return 1.0
-        v = self._search_root_value
-        # Win gate: ramp from gate_dsu_win_start to gate_dsu_win_full
-        t_win = (v - wf.gate_dsu_win_start) / max(1e-9, wf.gate_dsu_win_full - wf.gate_dsu_win_start)
-        t_win = max(0.0, min(1.0, t_win))
-        g_win = t_win ** wf.gate_dsu_power
-        # Forced-loss gate: ramp when v is very negative (gate_dsu_loss_start to gate_dsu_loss_full)
-        t_loss = (wf.gate_dsu_loss_start - v) / max(1e-9, wf.gate_dsu_loss_start - wf.gate_dsu_loss_full)
-        t_loss = max(0.0, min(1.0, t_loss))
-        g_loss = t_loss ** wf.gate_dsu_power
-        return max(g_win, g_loss)
+    @staticmethod
+    def _sat(x: torch.Tensor) -> torch.Tensor:
+        """Saturating function: sat(x) = (2/pi) * atan(x)."""
+        return (2.0 / math.pi) * torch.atan(x)
 
-    def _compute_score_utility(self, score: float, is_root_player: bool = True) -> float:
-        """
-        Legacy: score utility from scalar (tanh) score. Used only when server returns precomputed score_utility.
-        When using 201-bin protocol, non-terminal leaves get score_utility from GPU; terminals use _compute_terminal_score_utility.
-        """
-        g = self._compute_dsu_gate()
-        static_w = self.config.static_score_utility_weight * g
-        dynamic_w = self.config.dynamic_score_utility_weight * g
-        static = static_w * score
-        root_s = self._search_root_score if is_root_player else -self._search_root_score
-        dynamic = dynamic_w * (score - root_s)
-        return static + dynamic
+    @staticmethod
+    def _sat_scalar(x: float) -> float:
+        """Scalar saturating function."""
+        return (2.0 / math.pi) * math.atan(x)
 
-    def _compute_terminal_score_utility(self, raw_margin_points: float, is_root_player: bool) -> float:
-        """Terminal score utility in point space: sat((margin - center)/scale) with effective weights."""
-        scale = self._score_utility_scale
+    def _score_utility_from_logits(
+        self,
+        score_logits: torch.Tensor,
+        is_root_player: bool,
+    ) -> Tuple[float, float]:
+        """Compute mean_points and score_utility from a single (201,) logits vector.
+
+        Returns (mean_points, score_utility).
+        """
+        p = F_torch.softmax(score_logits.float(), dim=-1)
+        bins = self._score_bins_t
+        mean_points = float((p * bins).sum().item())
+        scale = self.config.score_utility_point_scale
         center = self._search_root_score if is_root_player else -self._search_root_score
 
-        def sat(x: float) -> float:
-            return (2.0 / math.pi) * math.atan(x)
+        dynamic_util = float((p * self._sat((bins - center) / scale)).sum().item())
+        score_utility = self.config.dynamic_score_utility_weight * dynamic_util
 
-        static_util = sat(raw_margin_points / scale)
-        dynamic_util = sat((raw_margin_points - center) / scale)
-        return self._search_effective_static_w * static_util + self._search_effective_dynamic_w * dynamic_util
+        if self.config.static_score_utility_weight != 0.0:
+            static_util = float((p * self._sat(bins / scale)).sum().item())
+            score_utility += self.config.static_score_utility_weight * static_util
+
+        return mean_points, score_utility
+
+    def _score_utility_from_logits_batched(
+        self,
+        score_logits: torch.Tensor,
+        is_root_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Batched version. score_logits: (B, 201), is_root_mask: (B,) bool.
+
+        Returns (mean_points_t (B,), score_utility_t (B,)).
+        """
+        p = F_torch.softmax(score_logits.float(), dim=-1)
+        bins = self._score_bins_t  # (201,)
+        mean_points = (p * bins).sum(dim=-1)  # (B,)
+        scale = self.config.score_utility_point_scale
+        root_s = self._search_root_score
+        centers = torch.where(
+            is_root_mask,
+            torch.tensor(root_s, device=p.device, dtype=torch.float32),
+            torch.tensor(-root_s, device=p.device, dtype=torch.float32),
+        )  # (B,)
+        dynamic_util = (p * self._sat((bins.unsqueeze(0) - centers.unsqueeze(1)) / scale)).sum(dim=-1)
+        score_utility = self.config.dynamic_score_utility_weight * dynamic_util
+
+        if self.config.static_score_utility_weight != 0.0:
+            static_util = (p * self._sat(bins.unsqueeze(0) / scale)).sum(dim=-1)
+            score_utility = score_utility + self.config.static_score_utility_weight * static_util
+
+        return mean_points, score_utility
+
+    def _compute_terminal_score_utility(self, raw_margin_points: float, is_root_player: bool) -> float:
+        """Score utility for terminal nodes using actual final margin (point-domain sat)."""
+        scale = self.config.score_utility_point_scale
+        center = self._search_root_score if is_root_player else -self._search_root_score
+        dynamic = self._sat_scalar((raw_margin_points - center) / scale)
+        utility = self.config.dynamic_score_utility_weight * dynamic
+        if self.config.static_score_utility_weight != 0.0:
+            static = self._sat_scalar(raw_margin_points / scale)
+            utility += self.config.static_score_utility_weight * static
+        return utility
 
     # ------------------------------------------------------------------
     # Public API
@@ -552,9 +522,6 @@ class OptimizedAlphaZeroMCTS:
             root_q: float — average Q-value at root (from to_move perspective)
         """
         start_time = time.time()
-        # Effective weights for score utility (root request uses these; then we apply DSU gate after root eval).
-        self._search_effective_static_w = self.config.static_score_utility_weight
-        self._search_effective_dynamic_w = self.config.dynamic_score_utility_weight
 
         root: Optional[MCTSNode] = None
         if self._root is not None and self._root.children:
@@ -576,12 +543,11 @@ class OptimizedAlphaZeroMCTS:
         if not root.is_expanded() and not root.terminal:
             self._expand_and_evaluate(root, precomputed_legal=root_legal_actions)
 
-        # KataGo dynamic score centering (POINT SPACE) and WIN_FIRST effective weights.
-        # Root was just evaluated; score_estimate is mean_points from server or local 201-bin.
+        # KataGo dynamic score centering: set the reference score from the root's network prediction.
+        # _expand_and_evaluate stores root.score_estimate; for reused roots this carries over from
+        # the previous search (stable since the position hasn't changed).
+        # All MCTS backups this search will use (score - _search_root_score) as the dynamic component.
         self._search_root_score = root.score_estimate
-        g = self._compute_dsu_gate()
-        self._search_effective_static_w = self.config.static_score_utility_weight * g
-        self._search_effective_dynamic_w = self.config.dynamic_score_utility_weight * g
 
         # Use batched MCTS if parallel_leaves > 1 (both local network and eval_client modes)
         if self.config.parallel_leaves > 1 and (self.network is not None or self.eval_client is not None):
@@ -611,82 +577,39 @@ class OptimizedAlphaZeroMCTS:
             if total_visits > 0:
                 root_q = float(root._total_value.sum() / total_visits)
 
+        # PW_DEBUG_MCTS=1: dump root score, center, top actions, fpu, entropy for protocol/debug.
+        if os.environ.get("PW_DEBUG_MCTS") == "1":
+            debug_entries = []
+            if hasattr(self, "_mcts_debug_dump"):
+                debug_entries = getattr(self, "_mcts_debug_dump", [])
+            fpu_val = root_q - self.config.fpu_reduction if root.n_total > 0 else -self.config.fpu_reduction
+            visits_arr = root._visit_count.astype(np.float64) if root._visit_count is not None else np.zeros(len(root.legal_actions))
+            total_v = visits_arr.sum()
+            ent = 0.0
+            if total_v > 0:
+                probs = visits_arr / total_v
+                ent = -float(np.sum(probs * np.log(probs + 1e-12)))
+            top10 = []
+            if root.legal_actions and root._prior is not None and root._visit_count is not None:
+                for i, a in enumerate(root.legal_actions):
+                    n = int(root._visit_count[i])
+                    p = float(root._prior[i])
+                    q = (float(root._total_value[i] - root._virtual_loss[i]) / (n + root._virtual_loss[i])) if (n + root._virtual_loss[i]) > 0 else fpu_val
+                    u = self.config.cpuct * p * math.sqrt(root.n_total + 1) / (1 + n)
+                    top10.append({"action": str(a)[:50], "P": round(p, 4), "N": n, "Q": round(q, 4), "U": round(u, 4), "Q+U": round(q + u, 4)})
+                top10.sort(key=lambda x: -x["N"])
+                top10 = top10[:10]
+            debug_entries.append({
+                "root_mean_points": getattr(root, "score_estimate", None),
+                "root_center": self._search_root_score,
+                "root_q": round(root_q, 4),
+                "fpu_value": round(fpu_val, 4),
+                "visits_entropy": round(ent, 4),
+                "top10_actions": top10,
+            })
+            setattr(self, "_mcts_debug_dump", debug_entries)
+
         return visit_counts, search_time, root_q
-
-    def _select_action_win_first(self, temperature: float, deterministic: bool) -> tuple:
-        """Win-first root move selection using root node's value_sum, score_sum, visit_count.
-        Only considers children with Nv>0 for best_Qv, candidate set C, and tiebreak; safe fallback if all Nv==0.
-        """
-        wf = self.config.win_first
-        root = self._root
-        if root is None or not root.legal_actions or root._visit_count is None or root._value_sum is None or root._score_sum is None:
-            vc = {a: int(root._visit_count[i]) for i, a in enumerate(root.legal_actions)} if root and root._visit_count is not None else {}
-            return max(vc.items(), key=lambda x: x[1])[0] if vc else root.legal_actions[0]
-
-        n = len(root.legal_actions)
-        visits = root._visit_count.astype(np.float64)
-        has_visits = visits > 0
-        if not np.any(has_visits):
-            if wf.debug_log_one_game and not self._win_first_debug_logged:
-                self._win_first_debug_logged = True
-                logger.info("[WIN_FIRST debug] best_Qv=N/A (no visits yet) delta=N/A candidate_count=0")
-            return root.legal_actions[0]
-
-        # Qv, Qs only meaningful where Nv>0; use 0 for zero-visit children so they are excluded from best_Qv and C
-        safe_visits = np.where(has_visits, visits, 1.0)
-        qv = np.where(has_visits, root._value_sum / safe_visits, -np.inf)
-        qs = np.where(has_visits, root._score_sum / safe_visits, -np.inf)
-        best_qv = float(np.max(qv))
-        if not np.isfinite(best_qv):
-            return root.legal_actions[0]
-
-        # Adaptive delta: widen when win secured
-        if best_qv <= wf.value_delta_win_start:
-            delta = wf.value_delta_min
-        elif best_qv >= wf.value_delta_win_full:
-            delta = wf.value_delta_max
-        else:
-            t = (best_qv - wf.value_delta_win_start) / max(1e-9, wf.value_delta_win_full - wf.value_delta_win_start)
-            delta = wf.value_delta_min + t * (wf.value_delta_max - wf.value_delta_min)
-        # Candidate set: Qv >= best_Qv - delta, and Nv>0 only
-        mask = has_visits & (qv >= (best_qv - delta))
-        candidate_indices = np.nonzero(mask)[0]
-        if len(candidate_indices) == 0:
-            candidate_indices = np.nonzero(has_visits)[0]
-        if len(candidate_indices) == 0:
-            return root.legal_actions[0]
-
-        # Optional one-time debug log (validation only; do not enable in production)
-        if wf.debug_log_one_game and not self._win_first_debug_logged:
-            self._win_first_debug_logged = True
-            qv_c = qv[candidate_indices]
-            qs_c = qs[candidate_indices]
-            nv_c = visits[candidate_indices]
-            order = np.lexsort((-nv_c, -qs_c, -qv_c))  # tiebreak: Qv desc, then Qs desc, then Nv desc
-            top3 = order[: min(3, len(order))]
-            lines = [
-                f"[WIN_FIRST debug] best_Qv={best_qv:.4f} delta={delta:.4f} candidate_count={len(candidate_indices)}",
-            ]
-            for i, idx in enumerate(top3):
-                lines.append(
-                    f"  top-{i+1}: Qv={qv_c[idx]:.4f} Qs_points={qs_c[idx]:.2f} Nv={int(nv_c[idx])}"
-                )
-            logger.info("\n".join(lines))
-
-        if temperature == 0 or deterministic:
-            if wf.tiebreak == "visits_then_score":
-                best_idx = candidate_indices[
-                    np.argmax(visits[candidate_indices] * 1e6 + qs[candidate_indices])
-                ]
-            else:
-                best_idx = candidate_indices[
-                    np.argmax(qs[candidate_indices] * 1e6 + visits[candidate_indices])
-                ]
-            return root.legal_actions[int(best_idx)]
-        visits_c = visits[candidate_indices] ** (1.0 / max(1e-9, temperature))
-        probs = visits_c / visits_c.sum()
-        idx = int(self._noise_rng.choice(len(candidate_indices), p=probs))
-        return root.legal_actions[int(candidate_indices[idx])]
 
     def select_action(
         self,
@@ -694,20 +617,19 @@ class OptimizedAlphaZeroMCTS:
         temperature: float = 1.0,
         deterministic: bool = False,
     ) -> tuple:
-        """Select action from visit counts. When win_first.enabled, uses root node for strict win-first selection."""
+        """Select action from visit counts."""
         if not visit_counts:
             raise ValueError("No visit counts")
-
-        if self.config.win_first.enabled and self._root is not None and self._root._value_sum is not None:
-            return self._select_action_win_first(temperature, deterministic)
 
         if temperature == 0 or deterministic:
             return max(visit_counts.items(), key=lambda x: x[1])[0]
 
         actions = list(visit_counts.keys())
         visits = np.array([visit_counts[a] for a in actions], dtype=np.float64)
+
         if visits.sum() == 0:
             return actions[int(self._noise_rng.integers(0, len(actions)))]
+
         visits_temp = visits ** (1.0 / temperature)
         probs = visits_temp / visits_temp.sum()
         return actions[int(self._noise_rng.choice(len(actions), p=probs))]
@@ -721,7 +643,9 @@ class OptimizedAlphaZeroMCTS:
         search_path: List[Tuple[MCTSNode, tuple]] = []
 
         while node.is_expanded() and not node.terminal:
-            action = node.select_action(self.config.cpuct, self.config.fpu_reduction)
+            action = node.select_action(
+                self.config.cpuct, self.config.fpu_reduction, getattr(self.config, "fpu_constant_only", False)
+            )
             search_path.append((node, action))
             node.add_virtual_loss(action, self.config.virtual_loss)
 
@@ -742,22 +666,27 @@ class OptimizedAlphaZeroMCTS:
     def _backup_path(
         self,
         search_path: List[Tuple[MCTSNode, tuple]],
-        leaf_v: float,
-        leaf_s: float,
-        leaf_u: float,
+        leaf_value: float,
         leaf_to_move: int,
     ) -> None:
         """
-        Backup (value, score, utility) through the search path. All from leaf's to_move perspective;
-        at each parent we convert to parent's perspective (flip sign when parent.to_move != leaf_to_move).
+        Backup value through the search path.
+
+        Convention: leaf_value is from the LEAF node's to_move perspective.
+        At each parent, we determine the value from the PARENT's perspective:
+          - If parent.to_move == leaf_to_move => same sign
+          - If parent.to_move != leaf_to_move => negate
         """
         for parent_node, action_taken in reversed(search_path):
             parent_node.remove_virtual_loss(action_taken, self.config.virtual_loss)
+
+            # Value from parent's perspective
             if parent_node.to_move == leaf_to_move:
-                vp, sp, up = leaf_v, leaf_s, leaf_u
+                value_for_parent = leaf_value
             else:
-                vp, sp, up = -leaf_v, -leaf_s, -leaf_u
-            parent_node.update(action_taken, vp, sp, up)
+                value_for_parent = -leaf_value
+
+            parent_node.update(action_taken, value_for_parent)
 
     # ------------------------------------------------------------------
     # Single simulation
@@ -768,7 +697,9 @@ class OptimizedAlphaZeroMCTS:
         search_path: List[Tuple[MCTSNode, tuple]] = []
 
         while node.is_expanded() and not node.terminal:
-            action = node.select_action(self.config.cpuct, self.config.fpu_reduction)
+            action = node.select_action(
+                self.config.cpuct, self.config.fpu_reduction, getattr(self.config, "fpu_constant_only", False)
+            )
             search_path.append((node, action))
             node.add_virtual_loss(action, self.config.virtual_loss)
 
@@ -780,10 +711,11 @@ class OptimizedAlphaZeroMCTS:
             node = node.children[action]
 
         if node.terminal:
-            v, s, u = self._get_terminal_v_s_u(node.state, node.to_move)
+            value = self._get_terminal_value(node.state, node.to_move)
         else:
-            v, s, u = self._expand_and_evaluate(node)
-        self._backup_path(search_path, v, s, u, node.to_move)
+            value = self._expand_and_evaluate(node)
+
+        self._backup_path(search_path, value, node.to_move)
 
     # ------------------------------------------------------------------
     # Batched simulation
@@ -792,9 +724,6 @@ class OptimizedAlphaZeroMCTS:
     def _simulate_batched(self, root: MCTSNode) -> None:
         sims_remaining = int(self.config.simulations)
         batch_n = max(1, int(self.config.parallel_leaves))
-        # Never use more SHM slots than allocated (schedule may request more than buffer size)
-        if self._shm_buf is not None:
-            batch_n = min(batch_n, self._shm_buf.n_slots)
 
         while sims_remaining > 0:
             k = min(batch_n, sims_remaining)
@@ -806,20 +735,20 @@ class OptimizedAlphaZeroMCTS:
             for _ in range(k):
                 leaf, path = self._select_leaf(root)
                 if leaf.terminal or terminal_fast(leaf.state):
-                    v, s, u = self._get_terminal_v_s_u(leaf.state, leaf.to_move)
-                    terminal_data.append((path, v, s, u, leaf.to_move))
+                    v = self._get_terminal_value(leaf.state, leaf.to_move)
+                    terminal_data.append((path, v, leaf.to_move))
                 else:
                     leaves.append(leaf)
                     paths.append(path)
 
-            values: List[Tuple[float, float, float]] = []
+            values: List[float] = []
             if leaves:
                 values = self._batch_expand_and_evaluate(leaves)
 
-            for path, (v, s, u), leaf_to_move in zip(paths, values, [l.to_move for l in leaves]):
-                self._backup_path(path, v, s, u, leaf_to_move)
-            for path, v, s, u, leaf_to_move in terminal_data:
-                self._backup_path(path, v, s, u, leaf_to_move)
+            for path, v, leaf_to_move in zip(paths, values, [l.to_move for l in leaves]):
+                self._backup_path(path, v, leaf_to_move)
+            for path, v, leaf_to_move in terminal_data:
+                self._backup_path(path, v, leaf_to_move)
 
             sims_remaining -= k
 
@@ -827,7 +756,7 @@ class OptimizedAlphaZeroMCTS:
     # Batch expand + evaluate
     # ------------------------------------------------------------------
 
-    def _batch_expand_and_evaluate(self, nodes: List[MCTSNode]) -> List[Tuple[float, float, float]]:
+    def _batch_expand_and_evaluate(self, nodes: List[MCTSNode]) -> List[float]:
         states_np: List[np.ndarray] = []
         masks_np: List[np.ndarray] = []
         mm_extras: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
@@ -873,9 +802,6 @@ class OptimizedAlphaZeroMCTS:
             if _use_shm:
                 # Zero-copy path: encode directly into shared memory slot n_nonterminal.
                 slot = n_nonterminal
-                assert slot < self._shm_buf.n_slots, (
-                    f"SHM slot {slot} >= n_slots {self._shm_buf.n_slots}"
-                )
                 enc = self._gold_v2_encoder
                 enc.encode_into(
                     node.state, node.to_move,
@@ -902,22 +828,20 @@ class OptimizedAlphaZeroMCTS:
             n_nonterminal += 1
 
         if n_nonterminal == 0:
-            return [self._get_terminal_v_s_u(nodes[i].state, nodes[i].to_move) for i in range(len(nodes))]
+            return [float(v) for v in terminal_out]
 
-        # GPU server mode: 201-bin protocol returns (priors, value, mean_points, score_utility).
+        # GPU server mode — server returns (priors, value, mean_points, score_utility) scalars
         if self.eval_client is not None:
             nonterminal_nodes = [n for i, n in enumerate(nodes) if terminal_out[i] is None]
             root_to_move = int(self._root.to_move) if self._root is not None else -1
             req_rids = []
             if shm_slot_list:
+                # SHM path: data already in shared memory — submit tiny metadata dicts.
                 for idx, (slot, n_lj) in enumerate(shm_slot_list):
                     node = nonterminal_nodes[idx]
                     is_root = (int(node.to_move) == root_to_move) if root_to_move >= 0 else True
                     center = self._search_root_score if is_root else -self._search_root_score
-                    rid = self.eval_client.submit_shm(
-                        slot, n_lj,
-                        center, self._search_effective_static_w, self._search_effective_dynamic_w,
-                    )
+                    rid = self.eval_client.submit_shm(slot, n_lj, center)
                     req_rids.append(rid)
             elif self._use_multimodal and mm_extras:
                 for j in range(len(states_np)):
@@ -927,8 +851,7 @@ class OptimizedAlphaZeroMCTS:
                     xg, xt, si, sf = mm_extras[j]
                     legal_i32 = legal_indices_list[j].astype(np.int32, copy=False)
                     rid = self.eval_client.submit_multimodal(
-                        states_np[j], xg, xt, si, sf, masks_np[j], legal_i32,
-                        center, self._search_effective_static_w, self._search_effective_dynamic_w,
+                        states_np[j], xg, xt, si, sf, masks_np[j], legal_i32, center
                     )
                     req_rids.append(rid)
             else:
@@ -937,10 +860,7 @@ class OptimizedAlphaZeroMCTS:
                     is_root = (int(node.to_move) == root_to_move) if root_to_move >= 0 else True
                     center = self._search_root_score if is_root else -self._search_root_score
                     legal_i32 = legal_indices_list[j].astype(np.int32, copy=False)
-                    rid = self.eval_client.submit_legacy(
-                        states_np[j], masks_np[j], legal_i32,
-                        center, self._search_effective_static_w, self._search_effective_dynamic_w,
-                    )
+                    rid = self.eval_client.submit_legacy(states_np[j], masks_np[j], legal_i32, center)
                     req_rids.append(rid)
 
             resp_priors = []
@@ -954,25 +874,22 @@ class OptimizedAlphaZeroMCTS:
                 resp_mean_pts.append(float(mean_points))
                 resp_score_util.append(float(score_utility))
 
-            result: List[Tuple[float, float, float]] = [None] * len(nodes)  # type: ignore[list-item]
-            for i in range(len(nodes)):
-                if terminal_out[i] is not None:
-                    result[i] = self._get_terminal_v_s_u(nodes[i].state, nodes[i].to_move)
+            out_values = []
             nonterm_idx = 0
             for i, node in enumerate(nodes):
                 if terminal_out[i] is not None:
+                    out_values.append(float(terminal_out[i]))
                     continue
+
                 priors_legal = resp_priors[nonterm_idx]
                 node._prior[:] = priors_legal[:len(node.legal_actions)]
                 node.normalize_priors()
-                v = resp_values[nonterm_idx]
-                s_points = resp_mean_pts[nonterm_idx]
-                su = resp_score_util[nonterm_idx]
-                node.score_estimate = s_points
-                u = v + su
-                result[i] = (v, s_points, u)
+                node.score_estimate = resp_mean_pts[nonterm_idx]
+                utility = resp_values[nonterm_idx] + resp_score_util[nonterm_idx]
+                out_values.append(utility)
                 nonterm_idx += 1
-            return result
+
+            return out_values
 
         # Local network mode: true batched evaluation
         if self.network is None:
@@ -997,7 +914,7 @@ class OptimizedAlphaZeroMCTS:
             if self.device.type == "cuda" and self.use_amp:
                 dtype = torch.float16 if self.amp_dtype == "float16" else torch.bfloat16
                 with torch.autocast(device_type="cuda", dtype=dtype):
-                    policy_logits, value_t, score_logits = self.network(
+                    policy_logits, value_t, score_t = self.network(
                         st, am,
                         x_global=x_global_t,
                         x_track=x_track_t,
@@ -1005,7 +922,7 @@ class OptimizedAlphaZeroMCTS:
                         shop_feats=shop_feats_t,
                     )
             else:
-                policy_logits, value_t, score_logits = self.network(
+                policy_logits, value_t, score_t = self.network(
                     st, am,
                     x_global=x_global_t,
                     x_track=x_track_t,
@@ -1013,72 +930,68 @@ class OptimizedAlphaZeroMCTS:
                     shop_feats=shop_feats_t,
                 )
 
-        value_t = value_t.squeeze(-1)
-        # 201-bin: compute mean_points and score_utility on GPU (mirror server).
-        score_logits_f = score_logits.float()
-        p = torch.softmax(score_logits_f, dim=-1)
-        bins = self._score_bins_t
-        mean_points_t = (p * bins).sum(dim=-1)
-        is_root_flags = [
-            (int(nodes[i].to_move) == int(self._root.to_move)) if self._root is not None else True
-            for i in range(len(nodes)) if terminal_out[i] is None
-        ]
-        centers_t = torch.tensor(
-            [self._search_root_score if is_r else -self._search_root_score for is_r in is_root_flags],
-            device=self.device, dtype=torch.float32,
-        )
-        scale = self._score_utility_scale
-        sat = lambda x: (2.0 / math.pi) * torch.atan(x)
-        static_util_t = (p * sat(bins.unsqueeze(0) / scale)).sum(dim=-1)
-        dynamic_util_t = (p * sat((bins.unsqueeze(0) - centers_t.unsqueeze(1)) / scale)).sum(dim=-1)
-        score_utility_t = self._search_effective_static_w * static_util_t + self._search_effective_dynamic_w * dynamic_util_t
+        value_t = value_t.squeeze(-1)  # (B,)
+        # score_t is (B, 201) logits — do NOT squeeze
+
+        # Build is_root mask for batched utility computation
+        is_root_flags: List[bool] = []
+        nonterminal_nodes: List[MCTSNode] = []
+        for i, node in enumerate(nodes):
+            if terminal_out[i] is None:
+                is_root_flags.append(
+                    (int(node.to_move) == int(self._root.to_move)) if self._root is not None else True
+                )
+                nonterminal_nodes.append(node)
+
+        is_root_mask = torch.tensor(is_root_flags, device=self.device, dtype=torch.bool)
+        mean_pts_t, score_util_t = self._score_utility_from_logits_batched(score_t, is_root_mask)
 
         value_cpu = value_t.float().cpu().numpy()
-        mean_points_cpu = mean_points_t.float().cpu().numpy()
-        score_utility_cpu = score_utility_t.float().cpu().numpy()
+        mean_pts_cpu = mean_pts_t.float().cpu().numpy()
+        score_util_cpu = score_util_t.float().cpu().numpy()
 
-        result_local: List[Tuple[float, float, float]] = [None] * len(nodes)  # type: ignore[list-item]
-        for i in range(len(nodes)):
-            if terminal_out[i] is not None:
-                result_local[i] = self._get_terminal_v_s_u(nodes[i].state, nodes[i].to_move)
+        out_values: List[float] = []
         nonterm_idx = 0
+
         for i, node in enumerate(nodes):
             if terminal_out[i] is not None:
+                out_values.append(float(terminal_out[i]))
                 continue
+
             legal_idxs = legal_indices_list[nonterm_idx]
             idx_t = torch.from_numpy(legal_idxs).to(self.device)
+
             legal_logits = policy_logits[nonterm_idx].index_select(0, idx_t)
             priors = torch.softmax(legal_logits, dim=0)
             priors_cpu = priors.float().cpu().numpy()
+
             node._prior[:] = priors_cpu[:len(node.legal_actions)]
             node.normalize_priors()
-            v = float(value_cpu[nonterm_idx])
-            s_points = float(mean_points_cpu[nonterm_idx])
-            su = float(score_utility_cpu[nonterm_idx])
-            node.score_estimate = s_points
-            u = v + su
-            result_local[i] = (v, s_points, u)
+            node.score_estimate = float(mean_pts_cpu[nonterm_idx])
+
+            utility = float(value_cpu[nonterm_idx]) + float(score_util_cpu[nonterm_idx])
+            out_values.append(utility)
             nonterm_idx += 1
-        return result_local
+
+        return out_values
 
     # ------------------------------------------------------------------
     # Single expand + evaluate
     # ------------------------------------------------------------------
 
-    def _expand_and_evaluate(self, node: MCTSNode, precomputed_legal: Optional[list] = None) -> Tuple[float, float, float]:
-        """Returns (value, score, utility) from node's to_move perspective. Sets _search_root_value when node is root."""
+    def _expand_and_evaluate(self, node: MCTSNode, precomputed_legal: Optional[list] = None) -> float:
         if terminal_fast(node.state):
             node.terminal = True
-            v, s, u = self._get_terminal_v_s_u(node.state, node.to_move)
-            node.terminal_value = u
-            return (v, s, u)
+            value = self._get_terminal_value(node.state, node.to_move)
+            node.terminal_value = value
+            return value
 
         node.legal_actions = precomputed_legal if precomputed_legal is not None else legal_actions_fast(node.state)
         if len(node.legal_actions) == 0:
             node.terminal = True
-            v, s, u = self._get_terminal_v_s_u(node.state, node.to_move)
-            node.terminal_value = u
-            return (v, s, u)
+            value = self._get_terminal_value(node.state, node.to_move)
+            node.terminal_value = value
+            return value
 
         # Initialize arrays now that legal_actions are known
         node._init_arrays()
@@ -1095,25 +1008,18 @@ class OptimizedAlphaZeroMCTS:
         if self.eval_client is not None:
             legal_idxs_np = np.asarray(legal_action_indices, dtype=np.int32)
             is_root = (int(node.to_move) == int(self._root.to_move)) if self._root is not None else True
-            center = 0.0 if (self._root is not None and node is self._root) else (
-                self._search_root_score if is_root else -self._search_root_score
-            )
+            center = self._search_root_score if is_root else -self._search_root_score
             if self._use_multimodal and mm is not None:
                 xg, xt, si, sf = mm
-                priors_legal, v, mean_points, score_utility = self.eval_client.evaluate_multimodal(
-                    state_np, xg, xt, si, sf, action_mask, legal_idxs_np,
-                    center, self._search_effective_static_w, self._search_effective_dynamic_w,
+                priors_legal, v, mean_points, score_util = self.eval_client.evaluate_multimodal(
+                    state_np, xg, xt, si, sf, action_mask, legal_idxs_np, center
                 )
             else:
-                priors_legal, v, mean_points, score_utility = self.eval_client.evaluate(
-                    state_np, action_mask, legal_idxs_np,
-                    center, self._search_effective_static_w, self._search_effective_dynamic_w,
+                priors_legal, v, mean_points, score_util = self.eval_client.evaluate(
+                    state_np, action_mask, legal_idxs_np, center
                 )
-            v, s_points, su = float(v), float(mean_points), float(score_utility)
-            node.score_estimate = s_points
-            if self._root is not None and node is self._root:
-                self._search_root_value = v
-            u = v + su
+            node.score_estimate = float(mean_points)
+            value = float(v) + float(score_util)
             node._prior[:] = priors_legal[:len(node.legal_actions)]
         else:
             if self.network is None:
@@ -1138,44 +1044,37 @@ class OptimizedAlphaZeroMCTS:
                 if self.device.type == "cuda" and self.use_amp:
                     dtype = torch.float16 if self.amp_dtype == "float16" else torch.bfloat16
                     with torch.autocast(device_type="cuda", dtype=dtype):
-                        policy_logits, value_t, score_logits = self.network(
+                        policy_logits, value_t, score_t = self.network(
                             state_tensor, action_mask_t,
                             x_global=x_global_t, x_track=x_track_t,
                             shop_ids=shop_ids_t, shop_feats=shop_feats_t,
                         )
                 else:
-                    policy_logits, value_t, score_logits = self.network(
+                    policy_logits, value_t, score_t = self.network(
                         state_tensor, action_mask_t,
                         x_global=x_global_t, x_track=x_track_t,
                         shop_ids=shop_ids_t, shop_feats=shop_feats_t,
                     )
 
-                v = float(value_t.squeeze(-1).item())
-                # 201-bin: mean_points and score_utility from logits (single sample).
-                p = torch.softmax(score_logits.float().squeeze(0), dim=-1)
-                bins = self._score_bins_t
-                s_points = float((p * bins).sum().item())
+                v = float(value_t.item())
+                score_logits_1d = score_t.squeeze(0)  # (201,)
                 is_root = (int(node.to_move) == int(self._root.to_move)) if self._root is not None else True
-                center = self._search_root_score if is_root else -self._search_root_score
-                scale = self._score_utility_scale
-                sat = lambda x: (2.0 / math.pi) * torch.atan(x)
-                static_util = float((p * sat(bins / scale)).sum().item())
-                dynamic_util = float((p * sat((bins - center) / scale)).sum().item())
-                su = self._search_effective_static_w * static_util + self._search_effective_dynamic_w * dynamic_util
-                node.score_estimate = s_points
-                if self._root is not None and node is self._root:
-                    self._search_root_value = v
-                u = v + su
+                mean_pts, score_util = self._score_utility_from_logits(score_logits_1d, is_root)
+                node.score_estimate = mean_pts
+                value = v + score_util
 
                 idx_t = torch.as_tensor(legal_action_indices, device=self.device, dtype=torch.long)
                 legal_logits = policy_logits.squeeze(0).index_select(0, idx_t)
                 priors = torch.softmax(legal_logits, dim=0)
 
             priors_cpu = priors.float().cpu().numpy()
+            # Bulk set priors directly into array
             node._prior[:] = priors_cpu[:len(node.legal_actions)]
 
+        # Normalize priors
         node.normalize_priors()
-        return (v, s_points, u)
+
+        return value
 
     # ------------------------------------------------------------------
     # Noise (FIX M4: use seeded RNG)
@@ -1198,26 +1097,25 @@ class OptimizedAlphaZeroMCTS:
     # Terminal value
     # ------------------------------------------------------------------
 
-    def _get_terminal_v_s_u(self, state, to_move: int) -> Tuple[float, float, float]:
-        """Terminal (value, score_points, utility) from to_move perspective.
-        value ±1/0; score_points = raw margin in points (for WIN_FIRST score_sum); utility = value + score_utility.
+    def _get_terminal_value(self, state, to_move: int) -> float:
+        """
+        Terminal utility from perspective of to_move (KataGo-consistent).
+
+        Uses point-domain sat utility (consistent with distributional nonterminal
+        evaluations) rather than tanh normalisation.
         """
         score0 = compute_score_fast(state, 0)
         score1 = compute_score_fast(state, 1)
         winner = int(get_winner_fast(state))
         value = terminal_value_from_scores(
-            score0=score0, score1=score1, winner=winner, to_move=int(to_move),
+            score0=score0,
+            score1=score1,
+            winner=winner,
+            to_move=int(to_move),
         )
         raw_margin_points = float(int(score0) - int(score1)) if int(to_move) == 0 else float(int(score1) - int(score0))
         is_root = (int(to_move) == int(self._root.to_move)) if self._root is not None else True
-        su = self._compute_terminal_score_utility(raw_margin_points, is_root)
-        utility = value + su
-        return (value, raw_margin_points, utility)
-
-    def _get_terminal_value(self, state, to_move: int) -> float:
-        """Terminal utility only (for backward compat). Prefer _get_terminal_v_s_u for backup."""
-        _, _, u = self._get_terminal_v_s_u(state, to_move)
-        return u
+        return value + self._compute_terminal_score_utility(raw_margin_points, is_root)
 
 
 # ---------------------------------------------------------------------------
@@ -1236,7 +1134,6 @@ def create_optimized_mcts(
 ) -> OptimizedAlphaZeroMCTS:
     """Factory function to create MCTS from config."""
     mcts_cfg = config.get("selfplay", {}).get("mcts", {}) or {}
-    win_first = _parse_and_validate_win_first(mcts_cfg.get("win_first"))
     mcts_config = MCTSConfig(
         simulations=int(mcts_cfg.get("simulations", 800)),
         parallel_leaves=int(mcts_cfg.get("parallel_leaves", 32)),
@@ -1246,19 +1143,17 @@ def create_optimized_mcts(
         root_dirichlet_alpha=float(mcts_cfg.get("root_dirichlet_alpha", 0.3)),
         root_noise_weight=float(mcts_cfg.get("root_noise_weight", 0.25)),
         virtual_loss=float(mcts_cfg.get("virtual_loss", 1.0)),
-        fpu_reduction=float(mcts_cfg.get("fpu_reduction", 0.25)),  # KataGo default
-        # KataGo dual-head score utility (self-play defaults: static=0.0, dynamic=0.3)
-        # Backward-compat: if only legacy score_utility_weight is set, treat it as static.
+        fpu_reduction=float(mcts_cfg.get("fpu_reduction", 0.25)),
+        fpu_constant_only=bool(mcts_cfg.get("fpu_constant_only", False)),
         static_score_utility_weight=float(mcts_cfg.get(
             "static_score_utility_weight",
-            mcts_cfg.get("score_utility_weight", 0.0),  # legacy key → static (0.0 if absent)
+            mcts_cfg.get("score_utility_weight", 0.0),
         )),
         dynamic_score_utility_weight=float(mcts_cfg.get("dynamic_score_utility_weight", 0.3)),
-        score_utility_scale=float(mcts_cfg.get("score_utility_scale", 30.0)),
         score_min=int(mcts_cfg.get("score_min", -100)),
         score_max=int(mcts_cfg.get("score_max", 100)),
+        score_utility_point_scale=float(mcts_cfg.get("score_utility_point_scale", 30.0)),
         enable_tree_reuse=enable_tree_reuse if enable_tree_reuse is not None else bool(mcts_cfg.get("enable_tree_reuse", False)),
-        win_first=win_first,
     )
 
     # [C1 FIX] Safety clamp: parallel_leaves must be < simulations so the tree
