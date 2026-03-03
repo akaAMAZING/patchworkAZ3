@@ -27,33 +27,6 @@ logger = logging.getLogger(__name__)
 # Dual-Head: refuse to merge legacy HDF5 (no score_margins) when training score head
 _REJECT_LEGACY_IF_SCORE_HEAD = True
 
-# Score margin validation: raw integer margin in points (KataGo Dual-Head)
-SCORE_MARGIN_MAX_ABS = 120
-
-
-def _validate_score_margins(
-    score_margins: np.ndarray,
-    max_abs: float = SCORE_MARGIN_MAX_ABS,
-    source: str = "",
-) -> None:
-    """Validate score_margins: finite and in range. Raise with clear message on failure."""
-    if score_margins.size == 0:
-        return
-    if not np.all(np.isfinite(score_margins)):
-        bad = np.logical_not(np.isfinite(score_margins)).sum()
-        raise ValueError(
-            f"score_margins validation failed{': ' + source if source else ''}: "
-            f"{bad} non-finite value(s). "
-            "Wipe runs/<run_id>/staging and committed and regenerate self-play."
-        )
-    abs_max = float(np.abs(score_margins).max())
-    if abs_max > max_abs:
-        raise ValueError(
-            f"score_margins validation failed{': ' + source if source else ''}: "
-            f"max |score_margin| = {abs_max} > {max_abs}. "
-            "Wipe runs/<run_id>/staging and committed and regenerate self-play."
-        )
-
 
 class ReplayBuffer:
     """
@@ -138,10 +111,18 @@ class ReplayBuffer:
                         logger.warning("Replay buffer restore: missing file %s, skipping", path)
             if new_entries:
                 new_entries.sort(key=lambda x: x[0])
+                n_before = len(new_entries)
                 # Enforce window_size by evicting oldest
                 while len(new_entries) > self.window_size:
                     new_entries.pop(0)
+                n_kept = len(new_entries)
                 self._entries = new_entries
+                total_pos = self.total_positions
+                target_total = min(total_pos, self.max_size)
+                logger.info(
+                    "[REPLAY] restore: entries=%d -> kept=%d (window=%d), total_positions=%d, target_total=%d",
+                    n_before, n_kept, self.window_size, total_pos, target_total,
+                )
                 return True
             return False
         except Exception as e:
@@ -372,9 +353,6 @@ class ReplayBuffer:
         score_loss_weight = float(
             (self.config.get("training", {}) or {}).get("score_loss_weight", 0.0)
         )
-        score_margin_max_abs = float(
-            (self.config.get("data", {}) or {}).get("score_margin_max_abs", SCORE_MARGIN_MAX_ABS)
-        )
 
         # Stream-write merged file (no giant RAM concat).
         # The merged file is a temporary staging artifact loaded immediately into RAM
@@ -420,6 +398,10 @@ class ReplayBuffer:
             out_owns = out.create_dataset("ownerships", shape=(0, *own_shape), maxshape=(None, *own_shape),
                                           dtype=np.float32, chunks=(chunk_rows, *own_shape),
                                           compression=compression, compression_opts=comp_opts)
+            # source_iteration: iteration index per sample (for age histogram / recency analysis)
+            out_sources = out.create_dataset("source_iteration", shape=(0,), maxshape=(None,),
+                                             dtype=np.int32, chunks=(chunk_rows,),
+                                             compression=compression, compression_opts=comp_opts)
             # slot_piece_ids optional - created only when merging canonical data
             out_slot_ids = None
 
@@ -487,7 +469,26 @@ class ReplayBuffer:
                             va = np.asarray(f["values"][sl], dtype=np.float32)
                             if file_has_scores:
                                 sc = np.asarray(f["score_margins"][sl], dtype=np.float32)
-                                _validate_score_margins(sc, max_abs=score_margin_max_abs, source=h5_path)
+                                # Strict Iteration-0 validation: raw integer margins only
+                                if not np.isfinite(sc).all():
+                                    raise RuntimeError(
+                                        f"score_margins in {h5_path} contains non-finite values. "
+                                        "Wipe staging/committed and regenerate selfplay."
+                                    )
+                                if np.max(np.abs(sc)) > 120:
+                                    raise RuntimeError(
+                                        f"score_margins in {h5_path} out of range "
+                                        f"(max abs={np.max(np.abs(sc)):.1f} > 120). "
+                                        "Wipe staging/committed and regenerate selfplay."
+                                    )
+                                mean_frac = float(np.mean(np.abs(sc - np.round(sc))))
+                                if mean_frac > 1e-3:
+                                    raise RuntimeError(
+                                        f"score_margins in {h5_path} appear non-integer "
+                                        f"(mean|sc-round(sc)|={mean_frac:.6f} > 1e-3). "
+                                        "Old tanh-squashed data detected. "
+                                        "Wipe staging/committed and regenerate selfplay."
+                                    )
                             else:
                                 sc = np.zeros(st.shape[0], dtype=np.float32)
                             if file_has_ownership:
@@ -504,6 +505,8 @@ class ReplayBuffer:
 
                             new = cur + st.shape[0]
                             out_states.resize((new,) + out_states.shape[1:])
+                            out_sources.resize((new,))
+                            out_sources[cur:new] = it
                             if merge_multimodal:
                                 out_global.resize((new, F_GLOBAL))
                                 out_track.resize((new,) + out_track.shape[1:])

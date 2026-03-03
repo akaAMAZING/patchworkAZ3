@@ -1,10 +1,10 @@
 """
 Patchwork AlphaZero Neural Network Architecture
 
-Input:  14 channels × 9×9 board
+Input:  14 channels Ã— 9Ã—9 board
 Policy: 2026 action logits
 Value:  scalar in [-1, 1]
-Score:  categorical distribution over 201 integer bins [-100, +100] (logits)
+Score:  categorical distribution over 201 integer bins [-100, +100]
 """
 
 from __future__ import annotations
@@ -355,7 +355,7 @@ class PolicyHead(nn.Module):
 
 class ValueHead(nn.Module):
     """Value head outputting scalar value in [-1, 1]. Optional score head outputs
-    201-bin logits over integer margin bins (KataGo-style distributional score).
+    categorical logits over 201 integer bins [-100, +100].
 
     global_inject_dim: if >0, a projected global-feature vector is concatenated with
     the spatial conv output before fc1.  This gives the value head direct access to
@@ -366,7 +366,7 @@ class ValueHead(nn.Module):
 
     SCORE_MIN = -100
     SCORE_MAX = 100
-    SCORE_BINS = SCORE_MAX - SCORE_MIN + 1  # 201
+    SCORE_BINS = 201  # score_max - score_min + 1
 
     def __init__(
         self,
@@ -383,8 +383,6 @@ class ValueHead(nn.Module):
         self.global_inject_dim = global_inject_dim
         self.fc1 = nn.Linear(value_channels * 9 * 9 + global_inject_dim, value_hidden)
         self.fc2 = nn.Linear(value_hidden, 1)
-        # 201-bin score head: categorical logits over integer margins [SCORE_MIN, SCORE_MAX].
-        # MCTS uses distribution on GPU to compute mean_points and score_utility (no IPC of logits).
         self.score_head = nn.Linear(value_hidden, self.SCORE_BINS) if with_score_head else None
 
     def forward(
@@ -772,8 +770,9 @@ class PatchworkNetwork(nn.Module):
         shop_ids: Optional[torch.Tensor] = None,
         shop_feats: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Forward pass returning (policy_logits, value, score).
+        """Forward pass returning (policy_logits, value, score_logits).
 
+        score_logits: (B, 201) categorical logits over integer bins [-100, +100].
         state: x_spatial (B,56,9,9) for gold_v2
         x_global, x_track, shop_ids, shop_feats: optional multimodal inputs for FiLM
         """
@@ -783,14 +782,13 @@ class PatchworkNetwork(nn.Module):
         if self.global_to_heads is not None and x_global is not None:
             g_heads = self.global_to_heads(x_global)
             if self.trunk_to_heads is not None:
-                # Add trunk spatial pooling: mean over 9×9 → projected to same dim → additive residual
                 g_heads = g_heads + self.trunk_to_heads(trunk.mean(dim=(2, 3)))
         policy_logits = self.policy_head(trunk, g=g_heads)
         if action_mask is not None:
             policy_logits = policy_logits.masked_fill(action_mask == 0, float("-inf"))
         value_out = self.value_head(trunk, g=g_heads)
         if isinstance(value_out, tuple):
-            value, score_logits = value_out[0], value_out[1]
+            value, score_logits = value_out
         else:
             value = value_out
             B = value.shape[0]
@@ -800,8 +798,11 @@ class PatchworkNetwork(nn.Module):
     def predict(
         self, state: torch.Tensor, action_mask: Optional[torch.Tensor] = None, temperature: float = 1.0
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Inference helper. Returns (policy_probs, value, score_logits)."""
-        self.eval()  # Ensure BatchNorm/Dropout in eval mode
+        """Inference helper. Returns (policy_probs, value, score_logits).
+
+        score_logits: (B, 201) raw logits (not softmaxed).
+        """
+        self.eval()
         with torch.no_grad():
             policy_logits, value, score_logits = self.forward(state, action_mask)
             if temperature > 0:
@@ -819,9 +820,8 @@ class PatchworkNetwork(nn.Module):
         target_value: torch.Tensor,
         policy_weight: float = 1.0,
         value_weight: float = 1.0,
-        target_score: Optional[torch.Tensor] = None,
         target_score_dist: Optional[torch.Tensor] = None,
-        score_loss_weight: float = 0.02,
+        score_loss_weight: float = 0.01,
         target_ownership: Optional[torch.Tensor] = None,
         ownership_weight: float = 0.0,
         ownership_valid_mask: Optional[torch.Tensor] = None,
@@ -833,15 +833,11 @@ class PatchworkNetwork(nn.Module):
         """Compute training loss.
 
         Args:
+            target_score_dist: (B, 201) soft label distribution over score bins.
+                               Must sum to ~1 per row.  Built by make_gaussian_score_targets().
             target_ownership: (B, 2, 9, 9) float32 binary targets.
-                              Channel 0: current player's board (0=empty, 1=filled).
-                              Channel 1: opponent's board (0=empty, 1=filled).
-                              Only used when ownership_head exists and weight > 0.
             ownership_weight: Loss weight for the auxiliary ownership head.
-            ownership_valid_mask: (B,) bool tensor. When provided, ownership loss
-                              is computed only on samples where mask is True.
-                              Allows mixed old/new data batches to still train
-                              the ownership head on valid samples.
+            ownership_valid_mask: (B,) bool tensor for per-sample masking.
         """
         state, shop_feats = self._apply_gpu_legality(state, shop_ids, shop_feats)
         trunk = self._trunk_forward(state, x_global, x_track, shop_ids, shop_feats)
@@ -849,46 +845,75 @@ class PatchworkNetwork(nn.Module):
         if self.global_to_heads is not None and x_global is not None:
             g_heads = self.global_to_heads(x_global)
             if self.trunk_to_heads is not None:
-                # Add trunk spatial pooling: mean over 9×9 → projected to same dim → additive residual
                 g_heads = g_heads + self.trunk_to_heads(trunk.mean(dim=(2, 3)))
         policy_logits = self.policy_head(trunk, g=g_heads)
         if action_mask is not None:
             policy_logits = policy_logits.masked_fill(action_mask == 0, float("-inf"))
         value_out = self.value_head(trunk, g=g_heads)
         if isinstance(value_out, tuple):
-            value, score_logits = value_out[0], value_out[1]
+            value, score_logits = value_out
         else:
             value = value_out
             B = value.shape[0]
             score_logits = torch.zeros(B, ValueHead.SCORE_BINS, device=value.device, dtype=value.dtype)
 
-        # Policy loss (cross-entropy)
+        # --- Policy loss (cross-entropy, float32 for stability under AMP) ---
+        # PCR support: all-zeros policy targets (from fast-search moves) are excluded
+        # via masked mean so they don't dilute the policy gradient.
         target_policy_sum = target_policy.sum(dim=-1, keepdim=True)
+        policy_valid = (target_policy_sum.squeeze(-1) > 1e-6)  # (B,) True for real targets
         target_policy_norm = target_policy / torch.clamp(target_policy_sum, min=1e-8)
-        log_probs = F.log_softmax(policy_logits, dim=-1).clamp(min=-100.0)
-        policy_loss = -(target_policy_norm * log_probs).sum(dim=-1).mean()
-        # CRITICAL FIX: Raise on NaN instead of silently zeroing (hides bugs)
+        log_probs = F.log_softmax(policy_logits.float(), dim=-1).clamp(min=-100.0)
+        per_sample_ce = -(target_policy_norm.float() * log_probs).sum(dim=-1)  # (B,)
+        n_valid = policy_valid.sum().clamp_min(1)
+        policy_loss = (per_sample_ce * policy_valid.float()).sum() / n_valid
         if torch.isnan(policy_loss):
             if self.training:
                 raise RuntimeError("policy_loss is NaN - check masks/logits/targets")
-            policy_loss = torch.tensor(0.0, device=policy_loss.device)  # Inference: skip
+            policy_loss = torch.tensor(0.0, device=policy_loss.device)
 
-        # Value loss (MSE)
-        value_loss = F.mse_loss(value, target_value)
+        # --- Value loss (MSE) ---
+        value_loss = F.mse_loss(value.squeeze(-1), target_value.squeeze(-1))
 
-        # Score loss: distributional CE over 201 bins (soft target from replay score_margins).
+        # --- Score loss (soft-target cross-entropy over 201 bins, float32) ---
         score_loss = torch.tensor(0.0, device=state.device)
-        if score_loss_weight > 0 and self.value_head.score_head is not None:
-            if target_score_dist is not None:
-                # (B, 201) soft labels; normalize and CE
-                tgt = target_score_dist.float() / target_score_dist.float().sum(dim=-1, keepdim=True).clamp(min=1e-12)
-                logp = F.log_softmax(score_logits.float(), dim=-1).clamp(min=-100.0)
-                score_loss = -(tgt * logp).sum(dim=-1).mean()
-            elif target_score is not None:
-                # Legacy scalar target: no-op (trainer should pass target_score_dist for 201-bin).
-                pass
+        score_ce_raw = 0.0
+        score_ce_weighted = 0.0
+        score_entropy_val = 0.0
+        score_pred_mean_val = 0.0
+        score_pred_std_val = 0.0
+        score_tgt_mean_val = 0.0
+        score_mae_mean_val = 0.0
 
-        # Ownership loss (auxiliary, KataGo-style adapted for dual-board)
+        if target_score_dist is not None and score_loss_weight > 0 and self.value_head.score_head is not None:
+            tgt = target_score_dist.float()
+            tgt = tgt / tgt.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            logp = F.log_softmax(score_logits.float(), dim=-1).clamp(min=-100.0)
+            score_ce = -(tgt * logp).sum(dim=-1).mean()
+            score_loss = score_ce
+
+            with torch.no_grad():
+                bins = torch.arange(
+                    ValueHead.SCORE_MIN, ValueHead.SCORE_MAX + 1,
+                    device=score_logits.device, dtype=torch.float32,
+                )
+                p = F.softmax(score_logits.float(), dim=-1)
+                pred_mean = (p * bins).sum(dim=-1)
+                pred_var = (p * (bins - pred_mean.unsqueeze(-1)) ** 2).sum(dim=-1).clamp_min(0.0)
+                pred_std = pred_var.sqrt()
+                ent = -(p * p.clamp_min(1e-12).log()).sum(dim=-1).mean()
+                tgt_mean = (tgt * bins).sum(dim=-1)
+                mae = (pred_mean - tgt_mean).abs().mean()
+
+                score_ce_raw = float(score_ce.item())
+                score_ce_weighted = float(score_loss_weight * score_ce.item())
+                score_entropy_val = float(ent.item())
+                score_pred_mean_val = float(pred_mean.mean().item())
+                score_pred_std_val = float(pred_std.mean().item())
+                score_tgt_mean_val = float(tgt_mean.mean().item())
+                score_mae_mean_val = float(mae.item())
+
+        # --- Ownership loss (auxiliary, KataGo-style adapted for dual-board) ---
         ownership_loss = torch.tensor(0.0, device=state.device)
         ownership_logits = None
         if (
@@ -896,9 +921,8 @@ class PatchworkNetwork(nn.Module):
             and target_ownership is not None
             and ownership_weight > 0
         ):
-            ownership_logits = self.ownership_head(trunk)  # (B, 2, 9, 9)
+            ownership_logits = self.ownership_head(trunk)
             if ownership_valid_mask is not None and not ownership_valid_mask.all():
-                # Per-sample masking: only compute loss on valid samples
                 valid_logits = ownership_logits[ownership_valid_mask]
                 valid_targets = target_ownership[ownership_valid_mask]
                 if valid_logits.shape[0] > 0:
@@ -906,7 +930,6 @@ class PatchworkNetwork(nn.Module):
                         valid_logits, valid_targets
                     )
             else:
-                # All samples valid (or no mask) — standard path
                 ownership_loss = F.binary_cross_entropy_with_logits(
                     ownership_logits, target_ownership
                 )
@@ -918,52 +941,45 @@ class PatchworkNetwork(nn.Module):
             + ownership_weight * ownership_loss
         )
 
-        # Guard against NaN in any loss component (not just policy)
         if torch.isnan(total_loss):
             if self.training:
                 raise RuntimeError(
                     f"total_loss is NaN — policy={policy_loss.item()}, "
-                    f"value={value_loss.item()}, ownership={ownership_loss.item()}. "
-                    f"Check inputs for corruption."
+                    f"value={value_loss.item()}, score={score_loss.item()}, "
+                    f"ownership={ownership_loss.item()}. Check inputs for corruption."
                 )
             total_loss = torch.tensor(0.0, device=total_loss.device)
 
         with torch.no_grad():
             pred_actions = policy_logits.argmax(dim=-1)
             target_actions = target_policy.argmax(dim=-1)
-            policy_accuracy = (pred_actions == target_actions).float().mean()
-            _, top5_pred = policy_logits.topk(5, dim=-1)
-            policy_top5_accuracy = (top5_pred == target_actions.unsqueeze(1)).any(dim=1).float().mean()
+            # PCR: only measure accuracy/KL over samples with real policy targets
+            if policy_valid.all():
+                policy_accuracy = (pred_actions == target_actions).float().mean()
+                _, top5_pred = policy_logits.topk(5, dim=-1)
+                policy_top5_accuracy = (top5_pred == target_actions.unsqueeze(1)).any(dim=1).float().mean()
+            else:
+                correct = (pred_actions == target_actions).float()
+                policy_accuracy = (correct * policy_valid.float()).sum() / n_valid
+                _, top5_pred = policy_logits.topk(5, dim=-1)
+                top5_hit = (top5_pred == target_actions.unsqueeze(1)).any(dim=1).float()
+                policy_top5_accuracy = (top5_hit * policy_valid.float()).sum() / n_valid
 
-            # Training diagnostics: policy entropy, target entropy, and KL divergence
-            policy_probs = log_probs.exp()
-            policy_entropy = -(policy_probs * log_probs).sum(dim=-1).mean()
+            policy_probs = F.softmax(policy_logits.float(), dim=-1).clamp(min=1e-8)
+            policy_entropy = -(policy_probs * policy_probs.log()).sum(dim=-1).mean()
 
-            target_log = target_policy_norm.clamp(min=1e-8).log()
-            target_entropy = -(target_policy_norm * target_log).sum(dim=-1).mean()
+            kl_per = (target_policy_norm.float() * (target_policy_norm.float().clamp(min=1e-8).log() - policy_probs.log())).sum(dim=-1)
+            kl_div = (kl_per * policy_valid.float()).sum() / n_valid
 
-            # KL(MCTS_target || network_policy) - measures how far net is from MCTS
-            kl_div = (target_policy_norm * (target_log - log_probs)).sum(dim=-1).mean()
-
-            policy_cross_entropy = policy_loss
-            ce_minus_policy_entropy = policy_cross_entropy - policy_entropy
-
-            # Per-sample identity check: CE(pi,p) = H(pi) + KL(pi||p) per sample, then mean(|err|)
-            ce_i = -(target_policy_norm * log_probs).sum(dim=-1)
-            h_i = -(target_policy_norm * target_log).sum(dim=-1)
-            kl_i = (target_policy_norm * (target_log - log_probs)).sum(dim=-1)
-            approx_identity_error = (h_i + kl_i - ce_i).abs().mean()
-
-            # Ownership accuracy (binary, threshold at 0.5) — only over valid samples
             ownership_accuracy = 0.0
             if ownership_logits is not None:
-                ownership_pred = (ownership_logits > 0).float()  # sigmoid > 0.5
+                ownership_pred = (ownership_logits > 0).float()
                 if ownership_valid_mask is not None and not ownership_valid_mask.all():
                     valid_pred = ownership_pred[ownership_valid_mask]
-                    valid_targets = target_ownership[ownership_valid_mask]
+                    valid_targets_o = target_ownership[ownership_valid_mask]
                     if valid_pred.shape[0] > 0:
                         ownership_accuracy = float(
-                            (valid_pred == valid_targets).float().mean().item()
+                            (valid_pred == valid_targets_o).float().mean().item()
                         )
                 else:
                     ownership_accuracy = float(
@@ -980,12 +996,15 @@ class PatchworkNetwork(nn.Module):
             "policy_top5_accuracy": float(policy_top5_accuracy.item()),
             "value_mse": float(value_loss.item()),
             "policy_entropy": float(policy_entropy.item()),
-            "target_entropy": float(target_entropy.item()),
-            "policy_cross_entropy": float(policy_cross_entropy.item()),
-            "ce_minus_policy_entropy": float(ce_minus_policy_entropy.item()),
             "kl_divergence": float(kl_div.item()),
-            "approx_identity_check": float(approx_identity_error.item()),
             "ownership_accuracy": float(ownership_accuracy),
+            "score_ce_raw": score_ce_raw,
+            "score_ce_weighted": score_ce_weighted,
+            "score_entropy": score_entropy_val,
+            "score_pred_mean": score_pred_mean_val,
+            "score_pred_std": score_pred_std_val,
+            "score_tgt_mean": score_tgt_mean_val,
+            "score_mae_mean": score_mae_mean_val,
         }
         return total_loss, metrics
 
@@ -1054,16 +1073,6 @@ def load_model_checkpoint(
             elif old_in != new_in:
                 raise ValueError(f"Checkpoint conv_input has {old_in} channels, model expects {new_in}. Incompatible.")
 
-    # Drop incompatible score_head weights (old scalar 1-dim vs new 201-bin)
-    for shk in list(state_dict.keys()):
-        if "score_head" in shk and shk in network.state_dict():
-            if state_dict[shk].shape != network.state_dict()[shk].shape:
-                logger.warning(
-                    "Dropping incompatible score_head key %s (shape %s vs %s); score head will reinitialise.",
-                    shk, state_dict[shk].shape, network.state_dict()[shk].shape,
-                )
-                del state_dict[shk]
-
     # Widen FiLM MLP first layer when loading old checkpoints (11->20 inputs)
     if network.film_mlp is not None and "film_mlp.0.weight" in state_dict:
         old_film_w = state_dict["film_mlp.0.weight"]
@@ -1079,6 +1088,18 @@ def load_model_checkpoint(
                 "Checkpoint film_mlp.0 widened %d->%d inputs (new columns zero-init).",
                 old_in_film, new_in_film,
             )
+
+    # Harden: drop incompatible score_head weights (old scalar 1-dim vs new 201-dim)
+    score_head_keys = [k for k in state_dict if "score_head" in k]
+    for shk in score_head_keys:
+        if shk in network.state_dict():
+            if state_dict[shk].shape != network.state_dict()[shk].shape:
+                logger.warning(
+                    "Dropping incompatible score_head key %s: checkpoint shape %s vs model %s. "
+                    "Score head will reinitialise from scratch.",
+                    shk, state_dict[shk].shape, network.state_dict()[shk].shape,
+                )
+                del state_dict[shk]
 
     current_keys = set(network.state_dict().keys())
     ckpt_keys = set(state_dict.keys())

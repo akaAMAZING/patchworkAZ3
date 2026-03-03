@@ -1,0 +1,9 @@
+key,value,description
+ema_decay,0.999,Polyak EMA decay (half-life ~1000 steps); applied each training step; not a per-iteration scalar
+ema_use_for_selfplay,true,Self-play uses EMA weights
+ema_use_for_eval,true,Eval uses EMA weights
+max_grad_norm,1.0,Gradient clipping
+policy_loss_weight,1.0
+value_loss_weight,1.0
+score_loss_weight,0.1
+ownership_loss_weight,0.15

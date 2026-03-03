@@ -36,9 +36,6 @@ from src.network.gold_v2_constants import (
     TRACK_LEN,
 )
 
-# Module-level max payload size seen in check_slot_write_bounds (for diagnostics; thread-safe not required).
-_max_payload_nbytes_seen: int = 0
-
 
 class WorkerSharedBuffer:
     """Per-worker shared memory block. GPU server reads from it without pickling."""
@@ -52,9 +49,6 @@ class WorkerSharedBuffer:
     _L  = MAX_ACTIONS * 4                    # legal_idxs (2026,) i32:  8104 bytes (max size)
     _NL = 4                                  # n_legal  (1,)      i32:     4 bytes
     SLOT_BYTES: int = _S + _G + _T + _SI + _SF + _M + _L + _NL  # = 29940
-    # Bounds check: payload written = fixed part + n_legal*4; must not exceed one slot.
-    HEADER_BYTES: int = 0  # no separate header; slot is contiguous layout
-    PAYLOAD_FIXED_BYTES: int = _S + _G + _T + _SI + _SF + _M + _NL  # = 21836 (slot minus legal_idxs max)
 
     OFF_S  = 0
     OFF_G  = OFF_S  + _S
@@ -71,7 +65,6 @@ class WorkerSharedBuffer:
         worker_id: int = 0,
         create: bool = True,
         name: Optional[str] = None,
-        expected_n_slots: Optional[int] = None,
     ) -> None:
         if create:
             assert n_slots is not None and n_slots > 0, "n_slots required when create=True"
@@ -81,24 +74,8 @@ class WorkerSharedBuffer:
         else:
             assert name is not None, "name required when create=False"
             self._shm = SharedMemory(create=False, name=name)
-            # SHM ATTACH VALIDATION: prevent n_slots=0 or undersized segments (can cause
-            # STATUS_STACK_BUFFER_OVERRUN in child when creating numpy views).
-            if self._shm.size < self.SLOT_BYTES:
-                raise ValueError(
-                    f"SHM buffer too small: name={name!r} size={self._shm.size} "
-                    f"< SLOT_BYTES={self.SLOT_BYTES}"
-                )
+            # Derive n_slots from actual SHM size (caller may pass n_slots for verification)
             derived = self._shm.size // self.SLOT_BYTES
-            if derived < 1:
-                raise ValueError(
-                    f"SHM buffer has no full slots: name={name!r} size={self._shm.size} "
-                    f"SLOT_BYTES={self.SLOT_BYTES} derived={derived}"
-                )
-            if expected_n_slots is not None and derived < expected_n_slots:
-                raise ValueError(
-                    f"SHM slot count too small: name={name!r} size={self._shm.size} "
-                    f"SLOT_BYTES={self.SLOT_BYTES} derived={derived} expected_n_slots={expected_n_slots}"
-                )
             self.n_slots = n_slots if n_slots is not None else derived
 
         self.name = self._shm.name
@@ -110,33 +87,6 @@ class WorkerSharedBuffer:
 
     def _base(self, slot: int) -> int:
         return slot * self.SLOT_BYTES
-
-    def check_slot_write_bounds(
-        self,
-        slot_idx: int,
-        n_legal: int,
-        *,
-        worker_id: int = 0,
-        expected_n_slots: int | None = None,
-        derived_n_slots: int | None = None,
-    ) -> None:
-        """Raise ValueError if writing n_legal legal indices to slot_idx would exceed slot capacity."""
-        derived = derived_n_slots if derived_n_slots is not None else self.n_slots
-        if slot_idx < 0 or slot_idx >= derived:
-            raise ValueError(
-                f"SHM slot index out of range: worker_id={worker_id} slot_idx={slot_idx} "
-                f"expected_n_slots={expected_n_slots} derived_n_slots={derived}"
-            )
-        payload_nbytes = self.PAYLOAD_FIXED_BYTES + n_legal * 4
-        global _max_payload_nbytes_seen
-        if payload_nbytes > _max_payload_nbytes_seen:
-            _max_payload_nbytes_seen = payload_nbytes
-        if payload_nbytes > self.SLOT_BYTES:
-            raise ValueError(
-                f"SHM slot write overflow: worker_id={worker_id} slot_idx={slot_idx} "
-                f"payload_nbytes={payload_nbytes} SLOT_BYTES={self.SLOT_BYTES} HEADER_BYTES={self.HEADER_BYTES} "
-                f"expected_n_slots={expected_n_slots} derived_n_slots={derived}"
-            )
 
     # ------------------------------------------------------------------
     # Zero-copy numpy views into shared memory (no allocation)
@@ -213,10 +163,3 @@ class WorkerSharedBuffer:
             self._shm.unlink()
         except Exception:
             pass
-
-
-def get_shm_safety_margin() -> tuple[int, int, int]:
-    """Return (max_payload_nbytes_seen, capacity_bytes, margin_bytes). capacity = SLOT_BYTES - HEADER_BYTES."""
-    capacity = WorkerSharedBuffer.SLOT_BYTES - WorkerSharedBuffer.HEADER_BYTES
-    margin = capacity - _max_payload_nbytes_seen
-    return (_max_payload_nbytes_seen, capacity, margin)

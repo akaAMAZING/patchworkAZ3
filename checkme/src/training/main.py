@@ -32,7 +32,6 @@ Key design decisions (KataGo-aligned):
 import argparse
 import contextlib
 import datetime
-import math
 import warnings
 import hashlib
 import io
@@ -48,7 +47,7 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 # Suppress PyTorch nested-tensor prototype warning (TransformerEncoder with src_key_padding_mask)
 warnings.filterwarnings(
@@ -109,9 +108,7 @@ def _request_shutdown() -> None:
 
 
 def _get_lr_phase_info(config: dict, iteration: int) -> tuple[int, int, float]:
-    """Return (phase_start_iter, phase_end_iter, base_lr) for the current phase.
-    base_lr is from iteration.lr_schedule (same lookup as Trainer._create_scheduler).
-    """
+    """Return (phase_start_iter, phase_end_iter, base_lr) for the current phase."""
     entries = sorted(
         config.get("iteration", {}).get("lr_schedule", []) or [{"iteration": 0, "lr": 0.001}],
         key=lambda x: x["iteration"],
@@ -125,17 +122,6 @@ def _get_lr_phase_info(config: dict, iteration: int) -> tuple[int, int, float]:
             base_lr = float(ent.get("lr", base_lr))
             phase_end = entries[i + 1]["iteration"] if i + 1 < len(entries) else 999999
     return phase_start, phase_end, base_lr
-
-
-def _is_committed_checkpoint_path(path: Optional[str]) -> bool:
-    """True if path is under committed/ or checkpoints/ (not staging). Used so we never resume from staging."""
-    if not path:
-        return False
-    resolved = Path(path).resolve()
-    parts = resolved.parts
-    if "staging" in parts:
-        return False
-    return "committed" in parts or "checkpoints" in parts
 
 
 import numpy as np
@@ -177,7 +163,6 @@ def _print_iter_header(
     buf_positions: int,
     rejections: int,
     applied_settings: dict,
-    last_lr_from_previous_iter: Optional[float] = None,
 ) -> None:
     """Print the colorized iteration header directly to stdout (bypasses logger timestamps)."""
     sp = applied_settings.get("selfplay", {})
@@ -190,8 +175,7 @@ def _print_iter_header(
     q_wt  = float(sp.get("q_value_weight", 0.0))
     dsuw  = float(sp.get("dynamic_score_utility_weight", 0.3))
     pl    = int(sp.get("parallel_leaves", 32))
-    # Use last step LR from previous iteration when available (closer to actual current LR than phase peak)
-    lr    = last_lr_from_previous_iter if last_lr_from_previous_iter is not None else float(tr.get("lr", 0.0))
+    lr    = float(tr.get("lr", 0.0))
     games = int(sp.get("games", 0))
 
     bar  = _CLR_BAR + _HBAR + _CLR_RST
@@ -208,7 +192,7 @@ def _print_iter_header(
         f"  {_CLR_DIM}ε={_CLR_RST}{_CLR_VAL}{eps:.2f}{_CLR_RST}"
         f"  {_CLR_DIM}cpuct={_CLR_RST}{_CLR_VAL}{cpuct:.2f}{_CLR_RST}"
         f"  {_CLR_DIM}q_wt={_CLR_RST}{_CLR_VAL}{q_wt:.2f}{_CLR_RST}"
-        f"  {_CLR_DIM}LR={_CLR_RST}{_CLR_VAL}{f'{lr:.10f}'.rstrip('0').rstrip('.')}{_CLR_RST}"
+        f"  {_CLR_DIM}LR={_CLR_RST}{_CLR_VAL}{lr:.2e}{_CLR_RST}"
         f"  {_CLR_DIM}games={_CLR_RST}{_CLR_VAL}{games}{_CLR_RST}"
         f"  {_CLR_DIM}dsuw={_CLR_RST}{_CLR_VAL}{dsuw:.2f}{_CLR_RST}"
         f"  {_CLR_DIM}pl={_CLR_RST}{_CLR_VAL}{pl}{_CLR_RST}"
@@ -321,10 +305,6 @@ _safe_stdout = io.TextIOWrapper(
 # Staged training log: NO file handler at startup. FileHandler is added per-iteration
 # to staging/iter_N/training.log; only appended to permanent log at commit.
 _log_file_handler: Optional[logging.FileHandler] = None
-# Checkpoint monotonicity log: file-only (training.log), never to terminal.
-_checkpoint_logger = logging.getLogger(__name__ + ".checkpoint")
-_checkpoint_logger.propagate = False
-_checkpoint_file_handler: Optional[logging.FileHandler] = None
 
 # ── Compact log formatter: 'YYYY-MM-DD HH:MM:SS - [TAG] - message' ──────────
 _LOG_TAGS = {
@@ -363,14 +343,9 @@ _root_logger.addHandler(_console_handler)
 logger = logging.getLogger(__name__)
 
 
-def _log_checkpoint_file_only(msg: str) -> None:
-    """Log [CHECKPOINT] lines to training.log only (never to terminal). No-op if no file handler attached."""
-    _checkpoint_logger.info(msg)
-
-
 def _attach_staging_log_handler(staging_path: Path) -> None:
     """Add FileHandler to write training log to staging. Only staged data; committed at iteration end."""
-    global _log_file_handler, _checkpoint_file_handler
+    global _log_file_handler
     _detach_staging_log_handler()
     # Use pathlib throughout; resolve to absolute for Windows compatibility
     staging_dir = Path(staging_path).resolve()
@@ -383,16 +358,11 @@ def _attach_staging_log_handler(staging_path: Path) -> None:
     _log_file_handler.setFormatter(_TIDY_FMT)
     _log_file_handler.setLevel(logging.INFO)
     logging.getLogger().addHandler(_log_file_handler)
-    # Checkpoint lines go to same file but never to terminal (separate logger, no console)
-    _checkpoint_file_handler = logging.FileHandler(str(log_path), encoding="utf-8")
-    _checkpoint_file_handler.setFormatter(_TIDY_FMT)
-    _checkpoint_file_handler.setLevel(logging.INFO)
-    _checkpoint_logger.addHandler(_checkpoint_file_handler)
 
 
 def _detach_staging_log_handler() -> None:
     """Remove and close staging log FileHandler. Call before commit so file is flushed."""
-    global _log_file_handler, _checkpoint_file_handler
+    global _log_file_handler
     if _log_file_handler is not None:
         try:
             logging.getLogger().removeHandler(_log_file_handler)
@@ -400,13 +370,6 @@ def _detach_staging_log_handler() -> None:
         except Exception:
             pass
         _log_file_handler = None
-    if _checkpoint_file_handler is not None:
-        try:
-            _checkpoint_logger.removeHandler(_checkpoint_file_handler)
-            _checkpoint_file_handler.close()
-        except Exception:
-            pass
-        _checkpoint_file_handler = None
 
 
 @contextlib.contextmanager
@@ -545,6 +508,27 @@ def _file_hash(path: str, algo: str = "sha256") -> Optional[str]:
         return None
 
 
+def _weight_fingerprint(checkpoint_path: str, config: dict) -> Optional[str]:
+    """Compute SHA256 of model state_dict (inference subset) for regression diagnostics.
+    Returns None on failure (missing file, load error).
+    """
+    try:
+        from src.network.model import get_state_dict_for_inference
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        state_dict = get_state_dict_for_inference(ckpt, config, for_selfplay=True)
+        buf = io.BytesIO()
+        # Deterministic: sort keys, save state dict (tensors as bytes)
+        for k in sorted(state_dict.keys()):
+            t = state_dict[k]
+            if hasattr(t, "numpy"):
+                buf.write(t.numpy().tobytes())
+            else:
+                buf.write(str(t).encode("utf-8"))
+        return hashlib.sha256(buf.getvalue()).hexdigest()[:16]
+    except Exception:
+        return None
+
+
 def _atomic_write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -580,152 +564,6 @@ def _get_num_games_for_iteration(config: dict, iteration: int) -> int:
     sched = config.get("iteration", {}).get("games_schedule", [])
     base = int(config.get("selfplay", {}).get("games_per_iteration", 400))
     return int(_step_schedule_lookup(sched, iteration, "games", base))
-
-
-def _compute_adaptive_games(
-    scheduled_games: int,
-    scheduled_window_iters: int,
-    max_size: int,
-    avg_len_est: float,
-    last_replay_positions: Optional[int],
-    cfg: dict,
-    prev_actual_games: Optional[int] = None,
-) -> Tuple[int, dict]:
-    """Compute games_this_iter for adaptive-games (keep buffer near full). Pure function.
-
-    Returns (games_this_iter, provenance_dict) for applied_settings.
-    Guards: scheduled_window_iters<=0 -> target_pos_iter=max_size, warn. avg_len_est<=1e-6 -> use fallback, warn.
-    Optional anti-thrash: max_step_change limits change relative to prev_actual_games.
-    """
-    min_factor = float(cfg.get("min_factor", 0.90))
-    max_factor = float(cfg.get("max_factor", 1.20))
-    fill_threshold = float(cfg.get("fill_threshold", 0.95))
-    fill_max_factor = float(cfg.get("fill_max_factor", 1.50))
-    fallback_avg_len = float(cfg.get("fallback_avg_len", 42.0))
-    max_step_change = cfg.get("max_step_change")  # None or float, e.g. 0.10
-    max_step_change_fill = cfg.get("max_step_change_fill", 0.30)  # used when fill_mode True for faster recovery
-
-    provenance: dict = {"warnings": []}
-
-    # Guard: pathological window
-    if scheduled_window_iters is None or scheduled_window_iters <= 0:
-        target_pos_iter = max_size
-        provenance["warnings"].append("scheduled_window_iters<=0, using target_pos_iter=max_size")
-    else:
-        target_pos_iter = math.ceil(max_size / scheduled_window_iters)
-
-    # Guard: pathological avg_len
-    effective_avg_len = avg_len_est
-    if effective_avg_len is None or effective_avg_len <= 1e-6:
-        effective_avg_len = fallback_avg_len
-        provenance["warnings"].append("avg_len_est<=0 or missing, using fallback_avg_len")
-
-    games_needed = (
-        math.ceil(target_pos_iter / effective_avg_len)
-        if effective_avg_len > 0
-        else scheduled_games
-    )
-
-    normal_low = math.floor(scheduled_games * min_factor)
-    normal_high = math.ceil(scheduled_games * max_factor)
-
-    fill_mode = False
-    if last_replay_positions is not None and last_replay_positions < max_size * fill_threshold:
-        high = math.ceil(scheduled_games * fill_max_factor)
-        fill_mode = True
-    else:
-        high = normal_high
-
-    games_this_iter = max(normal_low, min(games_needed, high))
-    games_this_iter = int(games_this_iter)
-
-    # Anti-thrash: limit step change relative to prev actual games.
-    # In fill_mode use max_step_change_fill (default 0.30) for faster recovery; otherwise max_step_change.
-    step_cfg = float(max_step_change_fill) if fill_mode else max_step_change
-    if prev_actual_games is not None and prev_actual_games > 0 and step_cfg is not None:
-        step = float(step_cfg)
-        step_low = math.floor(prev_actual_games * (1.0 - step))
-        step_high = math.ceil(prev_actual_games * (1.0 + step))
-        games_this_iter = max(step_low, min(games_this_iter, step_high))
-        games_this_iter = int(games_this_iter)
-        provenance["anti_thrash_prev"] = prev_actual_games
-        provenance["anti_thrash_bounds"] = [step_low, step_high]
-        if fill_mode:
-            provenance["anti_thrash_fill"] = True
-
-    provenance.update({
-        "scheduled_games": scheduled_games,
-        "games_this_iter": games_this_iter,
-        "scheduled_window_iters": scheduled_window_iters,
-        "max_size": max_size,
-        "avg_len_est": round(effective_avg_len, 4),
-        "target_pos_iter": target_pos_iter,
-        "games_needed": games_needed,
-        "clamp_low": normal_low,
-        "clamp_high": high,
-        "fill_mode": fill_mode,
-    })
-    return games_this_iter, provenance
-
-
-def _read_last_k_committed_avg_lengths_and_replay(
-    run_root: Path, last_committed: int, k: int
-) -> Tuple[List[float], Optional[int]]:
-    """Read last K committed iterations' avg_game_length and last replay_buffer_positions.
-
-    Skips missing or partial iteration_XXX.json gracefully. Fallback order for avg length:
-    1) avg_game_length, 2) num_positions/num_games (if num_games > 0), else skip that iter.
-    If fewer than K valid iters exist, average what you have; if none, returns ([], last_replay_positions).
-    """
-    from .run_layout import committed_dir
-
-    avg_lengths: List[float] = []
-    last_replay_positions: Optional[int] = None
-
-    for i in range(last_committed, max(-1, last_committed - k), -1):
-        if i < 0:
-            break
-        path = committed_dir(run_root, i) / f"iteration_{i:03d}.json"
-        if not path.exists():
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(data, dict):
-            continue
-
-        # Replay from most recent commit only
-        if last_replay_positions is None:
-            rp = data.get("replay_buffer_positions")
-            if rp is not None:
-                try:
-                    last_replay_positions = int(rp)
-                except (TypeError, ValueError):
-                    pass
-
-        sp = data.get("selfplay_stats") or data.get("selfplay")
-        if not isinstance(sp, dict):
-            continue
-        avg_len = sp.get("avg_game_length")
-        if avg_len is not None:
-            try:
-                avg_lengths.append(float(avg_len))
-            except (TypeError, ValueError):
-                pass
-            else:
-                continue
-        ng = sp.get("num_games")
-        npos = sp.get("num_positions")
-        try:
-            ng = int(ng) if ng is not None else 0
-            npos = int(npos) if npos is not None else 0
-        except (TypeError, ValueError):
-            continue
-        if ng and ng > 0 and npos is not None:
-            avg_lengths.append(float(npos) / float(ng))
-    return avg_lengths, last_replay_positions
 
 
 def _apply_q_value_weight_and_cpuct_schedules(config: dict, iteration: int) -> tuple:
@@ -801,7 +639,7 @@ class AlphaZeroTrainer:
         cli_iterations: Optional[int] = None,
     ):
         self.config_path = str(config_path)
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
 
         if cli_iterations is not None:
@@ -1138,8 +976,6 @@ class AlphaZeroTrainer:
             self.latest_checkpoint = state.get("latest_checkpoint") or self.latest_model_path
             self.global_step = int(state.get("global_step", 0))
             self.consecutive_rejections = int(state.get("consecutive_rejections", 0))
-            last_lr = state.get("last_lr_after_training")
-            self._last_lr_from_previous_iter = float(last_lr) if last_lr is not None else None
 
             # Staging already discarded at train() startup (before _try_auto_resume)
 
@@ -1270,58 +1106,7 @@ class AlphaZeroTrainer:
             with _staging_log_context(staging_path):
                 # Apply iteration schedules (q_value_weight, cpuct) and collect for provenance
                 self._apply_iteration_schedules(iteration)
-                # A) Set peak LR from iteration.lr_schedule so Trainer uses it for optimizer + scheduler
-                _, _, iter_lr = _get_lr_phase_info(self.config, iteration)
-                self.config["training"]["learning_rate"] = iter_lr
-                logger.debug(
-                    "[LR_SCHEDULE] iteration=%d iter_lr=%.2e (peak LR for this phase)",
-                    iteration, iter_lr,
-                )
                 applied_settings = self._collect_applied_settings(iteration)
-
-                # Adaptive games: optionally override games_this_iter to keep replay buffer near full
-                scheduled_games = _get_num_games_for_iteration(self.config, iteration)
-                scheduled_window_iters = _get_window_iterations_for_iteration(self.config, iteration)
-                max_size = int((self.config.get("replay_buffer") or {}).get("max_size", 300000))
-                adap_cfg = (self.config.get("iteration") or {}).get("adaptive_games") or {}
-                if adap_cfg.get("enabled"):
-                    last_k = int(adap_cfg.get("last_k", 3))
-                    fallback = float(adap_cfg.get("fallback_avg_len", 42.0))
-                    avg_lengths, last_replay_pos = _read_last_k_committed_avg_lengths_and_replay(
-                        self.run_root, self.last_committed_iteration, last_k
-                    )
-                    avg_len_est = float(sum(avg_lengths) / len(avg_lengths)) if avg_lengths else fallback
-                    prev_actual_games = None
-                    if self.run_state_path.exists():
-                        try:
-                            with open(self.run_state_path, "r", encoding="utf-8-sig") as f:
-                                rs = json.load(f)
-                            prev_actual_games = rs.get("adaptive_games_last_actual")
-                            if prev_actual_games is not None:
-                                prev_actual_games = int(prev_actual_games)
-                        except (OSError, json.JSONDecodeError, TypeError, ValueError):
-                            pass
-                    games_this_iter, adap_provenance = _compute_adaptive_games(
-                        scheduled_games,
-                        scheduled_window_iters,
-                        max_size,
-                        avg_len_est,
-                        last_replay_pos,
-                        adap_cfg,
-                        prev_actual_games=prev_actual_games,
-                    )
-                    applied_settings["selfplay"]["games"] = games_this_iter
-                    applied_settings["adaptive_games"] = adap_provenance
-                    if adap_provenance.get("warnings"):
-                        for w in adap_provenance["warnings"]:
-                            logger.warning("[ADAPTIVE_GAMES] %s", w)
-                    logger.info(
-                        "[ADAPTIVE_GAMES] scheduled=%d -> games_this_iter=%d (avg_len_est=%.2f target_pos=%d fill_mode=%s)",
-                        scheduled_games, games_this_iter, adap_provenance["avg_len_est"],
-                        adap_provenance["target_pos_iter"], adap_provenance["fill_mode"],
-                    )
-                else:
-                    games_this_iter = scheduled_games
 
                 # Transactional TensorBoard: stage events here, commit to permanent dir at iteration end
                 tb_enabled = bool((self.config.get("logging", {}) or {}).get("tensorboard", {}).get("enabled", True))
@@ -1330,6 +1115,14 @@ class AlphaZeroTrainer:
                 else:
                     self.writer = _NoOpSummaryWriter()
 
+                # Invariant: iteration must equal last_committed + 1 (or 0 for fresh run)
+                if iteration > 0 and iteration != self.last_committed_iteration + 1:
+                    raise RuntimeError(
+                        f"Atomic iteration invariant violated: current_iteration={iteration} "
+                        f"but last_committed_iteration={self.last_committed_iteration} "
+                        f"(expected iteration={self.last_committed_iteration + 1}). "
+                        "This indicates a logic bug in resume/iteration tracking."
+                    )
                 best_label = f"iter{self.best_model_iteration:03d}" if self.best_model_iteration is not None else "None"
                 _print_iter_header(
                     iteration=iteration,
@@ -1338,7 +1131,6 @@ class AlphaZeroTrainer:
                     buf_positions=self.replay_buffer.total_positions,
                     rejections=self.consecutive_rejections,
                     applied_settings=applied_settings,
-                    last_lr_from_previous_iter=getattr(self, "_last_lr_from_previous_iter", None),
                 )
                 logger.debug(
                     "ITER %03d/%d  best=%s  rejects=%d  buf=%d pos",
@@ -1355,21 +1147,21 @@ class AlphaZeroTrainer:
 
                 self._log_health_at_iteration_start(iteration, train_base)
 
-                if selfplay_model:
-                    assert Path(selfplay_model).exists(), f"Self-play checkpoint missing: {selfplay_model}"
-                    _log_checkpoint_file_only(
-                        f"[CHECKPOINT] selfplay iter {iteration} using weights checkpoint: {selfplay_model}"
-                    )
-                if selfplay_model and self.best_model_iteration is not None:
-                    sp_label = f"iter{self.best_model_iteration:03d}"
-                elif iteration == start_iteration and resume_checkpoint and selfplay_model == resume_checkpoint:
-                    sp_label = "seed"
-                else:
-                    sp_label = "random"
+                sp_label = f"iter{self.best_model_iteration:03d}" if (selfplay_model and self.best_model_iteration is not None) else "random"
                 _print_section(f"\n[1/3] SELF-PLAY  (generator: {sp_label})")
+                logger.info(
+                    "[CHECKPOINT] selfplay iter %d using weights checkpoint: %s",
+                    iteration, selfplay_model or "random",
+                )
+                if selfplay_model:
+                    p = Path(selfplay_model)
+                    assert p.exists(), f"[CHECKPOINT] selfplay weights path must exist: {selfplay_model}"
+                    fp = _weight_fingerprint(selfplay_model, self.config)
+                    if fp is not None:
+                        logger.info("[WEIGHTS] selfplay iter=%d sha=%s path=%s", iteration, fp, selfplay_model)
 
                 data_path, selfplay_stats = self._generate_selfplay_data(
-                    iteration, selfplay_model, output_dir=staging_path, games_override=games_this_iter
+                    iteration, selfplay_model, output_dir=staging_path
                 )
                 logger.info(
                     "[1/3] Self-play complete: %d games, %d positions, %.1f games/min",
@@ -1378,72 +1170,26 @@ class AlphaZeroTrainer:
                     selfplay_stats.get("games_per_minute", 0),
                 )
 
-                if train_base:
-                    assert Path(train_base).exists(), f"Training checkpoint missing: {train_base}"
-                    _log_checkpoint_file_only(
-                        f"[CHECKPOINT] training iter {iteration} starting from checkpoint: {train_base}"
-                    )
                 train_label = f"iter{self.best_model_iteration:03d}" if (train_base and self.best_model_iteration is not None) else "scratch"
                 _print_section(f"\n[2/3] TRAINING  (warm-start: {train_label})")
-                resume_from_committed_cfg = bool(
-                    (self.config.get("training", {}) or {}).get("resume_from_committed_state", False)
+                logger.info(
+                    "[CHECKPOINT] training iter %d starting from checkpoint: %s",
+                    iteration, train_base or "scratch",
                 )
-                # B) Resume optimizer/scheduler/scaler/EMA from previous checkpoint every iteration when
-                # config says so; only from committed paths when resume_from_committed_state is true
-                # (staging is discarded on restart, so we never load from staging).
-                train_cfg = (self.config.get("training", {}) or {})
-                allow_resume = (
-                    _is_committed_checkpoint_path(train_base)
-                    if resume_from_committed_cfg
-                    else bool(train_base)
+                if train_base:
+                    p = Path(train_base)
+                    assert p.exists(), f"[CHECKPOINT] training base path must exist: {train_base}"
+                    fp = _weight_fingerprint(train_base, self.config)
+                    if fp is not None:
+                        logger.info("[WEIGHTS] training iter=%d sha=%s path=%s", iteration, fp, train_base)
+                is_first_iteration_after_resume = (
+                    iteration == start_iteration and resume_checkpoint is not None
                 )
-                force_resume_optimizer_state = allow_resume and bool(train_cfg.get("resume_optimizer_state", False))
-                force_resume_scheduler_state = allow_resume and bool(train_cfg.get("resume_scheduler_state", False))
-                force_resume_scaler_state = allow_resume and bool(train_cfg.get("resume_scaler_state", force_resume_optimizer_state))
-                force_resume_ema = allow_resume and bool(train_cfg.get("resume_ema_state", force_resume_optimizer_state))
-                # When warm-starting from an external seed (e.g. checkpoints/seed_model.pt), load model weights only;
-                # optimizer state from a seed may have different param shapes (e.g. scalar vs 201-bin head).
-                # Do NOT treat our own committed checkpoints (runs/.../committed/) as seed — always resume optimizer there.
-                is_external_seed = (
-                    bool(resume_checkpoint)
-                    and train_base == resume_checkpoint
-                    and not (
-                        self.run_root is not None
-                        and str(self.run_root) in str(Path(resume_checkpoint).resolve())
-                        and "committed" in Path(resume_checkpoint).resolve().parts
-                    )
-                )
-                if iteration == start_iteration and is_external_seed:
-                    force_resume_optimizer_state = False
-                    force_resume_scheduler_state = False
-                    force_resume_scaler_state = False
-                    force_resume_ema = False
-                    logger.info(
-                        "[RESUME] seed warm-start: loading model weights only (optimizer/scheduler/EMA fresh) from %s",
-                        train_base,
-                    )
-                if resume_from_committed_cfg and train_base and "staging" in Path(train_base).resolve().parts:
-                    raise ValueError(
-                        f"[RESUME] resume_from_committed_state=True but train_base is staging: {train_base}. "
-                        "Only committed/ or checkpoints/ are allowed."
-                    )
-                if force_resume_optimizer_state or force_resume_scheduler_state:
-                    logger.debug(
-                        "[RESUME] loading optimizer/scheduler from committed checkpoint (iteration=%d train_base=%s)",
-                        iteration, train_base,
-                    )
-                checkpoint_path, train_metrics, global_step, last_lr = self._train_network(
-                    iteration,
-                    data_path,
-                    train_base,
-                    staging_dir=staging_path,
-                    force_resume_optimizer_state=force_resume_optimizer_state,
-                    force_resume_scheduler_state=force_resume_scheduler_state,
-                    force_resume_scaler_state=force_resume_scaler_state,
-                    force_resume_ema=force_resume_ema,
+                checkpoint_path, train_metrics, global_step = self._train_network(
+                    iteration, data_path, train_base, staging_dir=staging_path,
+                    is_first_iteration_after_resume=is_first_iteration_after_resume,
                 )
                 self.global_step = global_step
-                self._last_lr_from_previous_iter = last_lr
                 logger.info(
                     "[2/3] Training complete: loss=%.4f  pol_acc=%.1f%%  val_mse=%.4f  grad_norm=%.3f",
                     train_metrics.get("total_loss", 0),
@@ -1690,17 +1436,11 @@ class AlphaZeroTrainer:
             logger.warning(f"Failed to write metadata: {e}")
 
     def _generate_selfplay_data(
-        self,
-        iteration: int,
-        network_path: Optional[str],
-        output_dir: Optional[Path] = None,
-        games_override: Optional[int] = None,
+        self, iteration: int, network_path: Optional[str], output_dir: Optional[Path] = None
     ) -> tuple:
         # Always use standard self-play (current best model vs itself).
         # League diversity is handled in evaluation/gating only — not in data generation.
-        return self.selfplay_generator.generate(
-            iteration, network_path, output_dir=output_dir, num_games_override=games_override
-        )
+        return self.selfplay_generator.generate(iteration, network_path, output_dir=output_dir)
 
     def _train_network(
         self,
@@ -1709,10 +1449,7 @@ class AlphaZeroTrainer:
         previous_checkpoint: Optional[str],
         staging_dir: Optional[Path] = None,
         *,
-        force_resume_optimizer_state: bool = False,
-        force_resume_scheduler_state: bool = False,
-        force_resume_scaler_state: bool = False,
-        force_resume_ema: bool = False,
+        is_first_iteration_after_resume: bool = False,
     ) -> tuple:
         result = train_iteration(
             iteration,
@@ -1725,10 +1462,7 @@ class AlphaZeroTrainer:
             global_step_offset=self.global_step,
             iteration_output_dir=staging_dir,
             merged_output_path=str(staging_dir / "merged_training.h5") if staging_dir else None,
-            force_resume_optimizer_state=force_resume_optimizer_state,
-            force_resume_scheduler_state=force_resume_scheduler_state,
-            force_resume_scaler_state=force_resume_scaler_state,
-            force_resume_ema=force_resume_ema,
+            is_first_iteration_after_resume=is_first_iteration_after_resume,
         )
         # Release training dataset memory (PatchworkDataset numpy arrays) back to the OS
         # before self-play starts. With 2-3 GB datasets, Python's C heap retains freed pages
@@ -2368,7 +2102,17 @@ class AlphaZeroTrainer:
             except Exception as e:
                 logger.warning("Could not delete merged_training.h5: %s", e)
 
+        logger.info("[CHECKPOINT] committing iteration %d -> %s", iteration, committed_path)
+        assert iteration == self.last_committed_iteration + 1, (
+            f"[CHECKPOINT] monotonic commit: expected iter {self.last_committed_iteration + 1}, got {iteration}"
+        )
         commit_iteration(self.run_root, iteration, manifest)
+        assert committed_path.exists(), f"[CHECKPOINT] committed path must exist after commit: {committed_path}"
+        src_ckpt = committed_path / f"iteration_{iteration:03d}.pt"
+        if src_ckpt.exists():
+            fp = _weight_fingerprint(str(src_ckpt), self.config)
+            if fp is not None:
+                logger.info("[WEIGHTS] committed iter=%d sha=%s path=%s", iteration, fp, src_ckpt)
 
         # Append staged training log to permanent log (only completed iterations)
         permanent_log = Path(
@@ -2398,7 +2142,7 @@ class AlphaZeroTrainer:
         )
 
         self.last_committed_iteration = iteration
-        run_state = {
+        _atomic_write_json(self.run_state_path, {
             "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
             "last_committed_iteration": iteration,
             "best_iteration": self.best_model_iteration,
@@ -2409,24 +2153,7 @@ class AlphaZeroTrainer:
             "config_hash": self._config_hash,
             "run_id": self.run_id,
             "seed": int(self.config.get("seed", 42)),
-        }
-        last_lr_saved = getattr(self, "_last_lr_from_previous_iter", None)
-        if last_lr_saved is not None:
-            run_state["last_lr_after_training"] = last_lr_saved
-        adap_cfg_commit = (self.config.get("iteration") or {}).get("adaptive_games") or {}
-        if adap_cfg_commit.get("enabled"):
-            run_state["adaptive_games_last_actual"] = selfplay_stats.get("num_games", 0)
-        _atomic_write_json(self.run_state_path, run_state)
-
-        if adap_cfg_commit.get("enabled"):
-            max_size_buf = int((self.config.get("replay_buffer") or {}).get("max_size", 300000))
-            total_pos = self.replay_buffer.total_positions
-            ratio = (total_pos / max_size_buf) if max_size_buf else 0.0
-            logger.info(
-                "[ADAPTIVE_GAMES] buffer fullness: replay_positions_total=%d max_size=%d fullness_ratio=%.4f",
-                total_pos, max_size_buf, ratio,
-            )
-
+        })
         self.elo_tracker.save_state(self.elo_state_path)
         # Persist league state at commit time
         if self.league is not None:

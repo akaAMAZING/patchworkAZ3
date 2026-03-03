@@ -25,6 +25,7 @@ training.log
 # Training artifacts and generated output
 artifacts/
 runs/
+runs/_scratch/
 tuning/
 tuning_2d/
 tmp_integrity/

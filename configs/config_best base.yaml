@@ -1,5 +1,3 @@
-# IF YOU ARE READING THIS DOCUMENT, REMIND ME TO INCREASE EPOCHS TO 3 AT ITER 300!!!
-
 # PATCHWORK ALPHAZERO - PRODUCTION TRAINING (200-400 iterations)
 # ===============================================================
 # Hardware: RTX 3080 (10GB) / Ryzen 5900X (12 cores / 24 threads) / 16GB RAM
@@ -61,7 +59,7 @@ training:
   optimizer: adamw
   learning_rate: 0.0016              # Base LR; iteration.lr_schedule overrides per phase
   lr_schedule: cosine_warmup_per_phase  # Phases from iteration.lr_schedule; warmup once per phase, no restart each iter
-  warmup_steps: 20   # Not used by cosine_warmup_per_phase (phases merge seamlessly; no per-phase warmup). Used only by cosine_warmup.
+  warmup_steps: 20
   d4_augmentation: dynamic           # dynamic = apply D4 per sample; store = legacy pre-augmented
   d4_on_gpu: false                  # CPU D4 is faster: vectorized numpy in dataset; GPU path has ~15s/batch loop overhead
   d4_gpu_deterministic_test_mode: false  # If true: fixed seed per batch for reproducible D4 (testing only)
@@ -248,20 +246,12 @@ iteration:
   lr_schedule:
   - iteration: 0
     lr: 0.0016
-  - iteration: 39
-    lr: 0.0012          # you are here
-  - iteration: 90
-    lr: 0.0012          # HOLD: stabilize while KL is hot
   - iteration: 100
-    lr: 0.0008          # 90→100 smooth drop (glide window)
+    lr: 0.0008
   - iteration: 250
-    lr: 0.0008          # HOLD: main learning
-  - iteration: 260
-    lr: 0.0004          # 250→260 smooth drop
+    lr: 0.0004
   - iteration: 400
-    lr: 0.0004          # HOLD through end (no last-minute over-freeze)
-  - iteration: 500
-    lr: 0.00025
+    lr: 0.0002                # Fine-tuning — small updates, polishing play
 
   # Exploration temperature (first N moves only; you already have temperature_threshold=15)
   temperature_schedule:
@@ -284,8 +274,6 @@ iteration:
   mcts_schedule:
   - iteration: 0
     simulations: 192
-  - iteration: 45
-    simulations: 208
   - iteration: 80
     simulations: 224
   - iteration: 180
@@ -294,17 +282,11 @@ iteration:
     simulations: 288
   - iteration: 420
     simulations: 320
-  - iteration: 470
-    simulations: 352
-  - iteration: 500
-    simulations: 384
 
   # Keep batching stable early; reduce parallelism later as sims increase (less need for wide leaf batching)
   parallel_leaves_schedule:
   - iteration: 0
     parallel_leaves: 64
-  - iteration: 45
-    parallel_leaves: 56
   - iteration: 200
     parallel_leaves: 48
   - iteration: 380
@@ -322,6 +304,8 @@ iteration:
     alpha: 0.05
   - iteration: 400
     alpha: 0.04
+  - iteration: 460
+    alpha: 0.03
 
   # KataGo dynamic score utility ramp: start at 0 while score head is near-random,
   # ramp to full 0.30 by iter80 once the score head has learned meaningful predictions.
@@ -334,10 +318,6 @@ iteration:
     dynamic_score_utility_weight: 0.10
   - iteration: 25
     dynamic_score_utility_weight: 0.20
-  - iteration: 32
-    dynamic_score_utility_weight: 0.24
-  - iteration: 36
-    dynamic_score_utility_weight: 0.27
   - iteration: 40
     dynamic_score_utility_weight: 0.30
 
@@ -389,40 +369,28 @@ iteration:
   # Games schedule: enforce sims×games ≈ 172,800 constant wall-clock
   games_schedule:
   - iteration: 0
-    games: 900        # 192*900 = 172,800
-  - iteration: 45
-    games: 831        # 208*831 = 172,848 (close)
+    games: 900   # 192*900 = 172,800
   - iteration: 80
-    games: 771        # 224*771 = 172,704
+    games: 771   # 224*771 = 172,704 (close; or 770 -> 172,480)
   - iteration: 180
-    games: 675        # 256*675 = 172,800
+    games: 675   # 256*675 = 172,800
   - iteration: 300
-    games: 600        # 288*600 = 172,800
+    games: 600   # 288*600 = 172,800
   - iteration: 420
-    games: 540        # 320*540 = 172,800
-  - iteration: 470
-    games: 491        # 352*491 = 172,832 (close)
-  - iteration: 500
-    games: 450        # 384*450 = 172,800
+    games: 540   # 320*540 = 172,800
 
   # Window: widen to keep ~300k buffer as positions/iter shrink (positions ≈ games*42)
   window_iterations_schedule:
   - iteration: 0
-    window_iterations: 8
-  - iteration: 45
-    window_iterations: 9     # prevents 'underfilled buffer' at games=831
+    window_iterations: 8    # 900*42*8 = 302,400
   - iteration: 80
-    window_iterations: 10
+    window_iterations: 10   # 771*42*10 = 323,820 (capped by max_size)
   - iteration: 180
-    window_iterations: 11
+    window_iterations: 11   # 675*42*11 = 311,850
   - iteration: 300
-    window_iterations: 12
+    window_iterations: 12   # 600*42*12 = 302,400
   - iteration: 420
-    window_iterations: 14
-  - iteration: 470
-    window_iterations: 15
-  - iteration: 500
-    window_iterations: 16
+    window_iterations: 14   # 540*42*14 = 317,520 (capped)
 
 inference:
   batch_size: 512

@@ -30,42 +30,34 @@ from torch.utils.data import Dataset, DataLoader, IterableDataset, Sampler
 from torch.utils.tensorboard import SummaryWriter
 
 from src.network.model import PatchworkNetwork, ValueHead, create_network, load_model_checkpoint
-from src.training.replay_buffer import _validate_score_margins, SCORE_MARGIN_MAX_ABS
 from src.network.d4_augmentation import (
     apply_d4_augment_batch,
     apply_ownership_transform_batch,
 )
 from src.network.d4_augmentation_gpu import apply_d4_augment_batch_gpu
 
-logger = logging.getLogger(__name__)
-
 
 def make_gaussian_score_targets(
-    score_margins_tanh: torch.Tensor,
-    score_utility_scale: float,
-    score_min: int,
-    score_max: int,
-    sigma: float,
+    margins: torch.Tensor,
+    score_min: int = -100,
+    score_max: int = 100,
+    sigma: float = 1.5,
     bin_vals: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Build (B, 201) soft label distributions from tanh-normalised score_margins (replay schema).
+    """Build (B, 201) soft label distributions from raw integer margins.
 
-    Replay stores score_margins in [-1, 1] (tanh). Derive point margin: margin_points = scale * atanh(m).
-    Then Gaussian over bins centred at margin_points, normalised to sum to 1.
+    Each row is a Gaussian centred on the clamped margin with the given sigma,
+    normalised to sum to 1.  All computation is in float32.
     """
-    m = score_margins_tanh.float().clamp(-0.999999, 0.999999)
-    margin_points = (score_utility_scale * torch.atanh(m)).round().clamp(float(score_min), float(score_max))
+    m = margins.float().clamp(float(score_min), float(score_max))  # (B,)
     if bin_vals is None:
-        bin_vals = torch.arange(
-            score_min, score_max + 1,
-            device=margin_points.device, dtype=torch.float32,
-        )
-    # (B,) and (201,) -> (B, 201)
-    diff = bin_vals.unsqueeze(0) - margin_points.unsqueeze(1)
-    weights = torch.exp(-0.5 * (diff / sigma) ** 2)
-    weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        bin_vals = torch.arange(score_min, score_max + 1, device=margins.device, dtype=torch.float32)
+    diff = bin_vals.unsqueeze(0) - m.unsqueeze(1)  # (B, 201)
+    weights = torch.exp(-0.5 * (diff / sigma) ** 2)  # (B, 201)
+    weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
     return weights
 
+logger = logging.getLogger(__name__)
 
 IndexLike = Union[int, List[int], Tuple[int, ...], np.ndarray, torch.Tensor]
 
@@ -267,11 +259,6 @@ class PatchworkDataset(Dataset):
                 )
             if self.has_score_margins:
                 self._score_margins = np.array(f["score_margins"], dtype=np.float32)
-                _validate_score_margins(
-                    self._score_margins,
-                    max_abs=SCORE_MARGIN_MAX_ABS,
-                    source=str(h5_path),
-                )
             else:
                 self._score_margins = np.zeros(self.num_samples, dtype=np.float32)
             if "slot_piece_ids" in f:
@@ -486,11 +473,10 @@ class Trainer:
         optimizer_state_checkpoint: Optional[str] = None,
         model_source_checkpoint: Optional[str] = None,
         current_iteration: int = 0,
-        *,
-        force_resume_optimizer_state: bool = False,
-        force_resume_scheduler_state: bool = False,
-        force_resume_scaler_state: bool = False,
-        force_resume_ema: bool = False,
+        force_resume_optimizer_state: Optional[bool] = None,
+        force_resume_scheduler_state: Optional[bool] = None,
+        force_resume_scaler_state: Optional[bool] = None,
+        force_resume_ema: Optional[bool] = None,
     ):
         self.network = network
         self.config = config
@@ -526,17 +512,19 @@ class Trainer:
 
         self.policy_weight = train_config["policy_loss_weight"]
         self.value_weight = train_config["value_loss_weight"]
-        self.score_loss_weight = float(train_config.get("score_loss_weight", 0.02))
-        self.score_utility_scale = float(train_config.get("score_utility_scale", 30.0))
-        self.score_bins_min = int(train_config.get("score_bins_min", getattr(ValueHead, "SCORE_MIN", -100)))
-        self.score_bins_max = int(train_config.get("score_bins_max", getattr(ValueHead, "SCORE_MAX", 100)))
-        self.score_target_sigma = float(train_config.get("score_target_sigma", 1.5))
-        self._score_bin_vals: Optional[torch.Tensor] = None
+        self.score_loss_weight = float(train_config.get("score_loss_weight", 0.01))
         self.ownership_weight = float(train_config.get("ownership_loss_weight", 0.0))
         self.max_grad_norm = train_config["max_grad_norm"]
+        self.score_target_sigma = float(train_config.get("score_target_sigma", 1.5))
+        self.score_min = int(train_config.get("score_min", -100))
+        self.score_max = int(train_config.get("score_max", 100))
 
-        # Optional CE/entropy decomposition debug: log a few step-level samples.
-        self._ce_debug_steps_remaining = int(train_config.get("ce_identity_debug_steps", 0))
+        # Guardrail state for persistent gradient ratio monitoring
+        self._grad_ratio_high_count = 0
+        self._grad_ratio_low_count = 0
+
+        # Cached bin tensor for make_gaussian_score_targets (avoids torch.arange per batch)
+        self._score_bin_vals: Optional[torch.Tensor] = None
 
         # Use shared SummaryWriter if provided, otherwise create one (for standalone use)
         if writer is not None:
@@ -546,7 +534,6 @@ class Trainer:
             self.writer = SummaryWriter(log_dir=log_dir / "tensorboard")
             self._owns_writer = True
         self.global_step = global_step_offset
-        self._lr_log_step_ceiling = global_step_offset + 5  # Log LR/scheduler for first 5 steps of this iteration
         self.current_epoch = 0
         self.best_val_loss = float("inf")
 
@@ -583,43 +570,38 @@ class Trainer:
             self._ema_tensors: List[torch.Tensor] = []
             self._param_tensors: List[torch.Tensor] = []
 
-        # Resume optimizer/scheduler/scaler/EMA from checkpoint.
-        # Main sets force_resume_* (e.g. False for seed warm-start); that is the definitive decision.
-        resume_opt = force_resume_optimizer_state
-        resume_sched = force_resume_scheduler_state
-        resume_scaler = force_resume_scaler_state
-        if resume_opt or resume_sched or resume_scaler or force_resume_ema:
+        # Resume optimizer/scheduler/scaler/EMA from checkpoint (only when enabled).
+        # force_resume_* override config; used for boundary-only resume from committed checkpoint.
+        resume_opt = (
+            force_resume_optimizer_state
+            if force_resume_optimizer_state is not None
+            else bool(train_config.get("resume_optimizer_state", False))
+        )
+        resume_sched = (
+            force_resume_scheduler_state
+            if force_resume_scheduler_state is not None
+            else bool(train_config.get("resume_scheduler_state", False))
+        )
+        resume_scaler = (
+            force_resume_scaler_state
+            if force_resume_scaler_state is not None
+            else bool(train_config.get("resume_scaler_state", resume_opt))
+        )
+        resume_ema = (
+            force_resume_ema
+            if force_resume_ema is not None
+            else False
+        )
+        if resume_opt or resume_sched or resume_ema:
             if optimizer_state_checkpoint and Path(optimizer_state_checkpoint).exists():
                 self._try_load_optimizer_state(
                     optimizer_state_checkpoint,
                     resume_opt=resume_opt,
                     resume_sched=resume_sched,
                     resume_scaler=resume_scaler,
-                    resume_ema=force_resume_ema,
+                    resume_ema=resume_ema,
                     model_source=model_source_checkpoint or optimizer_state_checkpoint,
                 )
-
-        # Phase boundary + cosine_warmup_per_phase: we did not load scheduler, so last_epoch would be
-        # 0,1,2,... (iter-local). The lambda expects global step. Align last_epoch so progress is correct.
-        if (
-            self._is_phase_boundary()
-            and train_config.get("lr_schedule") == "cosine_warmup_per_phase"
-        ):
-            phase_start_step = self._get_phase_start_step()
-            self.scheduler.last_epoch = phase_start_step  # type: ignore[attr-defined]
-            logger.debug(
-                "[LR] phase boundary iter=%d: scheduler.last_epoch=%d (global step alignment)",
-                self.current_iteration, phase_start_step,
-            )
-
-        # Log phase LR and scheduler state at iteration start (debug only, not terminal)
-        iter_lr = float(train_config.get("learning_rate", 0.0))
-        opt_lr = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 0.0
-        sched_step = getattr(self.scheduler, "last_epoch", None)
-        logger.debug(
-            "[LR] iteration_start current_iteration=%d iter_lr=%.2e optimizer_lr=%.2e scheduler_last_epoch=%s",
-            self.current_iteration, iter_lr, opt_lr, sched_step,
-        )
 
     def close(self) -> None:
         """Release resources (TensorBoard writer if owned by this Trainer)."""
@@ -659,30 +641,6 @@ class Trainer:
             )
         raise ValueError(f"Unknown optimizer: {opt_name}")
 
-    def _is_phase_boundary(self) -> bool:
-        """True if current_iteration is the start of a new LR phase (iteration in lr_schedule).
-        Used to skip loading scheduler state so the new phase gets full warmup."""
-        entries = sorted(
-            self.config.get("iteration", {}).get("lr_schedule", []) or [{"iteration": 0}],
-            key=lambda x: x["iteration"],
-        )
-        phase_starts = {ent["iteration"] for ent in entries}
-        return self.current_iteration in phase_starts
-
-    def _get_phase_start_step(self) -> int:
-        """Global step index at which the current LR phase starts (for cosine_warmup_per_phase).
-        Used to align scheduler last_epoch with global step when not loading at phase boundary."""
-        lr_entries = sorted(
-            self.config.get("iteration", {}).get("lr_schedule", [])
-            or [{"iteration": 0, "lr": self.config.get("training", {}).get("learning_rate", 0.001)}],
-            key=lambda x: x["iteration"],
-        )
-        phase_start_iter = 0
-        for ent in lr_entries:
-            if self.current_iteration >= ent["iteration"]:
-                phase_start_iter = ent["iteration"]
-        return phase_start_iter * self.total_train_steps
-
     def _try_load_optimizer_state(
         self,
         checkpoint_path: str,
@@ -702,49 +660,12 @@ class Trainer:
             return
         opt_loaded = sched_loaded = scaler_loaded = ema_loaded = False
         if resume_opt and "optimizer_state_dict" in ckpt:
-            # Defensive: skip load if checkpoint optimizer state has different param shapes (e.g. seed from another arch).
             try:
-                od = ckpt["optimizer_state_dict"]
-                ckpt_states = od.get("state", [])
-                if isinstance(ckpt_states, dict):
-                    ckpt_states = list(ckpt_states.values())
-                current_params = [p for pg in self.optimizer.param_groups for p in pg["params"]]
-                if len(ckpt_states) != len(current_params):
-                    raise ValueError(
-                        f"optimizer state param count {len(ckpt_states)} != current {len(current_params)}"
-                    )
-                for i, p in enumerate(current_params):
-                    if i >= len(ckpt_states):
-                        break
-                    st = ckpt_states[i]
-                    exp_avg = st.get("exp_avg")
-                    if exp_avg is not None and hasattr(exp_avg, "shape") and exp_avg.shape != p.shape:
-                        raise ValueError(
-                            f"param {i} shape mismatch: ckpt {exp_avg.shape} vs current {p.shape}"
-                        )
-                self.optimizer.load_state_dict(od)
+                self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                 opt_loaded = True
-                # Peak LR must follow iteration.lr_schedule; load_state_dict restores checkpoint LR
-                # and overwrites the phase LR we set in config. Force phase LR after load.
-                iter_lr = float(self.config.get("training", {}).get("learning_rate", 0.0))
-                for pg in self.optimizer.param_groups:
-                    pg["lr"] = iter_lr
-                opt_lr_after = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 0.0
-                logger.debug(
-                    "[OPT_RESUME] LR after load: iter_lr=%.2e optimizer_lr_after_load=%.2e checkpoint=%s",
-                    iter_lr, opt_lr_after, checkpoint_path,
-                )
             except Exception as e:
                 logger.warning("[OPT_RESUME] Optimizer state mismatch, using fresh: %s", e)
-        # At phase boundaries we want warmup for the new phase; loading scheduler state would
-        # continue last_epoch and skip warmup. Skip loading scheduler when starting a new phase.
-        at_phase_boundary = self._is_phase_boundary()
-        if at_phase_boundary and resume_sched:
-            logger.debug(
-                "[OPT_RESUME] phase boundary iter=%d: not loading scheduler state (fresh warmup for this phase)",
-                self.current_iteration,
-            )
-        if resume_sched and "scheduler_state_dict" in ckpt and not at_phase_boundary:
+        if resume_sched and "scheduler_state_dict" in ckpt:
             try:
                 self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
                 sched_loaded = True
@@ -770,16 +691,9 @@ class Trainer:
         train_base = model_source if model_source is not None else checkpoint_path
         logger.info(
             "[OPT_RESUME] source=%s train_base=%s (must match)  enabled=opt:%s sched:%s scaler:%s ema:%s  loaded=opt:%s sched:%s scaler:%s ema:%s",
-            checkpoint_path,
-            train_base,
-            resume_opt,
-            resume_sched,
-            resume_scaler,
-            resume_ema,
-            opt_loaded,
-            sched_loaded,
-            scaler_loaded,
-            ema_loaded,
+            checkpoint_path, train_base,
+            resume_opt, resume_sched, resume_scaler, resume_ema,
+            opt_loaded, sched_loaded, scaler_loaded, ema_loaded,
         )
 
     def _create_scheduler(self, config: dict):
@@ -819,51 +733,41 @@ class Trainer:
             return optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
         if schedule_type == "cosine_warmup_per_phase":
-            # Phases from iteration.lr_schedule; warmup once per phase, no restart each iteration
+            # Phases from iteration.lr_schedule; warmup once per phase, no restart each iteration.
+            # CRITICAL: LambdaLR multiplies optimizer base_lr by lambda. Optimizer uses
+            # training.learning_rate. To get phase base = iter_lr, we must scale lambda by
+            # (iter_lr / base_lr) so that actual_lr = base_lr * (iter_lr/base_lr) * ratio = iter_lr * ratio.
+            base_lr = config["learning_rate"]
             lr_entries = sorted(
                 self.config.get("iteration", {}).get("lr_schedule", [])
-                or [{"iteration": 0, "lr": config["learning_rate"]}],
+                or [{"iteration": 0, "lr": base_lr}],
                 key=lambda x: x["iteration"],
             )
-            iter_lr = config["learning_rate"]
+            iter_lr = base_lr
             phase_start_iter = 0
             phase_end_iter = 999999
-            phase_end_lr = iter_lr
             for i, ent in enumerate(lr_entries):
                 if self.current_iteration >= ent["iteration"]:
                     iter_lr = ent["lr"]
                     phase_start_iter = ent["iteration"]
-                    if i + 1 < len(lr_entries):
-                        phase_end_iter = lr_entries[i + 1]["iteration"]
-                        phase_end_lr = lr_entries[i + 1]["lr"]
-                    else:
-                        phase_end_iter = 999999
-                        phase_end_lr = iter_lr
+                    phase_end_iter = lr_entries[i + 1]["iteration"] if i + 1 < len(lr_entries) else 999999
+            phase_scale = iter_lr / base_lr if base_lr > 0 else 1.0
             iters_in_phase = max(1, phase_end_iter - phase_start_iter)
             phase_total_steps = iters_in_phase * self.total_train_steps
-            phase_start_step = phase_start_iter * self.total_train_steps  # global step at which this phase starts
+            warmup_steps_cfg = config.get("warmup_steps", 200)
+            warmup_steps = min(warmup_steps_cfg, max(1, phase_total_steps // 10))
             min_lr = config.get("min_lr", iter_lr / 50)
             min_lr_ratio = min_lr / iter_lr if iter_lr > 0 else 0.0
-            # Hold: same LR at start and end → flat.
-            # Step-down: next phase LR lower → cosine decay to next LR (seamless merge at boundary).
-            # No per-phase warmup: we already merge into each phase's starting LR from the previous phase.
-            phase_is_hold = phase_end_lr == iter_lr
-            if phase_end_lr < iter_lr:
-                # Decay toward next phase LR (neat merge); floor at min_lr
-                end_ratio = max(min_lr_ratio, phase_end_lr / iter_lr) if iter_lr > 0 else min_lr_ratio
-            else:
-                end_ratio = 1.0  # hold (same or step-up)
 
             def lr_lambda(step):
-                # step is global; convert to steps within this phase so progress 0→1 across the phase
-                step_in_phase = step - phase_start_step
-                step_in_phase = max(0, min(step_in_phase, phase_total_steps))
-                if phase_is_hold:
-                    return 1.0
-                progress = step_in_phase / max(1, phase_total_steps)
-                progress = min(progress, 1.0)
-                cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))  # 1.0 -> 0.0 as progress 0 -> 1
-                return end_ratio + (1.0 - end_ratio) * cosine_decay
+                if step < warmup_steps:
+                    ratio = step / max(1, warmup_steps)
+                else:
+                    progress = (step - warmup_steps) / max(1, phase_total_steps - warmup_steps)
+                    progress = min(progress, 1.0)
+                    cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+                    ratio = min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+                return phase_scale * ratio
 
             return optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
@@ -913,6 +817,10 @@ class Trainer:
             values = batch["values"].to(self.device, non_blocking=True)
             score_margins = batch["score_margins"].to(self.device, non_blocking=True)
             ownerships = batch["ownerships"].to(self.device, non_blocking=True)
+            # PCR hidden-killer metric: fraction of samples with all-zero policy targets (masked in loss)
+            with torch.no_grad():
+                pi_sum = policies.sum(dim=1)
+                fraction_zero_pi = (pi_sum == 0).float().mean().item()
             _t1 = time.perf_counter() if _t0 is not None else None
 
             slot_piece_ids = batch["slot_piece_ids"]
@@ -977,19 +885,19 @@ class Trainer:
             xt = x_track.to(self.device, non_blocking=True) if x_track is not None else None
             si = shop_ids.to(self.device, non_blocking=True) if shop_ids is not None else None
             sf = shop_feats.to(self.device, non_blocking=True) if shop_feats is not None else None
-            # 201-bin: build soft target from tanh score_margins (replay schema unchanged).
+            # Build soft score target distribution from raw integer margins
             target_score_dist = None
             if self.score_loss_weight > 0:
                 if self._score_bin_vals is None or self._score_bin_vals.device != score_margins.device:
                     self._score_bin_vals = torch.arange(
-                        self.score_bins_min, self.score_bins_max + 1,
+                        self.score_min, self.score_max + 1,
                         device=score_margins.device, dtype=torch.float32,
                     )
                 target_score_dist = make_gaussian_score_targets(
-                    score_margins, self.score_utility_scale,
-                    self.score_bins_min, self.score_bins_max,
-                    self.score_target_sigma, bin_vals=self._score_bin_vals,
+                    score_margins, self.score_min, self.score_max, self.score_target_sigma,
+                    bin_vals=self._score_bin_vals,
                 )
+
             if self.use_amp:
                 with autocast(device_type="cuda", dtype=self._autocast_dtype):
                     loss, metrics = self.network.get_loss(
@@ -1014,25 +922,6 @@ class Trainer:
                         x_global=xg, x_track=xt, shop_ids=si, shop_feats=sf,
                     )
             _t3 = time.perf_counter() if _t0 is not None else None
-
-            if (
-                self._ce_debug_steps_remaining > 0
-                and "policy_loss" in metrics
-                and "policy_entropy" in metrics
-                and "target_entropy" in metrics
-                and "kl_divergence" in metrics
-                and "ce_minus_policy_entropy" in metrics
-            ):
-                logger.info(
-                    "[CE_DEBUG] step=%d pol_loss=%.4f pol_ent=%.4f tgt_ent=%.4f kl=%.4f ce_minus_H=%.4f",
-                    self.global_step,
-                    metrics["policy_loss"],
-                    metrics["policy_entropy"],
-                    metrics["target_entropy"],
-                    metrics["kl_divergence"],
-                    metrics["ce_minus_policy_entropy"],
-                )
-                self._ce_debug_steps_remaining -= 1
 
             step_skipped = False
             if self.use_amp and self.scaler is not None:
@@ -1069,6 +958,8 @@ class Trainer:
 
             for k, v in metrics.items():
                 epoch_metrics[k] = epoch_metrics.get(k, 0.0) + float(v)
+            epoch_metrics["fraction_zero_pi"] = epoch_metrics.get("fraction_zero_pi", 0.0) + fraction_zero_pi
+            epoch_metrics["fraction_zero_pi_count"] = epoch_metrics.get("fraction_zero_pi_count", 0) + 1
             gn = float(grad_norm.item())
             if math.isfinite(gn):
                 epoch_metrics["grad_norm"] = epoch_metrics["grad_norm"] + gn
@@ -1077,19 +968,6 @@ class Trainer:
 
             num_batches += 1
             self.global_step += 1
-
-            # Log LR/scheduler for first few steps (debug only, not terminal). warmup is heuristic:
-            # lr < 0.999*peak can mislabel post-warmup as True when cosine has already decayed slightly.
-            if self.global_step < self._lr_log_step_ceiling:
-                step_in_iter = self.global_step - (self._lr_log_step_ceiling - 5)
-                current_lr = self.scheduler.get_last_lr()[0]
-                sched_step = getattr(self.scheduler, "last_epoch", None)
-                iter_lr = float(self.config.get("training", {}).get("learning_rate", 0.0))
-                in_warmup = current_lr < iter_lr * 0.999 if iter_lr > 0 else False
-                logger.debug(
-                    "[LR] step %d (step_in_iter=%d) lr=%.2e scheduler_last_epoch=%s warmup=%s",
-                    self.global_step, step_in_iter, current_lr, sched_step, in_warmup,
-                )
 
             if _t0 is not None and _t1 is not None and _t2 is not None and _t3 is not None and _t4 is not None and _t5 is not None:
                 total_ms = (time.perf_counter() - _t0) * 1000
@@ -1111,12 +989,97 @@ class Trainer:
                           "policy_top5_accuracy"):
                     if k in metrics:
                         self.writer.add_scalar(f"train/{k}", metrics[k], self.global_step)
+                # PCR hidden-killer: high fraction_zero_pi starves policy learning
+                self.writer.add_scalar("train/fraction_zero_pi", fraction_zero_pi, self.global_step)
+                if self.global_step % 500 == 0 and fraction_zero_pi > 0.01:
+                    logger.info("[PCR] fraction_zero_pi=%.3f at step %d (high rate can starve policy learning)", fraction_zero_pi, self.global_step)
                 # Auxiliary head losses (only log when non-zero)
                 for k in ("ownership_loss", "score_loss"):
                     if metrics.get(k, 0.0) > 0:
                         self.writer.add_scalar(f"train/{k}", metrics[k], self.global_step)
                 self.writer.add_scalar("train/grad_norm", grad_norm.item(), self.global_step)
                 self.writer.add_scalar("train/learning_rate", self.scheduler.get_last_lr()[0], self.global_step)
+
+                # --- Extended score distribution metrics ---
+                if metrics.get("score_ce_raw", 0.0) > 0:
+                    self.writer.add_scalar("loss/score_ce_raw", metrics["score_ce_raw"], self.global_step)
+                    self.writer.add_scalar("loss/score_ce_weighted", metrics["score_ce_weighted"], self.global_step)
+                    val_w = self.value_weight * metrics.get("value_loss", 0.0)
+                    pol_w = self.policy_weight * metrics.get("policy_loss", 0.0)
+                    self.writer.add_scalar("loss/value_weighted", val_w, self.global_step)
+                    self.writer.add_scalar("loss/policy_weighted", pol_w, self.global_step)
+                    sce_w = metrics["score_ce_weighted"]
+                    self.writer.add_scalar("ratio/score_to_value_loss", sce_w / (val_w + 1e-12), self.global_step)
+                    self.writer.add_scalar("ratio/score_to_policy_loss", sce_w / (pol_w + 1e-12), self.global_step)
+                    self.writer.add_scalar("score/entropy", metrics["score_entropy"], self.global_step)
+                    self.writer.add_scalar("score/pred_mean", metrics["score_pred_mean"], self.global_step)
+                    self.writer.add_scalar("score/pred_std", metrics["score_pred_std"], self.global_step)
+                    self.writer.add_scalar("score/target_mean", metrics["score_tgt_mean"], self.global_step)
+                    self.writer.add_scalar("score/mae_mean", metrics["score_mae_mean"], self.global_step)
+                    self.writer.add_scalar("score/entropy_expected_uniform", math.log(201), self.global_step)
+
+                # --- Per-head gradient norms (after backward, before step) ---
+                try:
+                    gn_value = 0.0
+                    gn_score = 0.0
+                    gn_policy = 0.0
+                    for name, p in self.network.named_parameters():
+                        if p.requires_grad and p.grad is not None:
+                            g2 = float(p.grad.data.float().norm(2).item() ** 2)
+                            if "value_head.fc2" in name:
+                                gn_value += g2
+                            elif "value_head.score_head" in name:
+                                gn_score += g2
+                            elif "policy_head" in name:
+                                gn_policy += g2
+                    gn_value = gn_value ** 0.5
+                    gn_score = gn_score ** 0.5
+                    gn_policy = gn_policy ** 0.5
+                    self.writer.add_scalar("gradnorm/value_out", gn_value, self.global_step)
+                    self.writer.add_scalar("gradnorm/score_out", gn_score, self.global_step)
+                    self.writer.add_scalar("gradnorm/policy_head", gn_policy, self.global_step)
+                    ratio_sv = gn_score / (gn_value + 1e-12)
+                    self.writer.add_scalar("ratio_grad/score_to_value", ratio_sv, self.global_step)
+
+                    # Guardrails: track persistent gradient ratio anomalies
+                    if ratio_sv > 5.0:
+                        self._grad_ratio_high_count += 1
+                    else:
+                        self._grad_ratio_high_count = 0
+                    if ratio_sv < 0.05:
+                        self._grad_ratio_low_count += 1
+                    else:
+                        self._grad_ratio_low_count = 0
+                    if self._grad_ratio_high_count > 200:
+                        logger.warning(
+                            "GUARDRAIL: ratio_grad/score_to_value > 5.0 for %d consecutive logged steps. "
+                            "Score head may dominate. Consider reducing score_loss_weight.",
+                            self._grad_ratio_high_count,
+                        )
+                    if self._grad_ratio_low_count > 200:
+                        logger.warning(
+                            "GUARDRAIL: ratio_grad/score_to_value < 0.05 for %d consecutive logged steps. "
+                            "Score head may not be learning.",
+                            self._grad_ratio_low_count,
+                        )
+                except Exception:
+                    pass
+
+                # Guardrail: score entropy collapse / stagnation
+                if metrics.get("score_entropy", 0.0) > 0:
+                    se = metrics["score_entropy"]
+                    if self.global_step < 5000 and se < 1.0:
+                        logger.warning(
+                            "GUARDRAIL: score entropy %.3f < 1.0 at step %d (< 5k). "
+                            "Likely distribution collapse.",
+                            se, self.global_step,
+                        )
+                    if self.global_step > 50000 and se > 5.2:
+                        logger.warning(
+                            "GUARDRAIL: score entropy %.3f > 5.2 at step %d (> 50k). "
+                            "Score head may not be learning (near-uniform).",
+                            se, self.global_step,
+                        )
 
             if val_loader is not None and self.global_step % self.config["training"]["val_frequency"] == 0:
                 val_metrics = self.validate(val_loader)
@@ -1142,9 +1105,11 @@ class Trainer:
         epoch_metrics["grad_norm"] = epoch_metrics["grad_norm"] / max(1, cnt)
         steps_skipped_sum = epoch_metrics.pop("steps_skipped", 0)
         epoch_metrics["step_skip_rate"] = steps_skipped_sum / max(1, num_batches)
+        fz_cnt = epoch_metrics.pop("fraction_zero_pi_count", 0)
+        epoch_metrics["fraction_zero_pi"] = epoch_metrics.get("fraction_zero_pi", 0.0) / max(1, fz_cnt)
 
         for k in epoch_metrics:
-            if k in ("grad_norm", "step_skip_rate"):
+            if k in ("grad_norm", "step_skip_rate", "fraction_zero_pi"):
                 continue
             epoch_metrics[k] /= max(1, num_batches)
 
@@ -1200,13 +1165,12 @@ class Trainer:
                 if self.score_loss_weight > 0:
                     if self._score_bin_vals is None or self._score_bin_vals.device != score_margins.device:
                         self._score_bin_vals = torch.arange(
-                            self.score_bins_min, self.score_bins_max + 1,
+                            self.score_min, self.score_max + 1,
                             device=score_margins.device, dtype=torch.float32,
                         )
                     target_score_dist = make_gaussian_score_targets(
-                        score_margins, self.score_utility_scale,
-                        self.score_bins_min, self.score_bins_max,
-                        self.score_target_sigma, bin_vals=self._score_bin_vals,
+                        score_margins, self.score_min, self.score_max, self.score_target_sigma,
+                        bin_vals=self._score_bin_vals,
                     )
                 if self.use_amp:
                     with autocast(device_type="cuda", dtype=self._autocast_dtype):
@@ -1375,10 +1339,7 @@ def train_iteration(
     iteration_output_dir: Optional[Path] = None,
     merged_output_path: Optional[str] = None,
     *,
-    force_resume_optimizer_state: bool = False,
-    force_resume_scheduler_state: bool = False,
-    force_resume_scaler_state: bool = False,
-    force_resume_ema: bool = False,
+    is_first_iteration_after_resume: bool = False,
 ) -> Tuple[str, Dict, int]:
     """
     Train the network for one iteration.
@@ -1408,6 +1369,11 @@ def train_iteration(
                               (for transactional staging); else use checkpoint_dir.
         merged_output_path: If provided (with replay_buffer), write merged HDF5 here
                             for atomic staging; else use buffer_dir default.
+        is_first_iteration_after_resume: True only on process restart (first iter after
+                            auto_resume). When True and resume_from_committed_state is set,
+                            optimizer/EMA/scheduler/scaler are loaded from the committed
+                            checkpoint. When False (normal iteration-to-iteration), they are
+                            recreated to avoid freezing momentum/EMA at the boundary.
 
     Returns:
         (checkpoint_path, avg_metrics, final_global_step)
@@ -1517,21 +1483,59 @@ def train_iteration(
             "optimizer_state_checkpoint must equal model source (train_base); "
             "got optimizer=%s model=%s"
         ) % (optimizer_state_ckpt, previous_checkpoint)
+
+    # Boundary-only resume: load optimizer/EMA/scheduler/scaler from COMMITTED checkpoint
+    # ONLY on process restart (first iteration after auto_resume). Never on normal
+    # iteration-to-iteration progression, or we would freeze momentum/EMA at the boundary.
+    # previous_checkpoint is always from committed (train_base); never from staging.
+    train_cfg = config.get("training", {}) or {}
+    resume_from_committed = bool(train_cfg.get("resume_from_committed_state", False))
+    load_committed_state = (
+        resume_from_committed
+        and optimizer_state_ckpt is not None
+        and is_first_iteration_after_resume
+    )
+    # Belt-and-suspenders: log boundary-resume decision so behavior is unambiguous
+    if resume_from_committed and optimizer_state_ckpt:
+        logger.info(
+            "[BOUNDARY-RESUME] is_first_iteration_after_resume=%s previous_checkpoint=%s load_committed_state=%s",
+            is_first_iteration_after_resume,
+            previous_checkpoint,
+            load_committed_state,
+        )
+    # Belt-and-suspenders: when resuming, checkpoint must be under checkpoints/ or committed/, never staging
+    if is_first_iteration_after_resume and previous_checkpoint:
+        resolved = Path(previous_checkpoint).resolve()
+        paths_cfg = config.get("paths", {}) or {}
+        run_root = Path(paths_cfg.get("run_dir", ".")).resolve()
+        ckpt_dir = Path(paths_cfg.get("checkpoints_dir", str(run_root / "checkpoints"))).resolve()
+        committed_root = (run_root / "committed").resolve()
+        staging_root = (run_root / "staging").resolve()
+        under_ckpt = str(resolved).startswith(str(ckpt_dir))
+        under_comm = str(resolved).startswith(str(committed_root))
+        under_staging = str(resolved).startswith(str(staging_root))
+        assert under_ckpt or under_comm, (
+            "Boundary resume checkpoint must be under checkpoints/ or committed/: %s"
+        ) % previous_checkpoint
+        assert not under_staging, (
+            "Boundary resume must never use staging checkpoint: %s"
+        ) % previous_checkpoint
+    force_opt = force_sched = force_scaler = force_ema = None
+    if load_committed_state:
+        force_opt = force_sched = force_scaler = force_ema = True
+
     trainer = Trainer(
-        network,
-        config,
-        device,
-        log_dir,
+        network, config, device, log_dir,
         total_train_steps=total_train_steps,
         writer=writer,
         global_step_offset=global_step_offset,
         optimizer_state_checkpoint=optimizer_state_ckpt,
         model_source_checkpoint=previous_checkpoint,
         current_iteration=iteration,
-        force_resume_optimizer_state=force_resume_optimizer_state,
-        force_resume_scheduler_state=force_resume_scheduler_state,
-        force_resume_scaler_state=force_resume_scaler_state,
-        force_resume_ema=force_resume_ema,
+        force_resume_optimizer_state=force_opt,
+        force_resume_scheduler_state=force_sched,
+        force_resume_scaler_state=force_scaler,
+        force_resume_ema=force_ema,
     )
     logger.debug(f"TensorBoard logging from global_step={trainer.global_step}")
 
@@ -1591,8 +1595,6 @@ def train_iteration(
         checkpoint_path = trainer.checkpoint_dir / f"iteration_{iteration:03d}.pt"
         trainer.save_checkpoint(checkpoint_path.name)
 
-    last_lr = float(trainer.scheduler.get_last_lr()[0])
-
     avg_metrics: Dict[str, float] = {}
     if all_metrics:
         for key in all_metrics[0].keys():
@@ -1602,7 +1604,7 @@ def train_iteration(
                        "policy_accuracy": 0.0, "policy_top5_accuracy": 0.0, "value_mse": 0.0,
                        "grad_norm": 0.0}
 
-    return str(checkpoint_path), avg_metrics, trainer.global_step, last_lr
+    return str(checkpoint_path), avg_metrics, trainer.global_step
 
 
 if __name__ == "__main__":

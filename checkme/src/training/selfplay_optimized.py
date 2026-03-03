@@ -233,7 +233,7 @@ class OptimizedSelfPlayWorker:
         # MAJOR FIX: Enforce max_game_length from config
         self.max_game_length = int(sp.get("max_game_length", 200))
 
-        # KataGo Dual-Head: value is strictly -1/0/1; score is raw margin
+        # KataGo Dual-Head: value is strictly -1/0/1; score is raw integer margin (points)
 
         # Q-value mixing (Oracle Part 4 / Leela Chess Zero):
         # Mix root MCTS Q-value with game outcome for value targets.
@@ -400,9 +400,10 @@ class OptimizedSelfPlayWorker:
             _, mask = encode_legal_actions_fast(legal)
 
             if self.network_path and self.mcts is not None:
-                # KataGo Playout Cap Randomization: use fewer sims for some moves
-                # to diversify training data. "Fast" moves still contribute to the
-                # policy target but with less search depth.
+                # KataGo Playout Cap Randomization: randomly use fewer sims for
+                # some moves to increase game throughput and position diversity.
+                # Fast moves get all-zeros policy target (excluded from policy loss
+                # via masked mean in get_loss) but still contribute value/score targets.
                 use_full_sims = True
                 if self.pcr_enabled and self._rng.random() < self.pcr_probability:
                     reduced_sims = max(1, int(self.base_simulations * self.pcr_fraction))
@@ -416,22 +417,27 @@ class OptimizedSelfPlayWorker:
                 # ACTION SELECTION: use temperature schedule (greedy after threshold)
                 action_temp = self.temperature if move_count < self.temperature_threshold else 0.0
                 action = self.mcts.select_action(visit_counts, temperature=action_temp, deterministic=(action_temp <= 0))
-                # POLICY TARGET: visits (normalized counts) or visits_temperature_shaped (legacy)
-                if self.policy_target_mode == "visits":
-                    pi = self.action_encoder.create_target_policy(visit_counts, mode="visits")
-                else:
-                    policy_temp = max(self.temperature, 1e-6)
-                    pi = self.action_encoder.create_target_policy(
-                        visit_counts, temperature=policy_temp, mode="visits_temperature_shaped"
+
+                if use_full_sims:
+                    # Full-search move: build real policy target from visit counts
+                    if self.policy_target_mode == "visits":
+                        pi = self.action_encoder.create_target_policy(visit_counts, mode="visits")
+                    else:
+                        policy_temp = max(self.temperature, 1e-6)
+                        pi = self.action_encoder.create_target_policy(
+                            visit_counts, temperature=policy_temp, mode="visits_temperature_shaped"
+                        )
+                    assert np.isfinite(pi).all() and abs(float(pi.sum()) - 1.0) < 1e-5, (
+                        f"policy target invalid: sum={pi.sum()} finite={np.isfinite(pi).all()}"
                     )
-                assert np.isfinite(pi).all() and abs(float(pi.sum()) - 1.0) < 1e-5, (
-                    f"policy target invalid: sum={pi.sum()} finite={np.isfinite(pi).all()}"
-                )
+                else:
+                    # PCR fast move: all-zeros policy signals "skip policy loss for this sample"
+                    pi = np.zeros(2026, dtype=np.float32)
+
                 if move_count == 0:
                     logger.debug(
-                        "[POLICY_TARGET] iter=%d mode=%s action_selection_temp=%.2f policy_target_temp=%s",
-                        iteration, self.policy_target_mode, action_temp,
-                        "N/A" if self.policy_target_mode == "visits" else f"{policy_temp:.2f}",
+                        "[POLICY_TARGET] iter=%d mode=%s action_selection_temp=%.2f full_sims=%s",
+                        iteration, self.policy_target_mode, action_temp, use_full_sims,
                     )
             else:
                 visit_counts = pure_mcts_search(st, sims=self.bootstrap_sims, rng=self._rng)
@@ -451,23 +457,27 @@ class OptimizedSelfPlayWorker:
                 move_root_qs.append(0.0)  # No Q-value for pure MCTS bootstrap
 
             # enforce legal mask + renorm (prevents illegal leakage)
-            pi = (pi * mask).astype(np.float32, copy=False)
-            s = float(pi.sum())
-            if s > 0:
-                pi /= s
-            else:
-                li = np.nonzero(mask > 0)[0]
-                if len(li) > 0:
-                    pi[li] = 1.0 / float(len(li))
+            # PCR fast moves already have all-zeros pi; skip renorm so the zero
+            # signal survives into training (masked mean in get_loss).
+            if pi.sum() > 0:
+                pi = (pi * mask).astype(np.float32, copy=False)
+                s = float(pi.sum())
+                if s > 0:
+                    pi /= s
+                else:
+                    li = np.nonzero(mask > 0)[0]
+                    if len(li) > 0:
+                        pi[li] = 1.0 / float(len(li))
 
-            # Policy collapse canary: track entropy and sharpness
-            nonzero = pi[pi > 0]
-            move_entropies.append(float(-np.sum(nonzero * np.log(nonzero))))
-            move_top1_probs.append(float(np.max(pi)))
+            # Policy collapse canary: track entropy and sharpness (skip PCR fast moves)
+            if pi.sum() > 0:
+                nonzero = pi[pi > 0]
+                move_entropies.append(float(-np.sum(nonzero * np.log(nonzero))))
+                move_top1_probs.append(float(np.max(pi)))
             move_num_legal.append(int(np.sum(mask > 0)))
 
-            # Position redundancy: hash the encoded state (original only, not augments)
-            seen_state_hashes.add(hash(enc.tobytes()))
+            # Position redundancy: hash the compact engine state (not the 10KB encoded tensor)
+            seen_state_hashes.add(hash(st.tobytes()))
 
             # Defensive invariant: chosen action index must be legal in current mask.
             selected_idx = int(engine_action_to_flat_index(action))
@@ -481,14 +491,16 @@ class OptimizedSelfPlayWorker:
             slot_piece_ids_arr = [(p if p is not None else -1) for p in slot_piece_ids]
 
             if self.store_canonical_only:
-                states.append(enc.copy())
+                # encode_state_multimodal already returns copies; no need to re-copy.
+                # mask and pi are fresh arrays each iteration — safe to store directly.
+                states.append(enc)
                 if self._use_multimodal:
-                    stored_global_states.append(x_global.copy())
-                    stored_track_states.append(x_track.copy())
-                    stored_shop_ids.append(shop_ids.copy())
-                    stored_shop_feats.append(shop_feats.copy())
-                masks.append(mask.copy())
-                policies.append(pi.copy())
+                    stored_global_states.append(x_global)
+                    stored_track_states.append(x_track)
+                    stored_shop_ids.append(shop_ids)
+                    stored_shop_feats.append(shop_feats)
+                masks.append(mask)
+                policies.append(pi)
                 values.append(0.0)
                 score_margins.append(0.0)
                 stored_players.append(to_move)
@@ -527,7 +539,7 @@ class OptimizedSelfPlayWorker:
 
         # Fill values and score_margins per stored state's to-move perspective
         # value: strictly 1.0 (Win), -1.0 (Loss), 0.0 (Tie)
-        # score_margins: integer margin (Current Player Score - Opponent Score)
+        # score_margins: raw integer margin in POINTS (to_move_score - opponent_score)
         # Q-value mixing (Oracle Part 4): blend MCTS root Q-value with game outcome for value only.
         q_w = self.q_value_weight
         aug_factor = 1 if self.store_canonical_only else (4 if self.augmentation == "flip" else (8 if self.augmentation == "d4" else 1))
@@ -537,6 +549,10 @@ class OptimizedSelfPlayWorker:
                 score1=int(score1),
                 winner=int(terminal_winner),
                 to_move=int(p),
+            )
+            assert abs(z_score) <= 120, (
+                f"score_margin {z_score} outside expected range [-120, 120]. "
+                f"score0={score0} score1={score1} to_move={p}"
             )
             score_margins[i] = z_score
             if q_w > 0 and move_root_qs:
@@ -697,16 +713,14 @@ def init_optimized_worker(
     return_mode: str = "dict",
     shard_dir: Optional[str] = None,
     worker_shm_names: Optional[dict] = None,
-    expected_n_slots: Optional[int] = None,
 ):
-    """Initialize worker (called once per process). expected_n_slots used for SHM attach validation."""
+    """Initialize worker (called once per process)."""
     global _WORKER, _RETURN_MODE, _SHARD_DIR, _SHARD_WRITER
 
-    # Limit PyTorch threads per worker to avoid oversubscription (many workers × default threads)
-    mcts_cfg = (config.get("selfplay", {}) or {}).get("mcts", {}) or {}
-    n_threads = max(1, int(mcts_cfg.get("num_threads", 1)))
-    torch.set_num_threads(n_threads)
-    torch.set_num_interop_threads(n_threads)
+    # Limit CPU thread oversubscription in self-play workers
+    n_threads = int((config.get("selfplay", {}) or {}).get("mcts", {}).get("num_threads", 1))
+    torch.set_num_threads(max(1, n_threads))
+    torch.set_num_interop_threads(max(1, n_threads))
 
     _RETURN_MODE = return_mode or "dict"
     _SHARD_DIR = shard_dir
@@ -752,7 +766,7 @@ def init_optimized_worker(
 
     _WORKER = OptimizedSelfPlayWorker(network_path, config, device=device, req_q=req_q, resp_q=resp_q, worker_id=worker_id)
 
-    # Attach shared memory buffer if available (zero-copy IPC path; expected_n_slots for validation)
+    # Attach shared memory buffer if available (zero-copy IPC path)
     if worker_shm_names is not None and _WORKER.mcts is not None:
         shm_name = worker_shm_names.get(worker_id)
         if shm_name is not None:
@@ -760,8 +774,7 @@ def init_optimized_worker(
                 from src.mcts.shared_state_buffer import WorkerSharedBuffer
                 from src.network.encoder import GoldV2StateEncoder
                 _WORKER.mcts._shm_buf = WorkerSharedBuffer(
-                    n_slots=None, worker_id=worker_id, create=False, name=shm_name,
-                    expected_n_slots=expected_n_slots,
+                    n_slots=None, worker_id=worker_id, create=False, name=shm_name
                 )
                 _WORKER.mcts._gold_v2_encoder = GoldV2StateEncoder()
             except Exception as _shm_err:

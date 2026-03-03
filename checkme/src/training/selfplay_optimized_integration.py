@@ -15,7 +15,6 @@ ARCHITECTURE:
 
 import logging
 import multiprocessing as mp
-import queue
 import os
 import signal
 import shutil
@@ -51,7 +50,6 @@ from .selfplay_optimized import (
     play_game_optimized,
 )
 from src.mcts.shared_state_buffer import WorkerSharedBuffer
-from src.training.replay_buffer import _validate_score_margins, SCORE_MARGIN_MAX_ABS
 
 
 def _init_worker_ignore_sigint(*args):
@@ -119,7 +117,7 @@ class SelfPlayGenerator:
         # Shared memory buffers for zero-copy IPC (one per worker)
         self._worker_shm_bufs: Dict[int, WorkerSharedBuffer] = {}
         self._worker_shm_names: Dict[int, str] = {}
-        self._expected_n_slots: Optional[int] = None  # Set when GPU server SHM is created; used by workers
+        self._shm_parallel_leaves: Optional[int] = None  # Set when GPU server SHM is created
 
     def _should_use_gpu_server(self, network_path: Optional[str]) -> bool:
         """Auto-detect if GPU inference server should be used."""
@@ -132,21 +130,10 @@ class SelfPlayGenerator:
         num_workers = int(self.config.get("selfplay", {}).get("num_workers", 1))
         return num_workers > 1
 
-    def _get_expected_n_slots(self) -> int:
-        """Max parallel_leaves over schedule if present, else config selfplay.mcts.parallel_leaves."""
-        base = int(
-            self.config.get("selfplay", {}).get("mcts", {}).get("parallel_leaves", 32)
-        )
-        pl_schedule = self.config.get("iteration", {}).get("parallel_leaves_schedule", [])
-        if pl_schedule:
-            return max(int(e.get("parallel_leaves", base)) for e in pl_schedule)
-        return base
-
-    def _start_gpu_server(self, network_path: str, num_workers: int):
+    def _start_gpu_server(self, network_path: str, num_workers: int, iteration_config: Optional[dict] = None):
         """Start GPU inference server process with per-worker response queues.
 
-        Uses expected_n_slots (max over schedule) for SHM sizing everywhere; same config
-        is passed to the child. Cleanup (SHM close+unlink) runs in finally.
+        iteration_config: Schedule-applied config; if provided, parallel_leaves is taken from it.
         """
         from src.network.gpu_inference_server import run_gpu_inference_server
 
@@ -156,92 +143,52 @@ class SelfPlayGenerator:
         self.stop_evt = ctx.Event()
         ready_q = ctx.Queue(maxsize=1)
 
-        expected_n_slots = self._get_expected_n_slots()
+        # Create per-worker shared memory buffers for zero-copy IPC
+        cfg = iteration_config if iteration_config is not None else self.config
+        parallel_leaves = int(
+            cfg.get("selfplay", {}).get("mcts", {}).get("parallel_leaves", 32)
+        )
         self._worker_shm_bufs = {}
         self._worker_shm_names = {}
-        started_ok = False
-
-        try:
-            for wid in range(num_workers):
-                try:
-                    buf = WorkerSharedBuffer(
-                        n_slots=expected_n_slots, worker_id=wid, create=True
-                    )
-                    self._worker_shm_bufs[wid] = buf
-                    self._worker_shm_names[wid] = buf.name
-                except Exception as e:
-                    logger.warning("Failed to create SHM buffer for worker %d: %s", wid, e)
-                    self._worker_shm_bufs = {}
-                    self._worker_shm_names = {}
-                    break
-            if not self._worker_shm_names:
-                raise RuntimeError(
-                    "Failed to create any SHM buffers for GPU server; check parallel_leaves / schedule."
-                )
-            logger.debug(
-                "Created %d shared memory buffers (expected_n_slots=%d × %d bytes each)",
-                num_workers, expected_n_slots, WorkerSharedBuffer.SLOT_BYTES,
-            )
-
-            self.gpu_process = ctx.Process(
-                target=run_gpu_inference_server,
-                args=(self.config, network_path, self.req_q, self.resp_qs, self.stop_evt, ready_q),
-                kwargs={
-                    "worker_shm_names": self._worker_shm_names,
-                    "expected_n_slots": expected_n_slots,
-                },
-                daemon=False,
-            )
-            self.gpu_process.start()
-            logger.debug("GPU inference server process started (PID: %s)", self.gpu_process.pid)
-            logger.debug("Waiting for GPU server to initialize...")
-
-            gpu_ready_timeout = float(
-                self.config.get("selfplay", {}).get("gpu_server_ready_timeout_s", 180)
-            )
+        for wid in range(num_workers):
             try:
-                status = ready_q.get(timeout=gpu_ready_timeout)
-            except queue.Empty:
-                if self.gpu_process.is_alive():
-                    self.gpu_process.terminate()
-                    self.gpu_process.join(timeout=5)
-                msg = (
-                    f"GPU server did not signal ready within {gpu_ready_timeout:.0f}s (timeout). "
-                    "Increase selfplay.gpu_server_ready_timeout_s to wait longer."
-                )
-                exitcode = getattr(self.gpu_process, "exitcode", None)
-                if exitcode is not None:
-                    msg += f" Child exit code: {exitcode}."
-                raise RuntimeError(msg)
+                buf = WorkerSharedBuffer(n_slots=parallel_leaves, worker_id=wid, create=True)
+                self._worker_shm_bufs[wid] = buf
+                self._worker_shm_names[wid] = buf.name
+            except Exception as e:
+                logger.warning("Failed to create SHM buffer for worker %d: %s", wid, e)
+                self._worker_shm_bufs = {}
+                self._worker_shm_names = {}
+                break
+        if self._worker_shm_names:
+            self._shm_parallel_leaves = parallel_leaves
+        else:
+            self._shm_parallel_leaves = None
 
+        self.gpu_process = ctx.Process(
+            target=run_gpu_inference_server,
+            args=(self.config, network_path, self.req_q, self.resp_qs, self.stop_evt, ready_q),
+            kwargs={"worker_shm_names": self._worker_shm_names or None},
+            daemon=False,
+        )
+        self.gpu_process.start()
+        logger.debug(f"GPU inference server process started (PID: {self.gpu_process.pid})")
+        logger.debug("Waiting for GPU server to initialize...")
+
+        # Wait for server to signal it's ready (or timeout after 120s)
+        # cudnn.benchmark profiling can take 30-90s; 120s gives safe headroom.
+        try:
+            status = ready_q.get(timeout=120.0)
             if status == "ready":
-                started_ok = True
-                self._expected_n_slots = expected_n_slots
                 logger.debug("GPU inference server ready!")
-            elif isinstance(status, tuple) and len(status) >= 3 and status[0] == "error":
-                _, err_msg, err_tb = status[0], status[1], status[2]
-                raise RuntimeError(
-                    f"GPU server initialization failed: {err_msg}\n\nChild traceback:\n{err_tb}"
-                )
-            elif isinstance(status, str) and status.startswith("error:"):
-                raise RuntimeError(f"GPU server initialization failed: {status[6:]}")
-            else:
-                raise RuntimeError(f"GPU server sent unexpected status: {type(status)} {status!r}")
-        except Exception:
-            if self.gpu_process and self.gpu_process.is_alive():
+            elif status.startswith("error:"):
+                error_msg = status[6:]
+                raise RuntimeError(f"GPU server initialization failed: {error_msg}")
+        except Exception as e:
+            if self.gpu_process.is_alive():
                 self.gpu_process.terminate()
                 self.gpu_process.join(timeout=5)
-            raise
-        finally:
-            # CLEANUP on startup failure only: release SHM so next run does not see stale segments
-            if not started_ok:
-                for wid, buf in list(self._worker_shm_bufs.items()):
-                    try:
-                        buf.destroy()
-                    except Exception as e:
-                        logger.debug("Failed to destroy SHM buffer for worker %d: %s", wid, e)
-                self._worker_shm_bufs.clear()
-                self._worker_shm_names.clear()
+            raise RuntimeError(f"GPU server failed to start: {e}")
 
     def _stop_gpu_server(self):
         """Stop GPU inference server and destroy shared memory buffers."""
@@ -263,14 +210,13 @@ class SelfPlayGenerator:
                 logger.debug("Failed to destroy SHM buffer for worker %d: %s", wid, e)
         self._worker_shm_bufs.clear()
         self._worker_shm_names.clear()
-        self._expected_n_slots = None
+        self._shm_parallel_leaves = None
 
     def generate(
         self,
         iteration: int,
         network_path: Optional[str] = None,
         output_dir: Optional[Path] = None,
-        num_games_override: Optional[int] = None,
     ) -> Tuple[str, Dict]:
         """Generate self-play data for iteration.
 
@@ -278,14 +224,13 @@ class SelfPlayGenerator:
             iteration: Iteration number.
             network_path: Path to model checkpoint for inference.
             output_dir: If provided, write HDF5 to output_dir/selfplay.h5 (for staging).
-            num_games_override: If set, use this many games instead of schedule (e.g. adaptive-games).
 
         Returns:
             (data_path, stats): Path to HDF5 file and game statistics dict
         """
         logger.debug("Generating self-play data for iteration %d", iteration)
 
-        num_games = int(num_games_override) if num_games_override is not None else self._get_num_games(iteration)
+        num_games = self._get_num_games(iteration)
 
         if output_dir is not None:
             output_dir = Path(output_dir)
@@ -326,8 +271,19 @@ class SelfPlayGenerator:
         # Start GPU server if beneficial
         use_gpu_server = self._should_use_gpu_server(network_path)
         if use_gpu_server:
-            self._start_gpu_server(network_path, num_workers)
+            self._start_gpu_server(network_path, num_workers, iteration_config)
             self.use_gpu_server = True
+            # Assert SHM capacity matches iteration parallel_leaves (prevents buffer overrun)
+            iter_pl = int(iteration_config.get("selfplay", {}).get("mcts", {}).get("parallel_leaves", 32))
+            if self._shm_parallel_leaves is not None and self._shm_parallel_leaves != iter_pl:
+                logger.error(
+                    "parallel_leaves mismatch: SHM capacity=%d, iteration_config=%d — risk of buffer overrun",
+                    self._shm_parallel_leaves, iter_pl,
+                )
+                raise RuntimeError(
+                    f"parallel_leaves mismatch: SHM={self._shm_parallel_leaves} vs iteration_config={iter_pl}. "
+                    "MCTS would write beyond SHM buffer. This should not happen with per-iteration server restart."
+                )
 
         try:
             # Log schedule changes
@@ -398,8 +354,7 @@ class SelfPlayGenerator:
                 self.resp_qs,
                 "shard",
                 str(shard_dir),
-                self._worker_shm_names or None,
-                self._expected_n_slots,  # for SHM attach validation in worker
+                self._worker_shm_names or None,  # SHM buffer names for zero-copy IPC
             ),
         )
         _register_pool(pool)
@@ -458,13 +413,12 @@ class SelfPlayGenerator:
             initializer=_init_worker_ignore_sigint,
             initargs=(
                 network_path,
-                iteration_config,
+                iteration_config,  # Use config with schedules applied
                 self.req_q,
-                self.resp_qs,
-                "shard",
-                str(shard_dir),
-                self._worker_shm_names or None,
-                self._expected_n_slots,  # for SHM attach validation in worker
+                self.resp_qs,  # Per-worker response queues
+                "shard",  # return_mode
+                str(shard_dir),  # shard_dir
+                self._worker_shm_names or None,  # SHM buffer names for zero-copy IPC
             ),
         )
         _register_pool(pool)
@@ -678,14 +632,6 @@ class SelfPlayGenerator:
                         )
                     has_slot_ids = "slot_piece_ids" in shard
                     has_scores = "score_margins" in shard
-                    score_loss_weight = float(
-                        (self.config.get("training", {}) or {}).get("score_loss_weight", 0.0)
-                    )
-                    if score_loss_weight > 0 and not has_scores:
-                        raise ValueError(
-                            f"Shard {shard_path} has no score_margins but training has score_loss_weight > 0. "
-                            "Regenerate self-play with score head enabled."
-                        )
                     if canonical_mode is None:
                         canonical_mode = has_slot_ids
                     elif canonical_mode != has_slot_ids:
@@ -695,6 +641,26 @@ class SelfPlayGenerator:
                         )
                     if scores_mode is None:
                         scores_mode = has_scores
+
+                    # Validate score_margins: must be finite raw integer margins
+                    if has_scores:
+                        sc = shard["score_margins"]
+                        if not np.isfinite(sc).all():
+                            raise ValueError(
+                                f"Shard {shard_path}: score_margins contains non-finite values."
+                            )
+                        if np.max(np.abs(sc)) > 120:
+                            raise ValueError(
+                                f"Shard {shard_path}: score_margins out of range "
+                                f"(max abs={np.max(np.abs(sc)):.1f} > 120). "
+                                "Expected raw integer margins, not normalised values."
+                            )
+                    elif self.config.get("training", {}).get("score_loss_weight", 0.01) > 0:
+                        raise ValueError(
+                            f"Shard {shard_path}: missing score_margins but "
+                            "score_loss_weight > 0. Cannot train score head without scores. "
+                            "Wipe staging/committed and regenerate selfplay."
+                        )
 
                     new_size = total_pos + n
                     if has_multimodal:
@@ -723,13 +689,7 @@ class SelfPlayGenerator:
                     policies_ds[total_pos:new_size] = shard["policies"]
                     values_ds[total_pos:new_size] = shard["values"]
                     if has_scores:
-                        sc = np.asarray(shard["score_margins"], dtype=np.float32)
-                        _validate_score_margins(
-                            sc,
-                            max_abs=SCORE_MARGIN_MAX_ABS,
-                            source=str(shard_path),
-                        )
-                        score_margins_ds[total_pos:new_size] = sc
+                        score_margins_ds[total_pos:new_size] = shard["score_margins"]
                     else:
                         score_margins_ds[total_pos:new_size] = np.zeros(n, dtype=np.float32)
                     ownerships_ds[total_pos:new_size] = shard["ownerships"]
@@ -809,6 +769,13 @@ class SelfPlayGenerator:
                 config["selfplay"]["mcts"]["simulations"] = entry["simulations"]
                 break
 
+        # Apply parallel_leaves schedule
+        pl_schedule = self.config.get("iteration", {}).get("parallel_leaves_schedule", [])
+        for entry in sorted(pl_schedule, key=lambda x: x["iteration"], reverse=True):
+            if iteration >= entry["iteration"]:
+                config["selfplay"]["mcts"]["parallel_leaves"] = entry["parallel_leaves"]
+                break
+
         # Apply Dirichlet alpha schedule
         alpha_schedule = self.config.get("iteration", {}).get("dirichlet_alpha_schedule", [])
         for entry in sorted(alpha_schedule, key=lambda x: x["iteration"], reverse=True):
@@ -823,15 +790,6 @@ class SelfPlayGenerator:
                 config["selfplay"]["mcts"]["root_noise_weight"] = entry["weight"]
                 break
 
-        # Apply parallel_leaves schedule (batch width for MCTS inference)
-        pl_schedule = self.config.get("iteration", {}).get("parallel_leaves_schedule", [])
-        for entry in sorted(pl_schedule, key=lambda x: x["iteration"], reverse=True):
-            if iteration >= entry["iteration"]:
-                config["selfplay"]["mcts"]["parallel_leaves"] = int(entry["parallel_leaves"])
-                if not quiet:
-                    logger.debug("[SCHEDULE] iter=%d parallel_leaves=%d", iteration, config["selfplay"]["mcts"]["parallel_leaves"])
-                break
-
         # Bootstrap override: use bootstrap.mcts_simulations for iteration 0
         bootstrap_cfg = config["selfplay"].get("bootstrap", {})
         if iteration == 0 and bootstrap_cfg.get("use_pure_mcts"):
@@ -843,8 +801,7 @@ class SelfPlayGenerator:
             mcts_cfg = config["selfplay"]["mcts"]
             logger.debug(
                 f"Schedule: temp={mcts_cfg['temperature']:.2f}  sims={mcts_cfg['simulations']}  "
-                f"alpha={mcts_cfg['root_dirichlet_alpha']}  noise={mcts_cfg['root_noise_weight']}  "
-                f"parallel_leaves={mcts_cfg.get('parallel_leaves', '?')}"
+                f"alpha={mcts_cfg['root_dirichlet_alpha']}  noise={mcts_cfg['root_noise_weight']}"
             )
 
         return config
