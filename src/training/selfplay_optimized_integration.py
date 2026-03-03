@@ -859,6 +859,13 @@ class SelfPlayGenerator:
                 "p0_wins": 0,
                 "p1_wins": 0,
                 "generation_time": generation_time,
+                "games_per_minute": 0.0,
+                "avg_policy_entropy": 0.0,
+                "avg_top1_prob": 0.0,
+                "avg_num_legal": 0.0,
+                "avg_redundancy": 0.0,
+                "unique_positions": 0,
+                "avg_root_q": 0.0,
             }
 
         game_lengths = [s.get("game_length", 0) for s in summaries]

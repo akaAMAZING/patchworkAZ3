@@ -1106,24 +1106,20 @@ class Trainer:
                 )
 
             if self.global_step % 10 == 0:
-                # Core training metrics
-                for k in ("total_loss", "policy_loss", "value_loss", "policy_accuracy", "policy_entropy",
-                          "policy_top5_accuracy"):
-                    if k in metrics:
-                        self.writer.add_scalar(f"train/{k}", metrics[k], self.global_step)
-                # Auxiliary head losses (only log when non-zero)
-                for k in ("ownership_loss", "score_loss"):
-                    if metrics.get(k, 0.0) > 0:
-                        self.writer.add_scalar(f"train/{k}", metrics[k], self.global_step)
-                self.writer.add_scalar("train/grad_norm", grad_norm.item(), self.global_step)
+                # Train metrics (canonical whitelist)
                 self.writer.add_scalar("train/learning_rate", self.scheduler.get_last_lr()[0], self.global_step)
+                self.writer.add_scalar("train/total_loss", metrics["total_loss"], self.global_step)
+                self.writer.add_scalar("train/policy_loss", metrics["policy_loss"], self.global_step)
+                self.writer.add_scalar("train/value_loss", metrics["value_loss"], self.global_step)
+                self.writer.add_scalar("train/grad_norm", grad_norm.item(), self.global_step)
+                self.writer.add_scalar("train/policy_entropy", metrics["policy_entropy"], self.global_step)
+                self.writer.add_scalar("train/policy_accuracy", metrics["policy_accuracy"], self.global_step)
+                self.writer.add_scalar("train/policy_top5_accuracy", metrics["policy_top5_accuracy"], self.global_step)
 
             if val_loader is not None and self.global_step % self.config["training"]["val_frequency"] == 0:
                 val_metrics = self.validate(val_loader)
 
-                for k in ("total_loss", "policy_loss", "value_loss", "score_loss",
-                          "policy_accuracy", "policy_entropy", "policy_top5_accuracy",
-                          "ownership_loss"):
+                for k in ("total_loss", "policy_loss", "value_loss", "policy_entropy", "policy_accuracy", "policy_top5_accuracy"):
                     if k in val_metrics:
                         self.writer.add_scalar(f"val/{k}", val_metrics[k], self.global_step)
 
@@ -1157,11 +1153,10 @@ class Trainer:
         val_metrics = {
             "policy_loss": 0.0,
             "value_loss": 0.0,
-            "score_loss": 0.0,
-            "ownership_loss": 0.0,
             "total_loss": 0.0,
             "policy_accuracy": 0.0,
             "policy_top5_accuracy": 0.0,
+            "policy_entropy": 0.0,
             "value_mse": 0.0,
         }
         num_batches = 0

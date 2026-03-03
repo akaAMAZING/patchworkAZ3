@@ -1472,49 +1472,32 @@ class AlphaZeroTrainer:
                     _print_section("\n[3/3] EVALUATION")
                 eval_results = self._evaluate_model(iteration, checkpoint_path)
 
-                # ── TensorBoard: iteration-level metrics ──────────────────────────────
-                # Eval metrics
-                if "elo_rating" in eval_results:
-                    self.writer.add_scalar("eval/elo_rating", eval_results["elo_rating"], iteration)
-                if "vs_pure_mcts" in eval_results:
-                    vm = eval_results["vs_pure_mcts"]
-                    self.writer.add_scalar("eval/win_rate_vs_mcts", vm["win_rate"], iteration)
-                    self.writer.add_scalar("eval/score_margin_vs_mcts", vm.get("avg_model_score_margin", 0), iteration)
-                    self.writer.add_scalar("eval/game_length_vs_mcts", vm.get("avg_game_length", 0), iteration)
-                    # P0/P1 position-bias signal
-                    _vm_results = vm.get("results", [])
-                    if _vm_results:
-                        _p0 = [r for r in _vm_results if r.get("model_plays_first", False)]
-                        _p1 = [r for r in _vm_results if not r.get("model_plays_first", False)]
-                        if _p0:
-                            self.writer.add_scalar("eval/win_rate_as_p0_vs_mcts", sum(1 for r in _p0 if r["model_won"]) / len(_p0), iteration)
-                        if _p1:
-                            self.writer.add_scalar("eval/win_rate_as_p1_vs_mcts", sum(1 for r in _p1 if r["model_won"]) / len(_p1), iteration)
-                if "vs_previous_best" in eval_results:
-                    vb = eval_results["vs_previous_best"]
-                    self.writer.add_scalar("eval/win_rate_vs_best", vb["win_rate"], iteration)
-                    self.writer.add_scalar("eval/score_margin_vs_best", vb.get("avg_model_score_margin", 0), iteration)
-                    # P0/P1 position-bias signal vs best model
-                    _vb_results = vb.get("results", [])
-                    if _vb_results:
-                        _p0b = [r for r in _vb_results if r.get("model_plays_first", False)]
-                        _p1b = [r for r in _vb_results if not r.get("model_plays_first", False)]
-                        if _p0b:
-                            self.writer.add_scalar("eval/win_rate_as_p0_vs_best", sum(1 for r in _p0b if r["model_won"]) / len(_p0b), iteration)
-                        if _p1b:
-                            self.writer.add_scalar("eval/win_rate_as_p1_vs_best", sum(1 for r in _p1b if r["model_won"]) / len(_p1b), iteration)
-
+                # ── TensorBoard: iteration-level metrics (single canonical spec) ─────
                 # Self-play stats
                 self.writer.add_scalar("selfplay/games_per_min", selfplay_stats.get("games_per_minute", 0), iteration)
                 self.writer.add_scalar("selfplay/num_positions", selfplay_stats.get("num_positions", 0), iteration)
+                self.writer.add_scalar("selfplay/num_games", selfplay_stats.get("num_games", 0), iteration)
+                self.writer.add_scalar("selfplay/avg_game_length", selfplay_stats.get("avg_game_length", 0), iteration)
+                self.writer.add_scalar("selfplay/unique_positions", selfplay_stats.get("unique_positions", 0), iteration)
+                self.writer.add_scalar("selfplay/avg_redundancy", selfplay_stats.get("avg_redundancy", 0), iteration)
+                self.writer.add_scalar("selfplay/avg_policy_entropy", selfplay_stats.get("avg_policy_entropy", 0), iteration)
+                self.writer.add_scalar("selfplay/avg_top1_prob", selfplay_stats.get("avg_top1_prob", 0), iteration)
+                self.writer.add_scalar("selfplay/avg_num_legal", selfplay_stats.get("avg_num_legal", 0), iteration)
+                self.writer.add_scalar("selfplay/avg_root_q", selfplay_stats.get("avg_root_q", 0), iteration)
+                self.writer.add_scalar("selfplay/generation_time", selfplay_stats.get("generation_time", 0), iteration)
 
-                # Replay buffer health
+                # Replay buffer
                 self.writer.add_scalar("buffer/total_positions", self.replay_buffer.total_positions, iteration)
                 self.writer.add_scalar("buffer/num_iterations", self.replay_buffer.num_iterations, iteration)
 
-                # Training diagnostics (epoch averages)
-                for k, v in train_metrics.items():
-                    self.writer.add_scalar(f"iter/{k}", v, iteration)
+                # Training diagnostics (whitelisted epoch averages)
+                _iter_whitelist = (
+                    "kl_divergence", "policy_entropy", "target_entropy", "policy_cross_entropy",
+                    "value_mse", "step_skip_rate", "approx_identity_check",
+                )
+                for k in _iter_whitelist:
+                    if k in train_metrics:
+                        self.writer.add_scalar(f"iter/{k}", train_metrics[k], iteration)
 
                 # --- League-based evaluation & gating ---
                 if self.league_enabled and self.league is not None and iteration > 0:
@@ -2071,12 +2054,6 @@ class AlphaZeroTrainer:
             logger.warning("  REGRESSION ALERTS: %s", gate_result.regression_alerts)
         logger.info("=" * 60)
 
-        # Log to TensorBoard
-        self.writer.add_scalar("league/vs_best_wr", gate_result.vs_best_wr, global_step)
-        if suite_winrates:
-            self.writer.add_scalar("league/suite_mean_wr", gate_result.suite_mean_wr, global_step)
-            self.writer.add_scalar("league/suite_worst_wr", gate_result.suite_worst_wr, global_step)
-
         # Step 4: Promotion decision
         above_floor = self._check_anti_regression_floor(eval_results)
         accepted = False
@@ -2133,9 +2110,6 @@ class AlphaZeroTrainer:
             "suite_winrates": suite_winrates,
         }
         diag = league.log_diagnostics(iteration, candidate_id)
-        self.writer.add_scalar("league/cycles", diag.get("cycles_in_200_triples", 0), global_step)
-        self.writer.add_scalar("league/exploitability", diag.get("exploitability_proxy", 0), global_step)
-        self.writer.add_scalar("league/pool_size", diag.get("pool_size", 0), global_step)
 
         # Step 6: Save reports
         logs_dir = Path(self.config["paths"]["logs_dir"])
