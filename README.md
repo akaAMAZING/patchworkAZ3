@@ -17,6 +17,8 @@ python -m src.training.main --config configs/config_best.yaml
 
 # Monitor progress (separate terminal)
 tensorboard --logdir logs/tensorboard
+
+tensorboard --logdir logs/tensorboard_canonical
 # → open http://localhost:6006
 
 # Eval: compare two checkpoints (uses standard Elo; 64.5% WR ≈ 104 gap)

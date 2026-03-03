@@ -1472,7 +1472,7 @@ class AlphaZeroTrainer:
                     _print_section("\n[3/3] EVALUATION")
                 eval_results = self._evaluate_model(iteration, checkpoint_path)
 
-                # ── TensorBoard: iteration-level metrics (single canonical spec) ─────
+                # ── TensorBoard: iteration-level metrics (single canonical spec) ──────
                 # Self-play stats
                 self.writer.add_scalar("selfplay/games_per_min", selfplay_stats.get("games_per_minute", 0), iteration)
                 self.writer.add_scalar("selfplay/num_positions", selfplay_stats.get("num_positions", 0), iteration)
@@ -1490,7 +1490,7 @@ class AlphaZeroTrainer:
                 self.writer.add_scalar("buffer/total_positions", self.replay_buffer.total_positions, iteration)
                 self.writer.add_scalar("buffer/num_iterations", self.replay_buffer.num_iterations, iteration)
 
-                # Training diagnostics (whitelisted epoch averages)
+                # Training diagnostics (epoch averages) — whitelist only
                 _iter_whitelist = (
                     "kl_divergence", "policy_entropy", "target_entropy", "policy_cross_entropy",
                     "value_mse", "step_skip_rate", "approx_identity_check",

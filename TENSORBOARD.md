@@ -1,309 +1,310 @@
-# Patchwork AlphaZero --- TensorBoard Field Manual (Exhaustive)
+# Patchwork AlphaZero — TensorBoard Field Manual (Exhaustive)
 
-This is the **operator-grade** reference for every TensorBoard scalar
-you currently log (post-cleanup), with:
+This is the **operator-grade** reference for every TensorBoard scalar you currently log (post-cleanup), with:
 
--   **Definition** (what it is mathematically / how it's computed)
--   **What it represents** (the system variable it measures)
--   **Target behavior / ranges** (practical, not fake precision)
--   **Red flags** (patterns that indicate trouble)
--   **Actions** (what to change, in what order, and why)
--   **Cross-metric diagnostics** (how to confirm a hypothesis)
+- **Definition** (what it is mathematically / how it's computed)
+- **What it represents** (the system variable it measures)
+- **Target behavior / ranges** (practical, not fake precision)
+- **Red flags** (patterns that indicate trouble)
+- **Actions** (what to change, in what order, and why)
+- **Cross-metric diagnostics** (how to confirm a hypothesis)
 
-Assumptions baked in: - Policy action space size is **2026** → max
-uniform entropy over *all* actions is **log(2026) ≈ 7.61**. - Illegal
-actions are masked (logits = -inf) before softmax/log-softmax. - Policy
-targets are MCTS visit distributions normalized over legal actions. -
-"Train" metrics are computed on batches used for SGD updates; "Val" on
-held-out replay batches (same distribution family). - Iter metrics are
-epoch-averaged values emitted per iteration.
+**Assumptions baked in:**
 
-> If you change what you log, update this doc immediately. A clean
-> metric surface is a competitive advantage.
+- Policy action space size is **2026** → max uniform entropy over *all* actions is **log(2026) ≈ 7.61**.
+- Illegal actions are masked (logits = -inf) before softmax/log-softmax.
+- Policy targets are MCTS visit distributions normalized over legal actions.
+- "Train" metrics are computed on batches used for SGD updates; "Val" on held-out replay batches (same distribution family).
+- Iter metrics are epoch-averaged values emitted per iteration.
 
-------------------------------------------------------------------------
+> If you change what you log, update this doc immediately. A clean metric surface is a competitive advantage.
+
+---
 
 ## Quick dashboard: what to watch first
 
-If you can only look at **6 charts**: 1) `iter/kl_divergence`\
-2) `iter/policy_entropy` **and** `iter/target_entropy` (same panel)\
-3) `selfplay/unique_positions` **and** `selfplay/avg_redundancy`\
-4) `train/grad_norm`\
-5) `selfplay/games_per_min` **or** `selfplay/generation_time`\
-6) `iter/value_mse`
+If you can only look at **6 charts**:
 
-These catch \>90% of real failures early.
+1. `iter/kl_divergence`
+2. `iter/policy_entropy` **and** `iter/target_entropy` (same panel)
+3. `selfplay/unique_positions` **and** `selfplay/avg_redundancy`
+4. `train/grad_norm`
+5. `selfplay/games_per_min` **or** `selfplay/generation_time`
+6. `iter/value_mse`
 
-------------------------------------------------------------------------
+These catch >90% of real failures early.
+
+---
 
 # 1) TRAIN METRICS (step-level)
 
 ## `train/learning_rate`
 
-**Definition**: Current optimizer LR (after schedule).
+**Definition:** Current optimizer LR (after schedule).
 
-**Represents**: Update step size; the primary "energy injector" into
-training.
+**Represents:** Update step size; the primary "energy injector" into training.
 
-**Target behavior / ranges**: - Should match your configured schedule. -
-Small discontinuities only where your schedule intentionally steps.
+**Target behavior / ranges:**
 
-**Red flags**: - Unexpected spikes/drops → schedule bug or wrong
-phase. - LR changes coinciding with KL/grad_norm explosions.
+- Should match your configured schedule.
+- Small discontinuities only where your schedule intentionally steps.
 
-**Actions**: - If unintended: verify schedule selection and "current
-iteration → LR" mapping. - If intended but destabilizing: smooth
-transition (glide) or reduce step magnitude.
+**Red flags:**
 
-**Cross-check**: - A destabilizing LR change almost always shows up
-within 1--3k steps as: - `train/grad_norm` spikes, -
-`iter/kl_divergence` increases next iteration, - selfplay quality
-degrades (redundancy up).
+- Unexpected spikes/drops → schedule bug or wrong phase.
+- LR changes coinciding with KL/grad_norm explosions.
 
-------------------------------------------------------------------------
+**Actions:**
+
+- If unintended: verify schedule selection and "current iteration → LR" mapping.
+- If intended but destabilizing: smooth transition (glide) or reduce step magnitude.
+
+**Cross-check:** A destabilizing LR change almost always shows up within 1–3k steps as:
+
+- `train/grad_norm` spikes
+- `iter/kl_divergence` increases next iteration
+- Selfplay quality degrades (redundancy up)
+
+---
 
 ## `train/total_loss`
 
-**Definition**: Weighted sum of component losses (policy + value +
-optional heads if present in your run).
+**Definition:** Weighted sum of component losses (policy + value + optional heads if present in your run).
 
-**Represents**: Coarse training progress; *not* a decision-grade metric
-by itself (weights can hide issues).
+**Represents:** Coarse training progress; *not* a decision-grade metric by itself (weights can hide issues).
 
-**Target behavior / ranges**: - Downward trend early; later it may
-plateau. - Noise is normal with large batch RL-style targets.
+**Target behavior / ranges:**
 
-**Red flags**: - Sudden sustained increase → instability. - Flatline
-from the start → data/target issue or LR too low. - "Looks fine" while
-other metrics break → component cancellation (total_loss masks
-problems).
+- Downward trend early; later it may plateau.
+- Noise is normal with large batch RL-style targets.
 
-**Actions**: - Diagnose using component losses + KL + entropy; don't act
-on total_loss alone.
+**Red flags:**
 
-**Cross-check**: - If total_loss worsens but `train/policy_loss` and
-`train/value_loss` improve, weights are likely changing effective
-emphasis (or aux head changed).
+- Sudden sustained increase → instability.
+- Flatline from the start → data/target issue or LR too low.
+- "Looks fine" while other metrics break → component cancellation (total_loss masks problems).
 
-------------------------------------------------------------------------
+**Actions:** Diagnose using component losses + KL + entropy; don't act on total_loss alone.
+
+**Cross-check:** If total_loss worsens but `train/policy_loss` and `train/value_loss` improve, weights are likely changing effective emphasis (or aux head changed).
+
+---
 
 ## `train/policy_loss`
 
-**Definition**: Cross-entropy CE(target π, model p). Common form: \[
-CE(`\pi`{=tex}, p) = - `\mathbb{E}`{=tex}\_`\pi [\log p(a)] `{=tex}=
--`\sum`{=tex}\_a `\pi`{=tex}(a)`\log `{=tex}p(a) \]
+**Definition:** Cross-entropy CE(target π, model p). Common form:  
+CE(π, p) = −𝔼_π[log p(a)] = −∑_a π(a) log p(a)
 
-**Represents**: How well the network's policy matches MCTS targets
-(supervision signal quality + model fit).
+**Represents:** How well the network's policy matches MCTS targets (supervision signal quality + model fit).
 
-**Target behavior / ranges**: - Should decrease early; later may plateau
-as targets sharpen. - Absolute magnitude depends on target entropy and
-KL; don't fixate on a universal numeric "good".
+**Target behavior / ranges:**
 
-**Red flags**: - Rising while `iter/kl_divergence` rising → the policy
-is losing alignment to MCTS. - Decreasing but selfplay diversity
-collapsing → overconfident policy (may be "learning the wrong thing").
+- Should decrease early; later may plateau as targets sharpen.
+- Absolute magnitude depends on target entropy and KL; don't fixate on a universal numeric "good".
 
-**Actions** (in order): 1) If it rises with KL: reduce LR 10--20% or
-hold LR longer. 2) If it rises without KL: check data pipeline, target
-normalization, action masking. 3) If it decreases but selfplay
-degenerates: increase exploration (noise/alpha/temp) before changing LR.
+**Red flags:**
 
-**Cross-check**: - Compare with `iter/target_entropy` and
-`iter/kl_divergence`: - CE ≈ H(target) + KL(target\|\|policy). - If CE
-rises because target entropy rises, that's not necessarily bad (targets
-got broader).
+- Rising while `iter/kl_divergence` rising → the policy is losing alignment to MCTS.
+- Decreasing but selfplay diversity collapsing → overconfident policy (may be "learning the wrong thing").
 
-------------------------------------------------------------------------
+**Actions** (in order):
+
+1. If it rises with KL: reduce LR 10–20% or hold LR longer.
+2. If it rises without KL: check data pipeline, target normalization, action masking.
+3. If it decreases but selfplay degenerates: increase exploration (noise/alpha/temp) before changing LR.
+
+**Cross-check:** Compare with `iter/target_entropy` and `iter/kl_divergence`: CE ≈ H(target) + KL(target‖policy). If CE rises because target entropy rises, that's not necessarily bad (targets got broader).
+
+---
 
 ## `train/value_loss`
 
-**Definition**: Mean squared error between predicted value and target
-value: \[ `\mathrm{MSE}`{=tex} =
-`\mathbb{E}`{=tex}\[(v\_`\theta `{=tex}-
-v\_`\mathrm{target}`{=tex})\^2\] \]
+**Definition:** Mean squared error between predicted value and target value:  
+MSE = 𝔼[(v_θ − v_target)²]
 
-**Represents**: Value head fit/calibration. Value drift can quietly
-break MCTS.
+**Represents:** Value head fit/calibration. Value drift can quietly break MCTS.
 
-**Target behavior / ranges**: - Typically decreases more slowly than
-policy. - Plateau is normal once value becomes "good enough" for search.
+**Target behavior / ranges:**
 
-**Red flags**: - Oscillation increases after schedule changes
-(LR/sims/score utility). - Sustained increase with stable policy metrics
-→ value head instability or target shift.
+- Typically decreases more slowly than policy.
+- Plateau is normal once value becomes "good enough" for search.
 
-**Actions**: - First: lower LR modestly (5--15%) if value is unstable. -
-If instability coincides with score utility changes: revisit score/value
-loss weights or score utility ramp speed. - If value remains noisy:
-consider more conservative temperature/noise changes (value targets
-depend on selfplay distribution).
+**Red flags:**
 
-**Cross-check**: - Watch `selfplay/avg_root_q` and game length: - value
-miscalibration often shifts root Q and changes game length distribution.
+- Oscillation increases after schedule changes (LR/sims/score utility).
+- Sustained increase with stable policy metrics → value head instability or target shift.
 
-------------------------------------------------------------------------
+**Actions:**
+
+- First: lower LR modestly (5–15%) if value is unstable.
+- If instability coincides with score utility changes: revisit score/value loss weights or score utility ramp speed.
+- If value remains noisy: consider more conservative temperature/noise changes (value targets depend on selfplay distribution).
+
+**Cross-check:** Watch `selfplay/avg_root_q` and game length: value miscalibration often shifts root Q and changes game length distribution.
+
+---
 
 ## `train/grad_norm`
 
-**Definition**: Norm of gradients (before clipping, if clipping exists).
+**Definition:** Norm of gradients (before clipping, if clipping exists).
 
-**Represents**: Optimization stability and effective step magnitude (LR
-× grad_norm).
+**Represents:** Optimization stability and effective step magnitude (LR × grad_norm).
 
-**Target behavior / ranges**: - Should settle into a stable band after
-initial transient. - A "good" band is the one that historically produced
-progress without spikes for your run. - (Use first stable window as
-baseline; don't chase a universal number.)
+**Target behavior / ranges:**
 
-**Red flags**: - Repeated spikes → LR too high, targets changing too
-fast, or batch outliers. - Trend upward over many steps → accumulating
-instability. - Trend to near-zero → learning stalled, dead grads, or LR
-too low.
+- Should settle into a stable band after initial transient.
+- A "good" band is the one that historically produced progress without spikes for your run.
+- Use first stable window as baseline; don't chase a universal number.
 
-**Actions**: - Spikes: reduce LR, increase grad clipping strictness, or
-reduce schedule shock (temp/sims jumps). - Near-zero: verify gradients
-exist (no masking bug), consider LR increase only if KL is low and
-training stagnates.
+**Red flags:**
 
-**Cross-check**: - If grad_norm spikes but KL doesn't: could be value
-head causing it; check value_loss/MSE.
+- Repeated spikes → LR too high, targets changing too fast, or batch outliers.
+- Trend upward over many steps → accumulating instability.
+- Trend to near-zero → learning stalled, dead grads, or LR too low.
 
-------------------------------------------------------------------------
+**Actions:**
+
+- Spikes: reduce LR, increase grad clipping strictness, or reduce schedule shock (temp/sims jumps).
+- Near-zero: verify gradients exist (no masking bug), consider LR increase only if KL is low and training stagnates.
+
+**Cross-check:** If grad_norm spikes but KL doesn't: could be value head causing it; check value_loss/MSE.
+
+---
 
 ## `train/policy_entropy`
 
-**Definition**: Shannon entropy of model policy distribution (masked),
-computed from log-softmax: \[ H(p) = -`\sum`{=tex}\_a
-p(a)`\log `{=tex}p(a) \]
+**Definition:** Shannon entropy of model policy distribution (masked), computed from log-softmax:  
+H(p) = −∑_a p(a) log p(a)
 
-**Represents**: Policy sharpness / confidence. A collapse detector.
+**Represents:** Policy sharpness / confidence. A collapse detector.
 
-**Target behavior / ranges**: - **Upper bound**: log(#legal actions).
-Global upper bound is 7.61, but with masking it's log(num_legal). -
-Healthy training typically shows a slow, controlled decrease as policy
-improves. - Entropy should not crater abruptly unless you intentionally
-lower temperature and sims are high and stable.
+**Target behavior / ranges:**
 
-**Red flags**: - Rapid entropy collapse (down sharply over a few
-iterations) **plus** redundancy rising → policy collapse / exploration
-failure. - Entropy spikes suddenly → instability or target distribution
-shift. - Entropy decreasing while KL increasing → policy getting sharper
-in the wrong direction (misalignment).
+- **Upper bound:** log(#legal actions). Global upper bound is 7.61, but with masking it's log(num_legal).
+- Healthy training typically shows a slow, controlled decrease as policy improves.
+- Entropy should not crater abruptly unless you intentionally lower temperature and sims are high and stable.
 
-**Actions** (in order): 1) If collapse: increase exploration (Dirichlet
-noise weight / alpha) and/or slow temperature decay. 2) Reduce LR if
-KL/grad_norm also show instability. 3) Pause sims increases (higher sims
-can amplify a collapsing prior).
+**Red flags:**
 
-**Cross-check**: - Compare to `iter/target_entropy`: - If H(p) \<\<
-H(target), network is overconfident relative to search targets.
+- Rapid entropy collapse (down sharply over a few iterations) **plus** redundancy rising → policy collapse / exploration failure.
+- Entropy spikes suddenly → instability or target distribution shift.
+- Entropy decreasing while KL increasing → policy getting sharper in the wrong direction (misalignment).
 
-------------------------------------------------------------------------
+**Actions** (in order):
+
+1. If collapse: increase exploration (Dirichlet noise weight / alpha) and/or slow temperature decay.
+2. Reduce LR if KL/grad_norm also show instability.
+3. Pause sims increases (higher sims can amplify a collapsing prior).
+
+**Cross-check:** Compare to `iter/target_entropy`: if H(p) ≪ H(target), network is overconfident relative to search targets.
+
+---
 
 ## `train/policy_accuracy`
 
-**Definition**: Top-1 accuracy vs target argmax (usually argmax of π).
+**Definition:** Top-1 accuracy vs target argmax (usually argmax of π).
 
-**Represents**: Whether the model's top prediction matches the
-most-visited MCTS move.
+**Represents:** Whether the model's top prediction matches the most-visited MCTS move.
 
-**Target behavior / ranges**: - Should rise early; later may plateau. -
-In large action spaces, absolute values may remain "not huge" even when
-learning is real---interpret as trend.
+**Target behavior / ranges:**
 
-**Red flags**: - Flat for many iterations while loss decreases → model
-improving calibration but not ranking; or target multimodality. - Drops
-sharply with stable loss → ranking issue or data drift.
+- Should rise early; later may plateau.
+- In large action spaces, absolute values may remain "not huge" even when learning is real—interpret as trend.
 
-**Actions**: - Use alongside top5 (below) to understand ranking vs
-calibration. - If both top1/top5 flatten and KL is low: consider
-capacity, LR too low, or targets too noisy.
+**Red flags:**
 
-------------------------------------------------------------------------
+- Flat for many iterations while loss decreases → model improving calibration but not ranking; or target multimodality.
+- Drops sharply with stable loss → ranking issue or data drift.
+
+**Actions:**
+
+- Use alongside top5 (below) to understand ranking vs calibration.
+- If both top1/top5 flatten and KL is low: consider capacity, LR too low, or targets too noisy.
+
+---
 
 ## `train/policy_top5_accuracy`
 
-**Definition**: Whether the target argmax action is within the model's
-top-5 predicted actions.
+**Definition:** Whether the target argmax action is within the model's top-5 predicted actions.
 
-**Represents**: **Ranking quality** independent of exact ordering;
-early-learning signal.
+**Represents:** **Ranking quality** independent of exact ordering; early-learning signal.
 
-**Target behavior / ranges**: - Often increases earlier than top-1. -
-Should be \>= top-1 by definition.
+**Target behavior / ranges:**
 
-**Red flags**: - Declines while policy_loss stays stable → ranking
-degradation (subtle regression). - Train improves but val does not →
-replay imbalance / too many epochs / skew to newest data.
+- Often increases earlier than top-1.
+- Should be ≥ top-1 by definition.
 
-**Actions**: - If train≫val: increase replay window, reduce epochs per
-iteration, reduce newest_fraction pressure. - If both stagnate with low
-KL: LR might be too low or model capacity bottleneck.
+**Red flags:**
 
-------------------------------------------------------------------------
+- Declines while policy_loss stays stable → ranking degradation (subtle regression).
+- Train improves but val does not → replay imbalance / too many epochs / skew to newest data.
+
+**Actions:**
+
+- If train ≫ val: increase replay window, reduce epochs per iteration, reduce newest_fraction pressure.
+- If both stagnate with low KL: LR might be too low or model capacity bottleneck.
+
+---
 
 # 2) VALIDATION METRICS (held-out replay)
 
-All `val/*` metrics mirror their `train/*` definitions, computed on
-non-updated batches.
+All `val/*` metrics mirror their `train/*` definitions, computed on non-updated batches.
 
 ## How to interpret train vs val in selfplay RL
 
-Validation here is not "generalization to a different distribution." It
-is a **leak detector** and **overfit-to-recent detector** within replay.
+Validation here is not "generalization to a different distribution." It is a **leak detector** and **overfit-to-recent detector** within replay.
 
-**Expected**: - Train and val trends are similar. - Train is slightly
-better than val. - Big gaps are informative.
+**Expected:**
+
+- Train and val trends are similar.
+- Train is slightly better than val.
+- Big gaps are informative.
 
 ### Primary red-flag patterns
 
--   **Train improves, Val flat/worse** → replay imbalance, too many
-    epochs, or newest_fraction dominance.
--   **Val much noisier** → LR too high, unstable targets, or sampling
-    issues.
+- **Train improves, Val flat/worse** → replay imbalance, too many epochs, or newest_fraction dominance.
+- **Val much noisier** → LR too high, unstable targets, or sampling issues.
 
 ### Primary fixes (in order)
 
-1)  Increase replay window iterations / reduce newest_fraction pressure.
-2)  Reduce epochs_per_iteration.
-3)  Lower LR if instability is present in KL/grad_norm.
+1. Increase replay window iterations / reduce newest_fraction pressure.
+2. Reduce epochs_per_iteration.
+3. Lower LR if instability is present in KL/grad_norm.
 
-(Apply one change at a time; observe 2--5 iterations.)
+(Apply one change at a time; observe 2–5 iterations.)
 
-Val metrics logged: - `val/total_loss` - `val/policy_loss` -
-`val/value_loss` - `val/policy_entropy` - `val/policy_accuracy` -
-`val/policy_top5_accuracy`
+**Val metrics logged:** `val/total_loss`, `val/policy_loss`, `val/value_loss`, `val/policy_entropy`, `val/policy_accuracy`, `val/policy_top5_accuracy`
 
-------------------------------------------------------------------------
+---
 
 # 3) ITERATION METRICS (epoch-averaged, per iteration)
 
 ## `iter/kl_divergence`
 
-**Definition**: KL(target π \|\| policy p) (per batch, averaged).
+**Definition:** KL(target π ‖ policy p) (per batch, averaged).
 
-**Represents**: **Alignment pressure**: how hard the model must move to
-match search.
+**Represents:** **Alignment pressure:** how hard the model must move to match search.
 
-**Target behavior / ranges**: - Should be stable or gently decreasing
-over time. - "Good" depends on your training regime; use stable windows
-as baseline.
+**Target behavior / ranges:**
 
-**Red flags**: - Sustained climb over multiple iterations. - Spikes
-coinciding with schedule changes (LR, temp, sims, score utility).
+- Should be stable or gently decreasing over time.
+- "Good" depends on your training regime; use stable windows as baseline.
 
-**Actions** (in order): 1) Hold LR (do not increase) until KL
-stabilizes. 2) Reduce LR 10--20% if KL remains high \> \~3--5
-iterations. 3) If spike after temperature drop: slow the temperature
-schedule or increase noise. 4) If spike after sims increase: pause sims
-increases until KL normalizes.
+**Red flags:**
 
-**Cross-check**: - If KL rises but target_entropy also rises: targets
-got broader; verify whether the broader targets are expected (e.g.,
-higher temperature or more noise).
+- Sustained climb over multiple iterations.
+- Spikes coinciding with schedule changes (LR, temp, sims, score utility).
 
-------------------------------------------------------------------------
+**Actions** (in order):
+
+1. Hold LR (do not increase) until KL stabilizes.
+2. Reduce LR 10–20% if KL remains high for ~3–5 iterations.
+3. If spike after temperature drop: slow the temperature schedule or increase noise.
+4. If spike after sims increase: pause sims increases until KL normalizes.
+
+**Cross-check:** If KL rises but target_entropy also rises: targets got broader; verify whether the broader targets are expected (e.g., higher temperature or more noise).
+
+---
 
 ## `iter/policy_entropy` and `iter/target_entropy`
 
@@ -311,202 +312,209 @@ See definitions above.
 
 ### The most important derived indicator: the entropy gap
 
-Compute mentally: - Gap = H(policy) − H(target)
+Compute mentally: **Gap = H(policy) − H(target)**
 
-**Interpretation**: - Gap ≈ 0: healthy tracking of sharpness - Gap \<\<
-0: policy too sharp / overconfident - Gap \>\> 0: policy too diffuse /
-underfitting
+**Interpretation:**
 
-**Actions**: - Gap \<\< 0: increase exploration or reduce LR (if also
-unstable) - Gap \>\> 0: increase training pressure (slightly higher LR
-if safe) or increase epochs (careful)
+- **Gap ≈ 0:** healthy tracking of sharpness
+- **Gap ≪ 0:** policy too sharp / overconfident
+- **Gap ≫ 0:** policy too diffuse / underfitting
 
-------------------------------------------------------------------------
+**Actions:**
+
+- Gap ≪ 0: increase exploration or reduce LR (if also unstable).
+- Gap ≫ 0: increase training pressure (slightly higher LR if safe) or increase epochs (careful).
+
+---
 
 ## `iter/policy_cross_entropy`
 
 Same as policy CE, logged explicitly for decomposition reasoning.
 
-**Target behavior**: - Should roughly track: H(target) + KL
+**Target behavior:** Should roughly track H(target) + KL. If it doesn't, check `iter/approx_identity_check`.
 
-If it doesn't, check `iter/approx_identity_check`.
-
-------------------------------------------------------------------------
+---
 
 ## `iter/value_mse`
 
-Same as value_loss but directly MSE (useful when value_loss
-naming/weighting might change).
+Same as value_loss but directly MSE (useful when value_loss naming/weighting might change).
 
-**Red flags/actions**: Same as value_loss, but treat MSE as the
-decision-grade value signal.
+**Red flags/actions:** Same as value_loss, but treat MSE as the decision-grade value signal.
 
-------------------------------------------------------------------------
+---
 
 ## `iter/step_skip_rate`
 
-**Definition**: fraction of steps skipped due to AMP overflow /
-numerical issues.
+**Definition:** Fraction of steps skipped due to AMP overflow / numerical issues.
 
-**Target**: **0**.
+**Target:** **0**.
 
-**Red flags**: - \>0 for more than a tiny blip → training is numerically
-unstable. - Increases after LR change → LR too high.
+**Red flags:**
 
-**Actions**: 1) Lower LR (first choice). 2) Use more conservative AMP
-dtype/scaler parameters. 3) Reduce schedule shocks (temperature/sims
-increases) that change target hardness.
+- >0 for more than a tiny blip → training is numerically unstable.
+- Increases after LR change → LR too high.
 
-------------------------------------------------------------------------
+**Actions:**
+
+1. Lower LR (first choice).
+2. Use more conservative AMP dtype/scaler parameters.
+3. Reduce schedule shocks (temperature/sims increases) that change target hardness.
+
+---
 
 ## `iter/approx_identity_check`
 
-**Definition**: mean over samples of: \[ \|H(`\pi`{=tex}\_i) +
-KL(`\pi`{=tex}\_i\|p_i) - CE(`\pi`{=tex}\_i,p_i)\| \]
+**Definition:** Mean over samples of |H(π_i) + KL(π_i‖p_i) − CE(π_i, p_i)|.
 
-**Represents**: A **math consistency alarm**. If this is large,
-something is wrong in masking/log-prob usage or logging.
+**Represents:** A **math consistency alarm**. If this is large, something is wrong in masking/log-prob usage or logging.
 
-**Target behavior / ranges**: - Typically \~1e-7 to 1e-4. - It can
-increase slightly with aggressive clamping, low precision, or unusual
-masking---but should remain tiny.
+**Target behavior / ranges:**
 
-**Red flags**: - Sustained \>1e-3 - Sudden jump after refactor
+- Typically ~1e-7 to 1e-4.
+- It can increase slightly with aggressive clamping, low precision, or unusual masking—but should remain tiny.
 
-**Actions**: - Verify: logits masking, target normalization, use of
-log-softmax for CE/entropy/KL, and that the same tensors feed each term.
+**Red flags:**
 
-------------------------------------------------------------------------
+- Sustained >1e-3
+- Sudden jump after refactor
+
+**Actions:** Verify: logits masking, target normalization, use of log-softmax for CE/entropy/KL, and that the same tensors feed each term.
+
+---
 
 # 4) SELFPLAY METRICS (per iteration)
 
-Selfplay metrics are the earliest warning system for distribution
-collapse and search quality issues.
+Selfplay metrics are the earliest warning system for distribution collapse and search quality issues.
 
 ## `selfplay/games_per_min`
 
-**Definition**: throughput (games generated per minute).
+**Definition:** Throughput (games generated per minute).
 
-**Represents**: system performance + cost of search.
+**Represents:** System performance + cost of search.
 
-**Target behavior**: - Decreases as sims increase; otherwise stable.
+**Target behavior:** Decreases as sims increase; otherwise stable.
 
-**Red flags**: - Sudden step down not explained by schedule. - Gradual
-erosion → data loader / CPU contention / parallel leaves issues.
+**Red flags:**
 
-**Actions**: - If schedule-related: accept or compensate by reducing
-games or parallel leaves. - If not schedule-related: profile selfplay
-workers, CPU affinity, dataloader contention.
+- Sudden step down not explained by schedule.
+- Gradual erosion → data loader / CPU contention / parallel leaves issues.
 
-------------------------------------------------------------------------
+**Actions:**
+
+- If schedule-related: accept or compensate by reducing games or parallel leaves.
+- If not schedule-related: profile selfplay workers, CPU affinity, dataloader contention.
+
+---
 
 ## `selfplay/num_positions`
 
-**Definition**: positions generated per iteration.
+**Definition:** Positions generated per iteration.
 
-**Represents**: data volume. Lower volume means higher variance SGD.
+**Represents:** Data volume. Lower volume means higher variance SGD.
 
-**Red flags**: - Unexpected drop → selfplay failure, early termination,
-throughput regression.
+**Red flags:** Unexpected drop → selfplay failure, early termination, throughput regression.
 
-**Actions**: - Check generation_time and games_per_min first. - Confirm
-games count and avg_game_length.
+**Actions:** Check generation_time and games_per_min first. Confirm games count and avg_game_length.
 
-------------------------------------------------------------------------
+---
 
 ## `selfplay/num_games`
 
-**Definition**: games generated per iteration.
+**Definition:** Games generated per iteration.
 
-**Represents**: primary sample count.
+**Represents:** Primary sample count.
 
-**Red flags**: - Drop larger than schedule expects → perf regression or
-selfplay stopping early.
+**Red flags:** Drop larger than schedule expects → perf regression or selfplay stopping early.
 
-------------------------------------------------------------------------
+---
 
 ## `selfplay/avg_game_length`
 
-**Definition**: average moves/plies per game.
+**Definition:** Average moves/plies per game.
 
-**Represents**: distributional shift; can indicate degeneracy.
+**Represents:** Distributional shift; can indicate degeneracy.
 
-**Red flags**: - Rapid shrink: resignation/termination bug, collapsed
-strategies. - Rapid growth: indecisive play; policy too diffuse or value
-too uncertain.
+**Red flags:**
 
-**Actions**: - If shrink + redundancy up: increase exploration. - If
-growth + entropy high: consider more sims or modest temperature
-reduction (only if stable).
+- Rapid shrink: resignation/termination bug, collapsed strategies.
+- Rapid growth: indecisive play; policy too diffuse or value too uncertain.
 
-------------------------------------------------------------------------
+**Actions:**
+
+- If shrink + redundancy up: increase exploration.
+- If growth + entropy high: consider more sims or modest temperature reduction (only if stable).
+
+---
 
 ## `selfplay/unique_positions`
 
-**Definition**: count of unique positions encountered (or your system's
-notion of uniqueness).
+**Definition:** Count of unique positions encountered (or your system's notion of uniqueness).
 
-**Represents**: diversity; the antidote to replay overfitting.
+**Represents:** Diversity; the antidote to replay overfitting.
 
-**Target behavior**: - Should scale with num_positions; ratio should
-remain healthy.
+**Target behavior:** Should scale with num_positions; ratio should remain healthy.
 
-**Red flags**: - Downtrend while num_positions stable → repetition /
-collapse. - Downtrend coinciding with entropy collapse → strong collapse
-signature.
+**Red flags:**
 
-**Actions**: - Increase exploration: noise weight, Dirichlet alpha,
-temperature, reduce q_value_weight aggressiveness.
+- Downtrend while num_positions stable → repetition / collapse.
+- Downtrend coinciding with entropy collapse → strong collapse signature.
 
-------------------------------------------------------------------------
+**Actions:** Increase exploration: noise weight, Dirichlet alpha, temperature, reduce q_value_weight aggressiveness.
+
+---
 
 ## `selfplay/avg_redundancy`
 
-**Definition**: how repetitive positions are on average.
+**Definition:** How repetitive positions are on average.
 
-**Represents**: collapse / cycling / low exploration.
+**Represents:** Collapse / cycling / low exploration.
 
-**Target behavior**: - Should remain stable or decrease as policy
-improves (depends on game).
+**Target behavior:** Should remain stable or decrease as policy improves (depends on game).
 
-**Red flags**: - Sustained increase over iterations. - Spikes after
-temperature drop or noise decrease.
+**Red flags:**
 
-**Actions**: 1) Increase noise (weight or alpha). 2) Slow temperature
-decay. 3) If KL also rises: reduce LR.
+- Sustained increase over iterations.
+- Spikes after temperature drop or noise decrease.
 
-------------------------------------------------------------------------
+**Actions:**
+
+1. Increase noise (weight or alpha).
+2. Slow temperature decay.
+3. If KL also rises: reduce LR.
+
+---
 
 ## `selfplay/avg_policy_entropy`
 
-**Definition**: average entropy of the search policy at root (or model
-prior, depending on your pipeline), as computed in selfplay stats.
+**Definition:** Average entropy of the search policy at root (or model prior, depending on your pipeline), as computed in selfplay stats.
 
-**Represents**: search uncertainty / diversity at decision time.
+**Represents:** Search uncertainty / diversity at decision time.
 
-**Red flags**: - Collapsing to near-zero early. - Diverging from
-train/iter entropy trends unexpectedly.
+**Red flags:**
 
-**Actions**: - If root entropy collapses while model entropy is fine:
-search settings are too exploitative (cpuct, q weight, noise). - If both
-collapse: increase exploration globally + reduce LR if unstable.
+- Collapsing to near-zero early.
+- Diverging from train/iter entropy trends unexpectedly.
 
-------------------------------------------------------------------------
+**Actions:**
+
+- If root entropy collapses while model entropy is fine: search settings are too exploitative (cpuct, q weight, noise).
+- If both collapse: increase exploration globally + reduce LR if unstable.
+
+---
 
 ## `selfplay/avg_top1_prob`
 
-**Definition**: average probability mass on the most likely action
-(root).
+**Definition:** Average probability mass on the most likely action (root).
 
-**Represents**: peakedness. Complement to entropy.
+**Represents:** Peakedness. Complement to entropy.
 
-**Healthy**: - Increases gradually as policy sharpens.
+**Healthy:** Increases gradually as policy sharpens.
 
-**Red flags**: - Jumps abruptly (often means determinism/collapse).
+**Red flags:** Jumps abruptly (often means determinism/collapse).
 
-**Actions**: - Increase exploration; slow temperature decay.
+**Actions:** Increase exploration; slow temperature decay.
 
-------------------------------------------------------------------------
+---
 
 ## `selfplay/avg_num_legal`
 
@@ -521,75 +529,77 @@ policy steering into constrained states.
 **Actions**: - If sudden: check mask generation and engine legality
 encoding. - If gradual + collapse signals: increase exploration.
 
-------------------------------------------------------------------------
+---
 
 ## `selfplay/avg_root_q`
 
-**Definition**: average root Q value from search.
+**Definition:** Average root Q value from search.
 
-**Represents**: value calibration + utility scaling; also detects bias.
+**Represents:** Value calibration + utility scaling; also detects bias.
 
-**Target behavior**: - Should be stable around a plausible equilibrium
-for your scoring scheme.
+**Target behavior:** Should be stable around a plausible equilibrium for your scoring scheme.
 
-**Red flags**: - Persistent drift (up or down). - Drift coincides with
-value MSE rising.
+**Red flags:**
 
-**Actions**: - Check value targets and loss scaling. - Lower LR
-slightly; value instability often responds to LR reductions. - If you
-recently changed dynamic score utility: slow ramp or reduce score
-weight.
+- Persistent drift (up or down).
+- Drift coincides with value MSE rising.
 
-------------------------------------------------------------------------
+**Actions:**
+
+- Check value targets and loss scaling.
+- Lower LR slightly; value instability often responds to LR reductions.
+- If you recently changed dynamic score utility: slow ramp or reduce score weight.
+
+---
 
 ## `selfplay/generation_time`
 
-**Definition**: time spent generating selfplay for an iteration (or per
-selfplay batch).
+**Definition:** Time spent generating selfplay for an iteration (or per selfplay batch).
 
-**Represents**: cost and scheduling pressure.
+**Represents:** Cost and scheduling pressure.
 
-**Red flags**: - Increases without a schedule reason. - Increases +
-games_per_min decreases unexpectedly.
+**Red flags:**
 
-**Actions**: - Profile selfplay; check sims/leaves schedule; check CPU
-saturation.
+- Increases without a schedule reason.
+- Increases + games_per_min decreases unexpectedly.
 
-------------------------------------------------------------------------
+**Actions:** Profile selfplay; check sims/leaves schedule; check CPU saturation.
+
+---
 
 # 5) BUFFER METRICS (per iteration)
 
 ## `buffer/total_positions`
 
-**Definition**: positions stored in replay (may cap at max_size).
+**Definition:** Positions stored in replay (may cap at max_size).
 
-**Represents**: buffer fullness / capacity.
+**Represents:** Buffer fullness / capacity.
 
-**Red flags**: - Not reaching cap when expected → ingestion bug. -
-Constantly at cap is fine; then diversity depends on
-window/newest_fraction.
+**Red flags:**
 
-**Actions**: - If not filling: check selfplay generation and replay
-insertion. - If filling too fast and cycling: increase window_iterations
-or adjust newest_fraction.
+- Not reaching cap when expected → ingestion bug.
+- Constantly at cap is fine; then diversity depends on window/newest_fraction.
 
-------------------------------------------------------------------------
+**Actions:**
+
+- If not filling: check selfplay generation and replay insertion.
+- If filling too fast and cycling: increase window_iterations or adjust newest_fraction.
+
+---
 
 ## `buffer/num_iterations`
 
-**Definition**: number of iterations represented in replay buffer.
+**Definition:** Number of iterations represented in replay buffer.
 
-**Represents**: temporal diversity.
+**Represents:** Temporal diversity.
 
-**Target behavior**: - Should follow your configured window/retention
-behavior.
+**Target behavior:** Should follow your configured window/retention behavior.
 
-**Red flags**: - Much smaller than expected → retention bug or
-over-aggressive trimming.
+**Red flags:** Much smaller than expected → retention bug or over-aggressive trimming.
 
-**Actions**: - Verify replay window logic and max_size interactions.
+**Actions:** Verify replay window logic and max_size interactions.
 
-------------------------------------------------------------------------
+---
 
 # 6) RED FLAGS --- COMPLETE PLAYBOOK
 
@@ -599,250 +609,226 @@ This section is organized by **symptom → diagnosis → fix**.
 
 ### Symptom
 
--   `iter/kl_divergence` spikes or trends upward
--   `train/grad_norm` spikes
--   `iter/step_skip_rate` \> 0
+- `iter/kl_divergence` spikes or trends upward
+- `train/grad_norm` spikes
+- `iter/step_skip_rate` > 0
 
 ### Likely causes
 
--   LR too high for current target hardness
--   Schedule shock: temperature drop, sims increase, noise decrease,
-    score utility ramp
+- LR too high for current target hardness
+- Schedule shock: temperature drop, sims increase, noise decrease, score utility ramp
 
 ### Fix (order matters)
 
-1)  **Hold** the schedule (pause further temp/sims/noise changes).
-2)  Reduce LR 10--20% (or slow next LR step).
-3)  If AMP overflow: lower LR first; only then adjust scaler/dtype.
+1. **Hold** the schedule (pause further temp/sims/noise changes).
+2. Reduce LR 10–20% (or slow next LR step).
+3. If AMP overflow: lower LR first; only then adjust scaler/dtype.
 
-------------------------------------------------------------------------
+---
 
 ## B) Policy collapse / degeneracy
 
 ### Symptom
 
--   `iter/policy_entropy` drops rapidly
--   `selfplay/avg_redundancy` rises
--   `selfplay/unique_positions` falls
--   `selfplay/avg_top1_prob` jumps
+- `iter/policy_entropy` drops rapidly
+- `selfplay/avg_redundancy` rises
+- `selfplay/unique_positions` falls
+- `selfplay/avg_top1_prob` jumps
 
 ### Likely causes
 
--   Exploration too low (noise/alpha too low, temp too low)
--   Q-weight / cpuct too exploitative
--   Too fast temperature decay
+- Exploration too low (noise/alpha too low, temp too low)
+- Q-weight / cpuct too exploitative
+- Too fast temperature decay
 
 ### Fix (fast)
 
-1)  Increase exploration **immediately** (noise weight up, alpha up, or
-    temp up).
-2)  Pause sims increases (high sims amplifies a strong prior).
-3)  If KL also unstable: reduce LR.
+1. Increase exploration **immediately** (noise weight up, alpha up, or temp up).
+2. Pause sims increases (high sims amplifies a strong prior).
+3. If KL also unstable: reduce LR.
 
-------------------------------------------------------------------------
+---
 
 ## C) Underfitting / "not learning"
 
 ### Symptom
 
--   `train/policy_loss` flat for many iterations
--   `train/policy_accuracy` and top5 flat
--   KL very low and stable
+- `train/policy_loss` flat for many iterations
+- `train/policy_accuracy` and top5 flat
+- KL very low and stable
 
 ### Likely causes
 
--   LR too low
--   Targets too easy / too deterministic
--   Capacity bottleneck
+- LR too low
+- Targets too easy / too deterministic
+- Capacity bottleneck
 
 ### Fix
 
-1)  Verify targets still have entropy (`iter/target_entropy` not near
-    0).
-2)  If KL is very low and everything is flat, **increase LR modestly**
-    (5--10%).
-3)  Consider increasing epochs_per_iteration (careful: watch train/val
-    gap).
-4)  If still stuck: capacity or feature issues.
+1. Verify targets still have entropy (`iter/target_entropy` not near 0).
+2. If KL is very low and everything is flat, **increase LR modestly** (5–10%).
+3. Consider increasing epochs_per_iteration (careful: watch train/val gap).
+4. If still stuck: capacity or feature issues.
 
-------------------------------------------------------------------------
+---
 
 ## D) Replay imbalance / overfit-to-recent
 
 ### Symptom
 
--   Train improves, Val does not
--   Selfplay diversity decreasing
--   Unique positions fraction down
+- Train improves, Val does not
+- Selfplay diversity decreasing
+- Unique positions fraction down
 
 ### Fix
 
-1)  Increase replay window_iterations.
-2)  Reduce epochs_per_iteration.
-3)  Reduce newest_fraction pressure (if applicable).
+1. Increase replay window_iterations.
+2. Reduce epochs_per_iteration.
+3. Reduce newest_fraction pressure (if applicable).
 
-------------------------------------------------------------------------
+---
 
 ## E) Value drift
 
 ### Symptom
 
--   `iter/value_mse` rising
--   `selfplay/avg_root_q` drifting
--   `selfplay/avg_game_length` shifts
+- `iter/value_mse` rising
+- `selfplay/avg_root_q` drifting
+- `selfplay/avg_game_length` shifts
 
 ### Fix
 
-1)  Lower LR slightly (5--15%).
-2)  Check score utility ramp and score/value loss weights.
-3)  Increase data volume (more games or positions) if variance is high.
+1. Lower LR slightly (5–15%).
+2. Check score utility ramp and score/value loss weights.
+3. Increase data volume (more games or positions) if variance is high.
 
-------------------------------------------------------------------------
+---
 
 ## F) Performance regression
 
 ### Symptom
 
--   `selfplay/games_per_min` down unexpectedly
--   `selfplay/generation_time` up unexpectedly
+- `selfplay/games_per_min` down unexpectedly
+- `selfplay/generation_time` up unexpectedly
 
 ### Fix
 
-1)  Confirm sims/leaves schedule didn't change.
-2)  Profile selfplay worker utilization (CPU bound vs GPU bound).
-3)  Check dataloader contention and pin_memory/persistent_workers
-    settings.
+1. Confirm sims/leaves schedule didn't change.
+2. Profile selfplay worker utilization (CPU bound vs GPU bound).
+3. Check dataloader contention and pin_memory/persistent_workers settings.
 
-------------------------------------------------------------------------
+---
 
 # 7) WHEN TO CHANGE SCHEDULES (DECISION RULES)
 
-These rules assume you only change one major knob at a time and observe
-for 2--5 iterations.
+These rules assume you only change one major knob at a time and observe for 2–5 iterations.
 
 ## Lower LR when
 
--   `iter/kl_divergence` is elevated and not improving for \~3--5
-    iterations, **or**
--   `train/grad_norm` spike frequency increases, **or**
--   `iter/step_skip_rate` \> 0, **or**
--   Entropy and KL become more volatile after a schedule change.
+- `iter/kl_divergence` is elevated and not improving for ~3–5 iterations, **or**
+- `train/grad_norm` spike frequency increases, **or**
+- `iter/step_skip_rate` > 0, **or**
+- Entropy and KL become more volatile after a schedule change.
 
-**Typical move**: -10% to -20% (or shift the next planned drop earlier).
+**Typical move:** −10% to −20% (or shift the next planned drop earlier).
 
 ## Hold LR (do nothing) when
 
--   KL is high but trending down,
--   selfplay quality stable,
--   losses still improving.
+- KL is high but trending down
+- Selfplay quality stable
+- Losses still improving
 
 ## Increase LR (rare) when
 
--   KL is very low and stable,
--   train/val both flat,
--   selfplay is healthy (diverse),
--   and you've been stagnant for \~8--12 iterations.
+- KL is very low and stable
+- Train/val both flat
+- Selfplay is healthy (diverse)
+- You've been stagnant for ~8–12 iterations
 
-**Typical move**: +5% to +10%.
+**Typical move:** +5% to +10%.
 
-------------------------------------------------------------------------
+---
 
 ## Increase MCTS sims when
 
--   KL is low/stable,
--   policy_loss is improving smoothly,
--   selfplay diversity is stable (unique_positions not falling;
-    redundancy not rising),
--   value_mse stable.
+- KL is low/stable
+- Policy_loss is improving smoothly
+- Selfplay diversity is stable (unique_positions not falling; redundancy not rising)
+- Value_mse stable
 
-**Do not** increase sims during instability---sims amplifies bad priors.
+**Do not** increase sims during instability—sims amplifies bad priors.
 
-------------------------------------------------------------------------
+---
 
 ## Lower temperature when
 
--   policy and target entropies are close and stable,
--   redundancy is not rising,
--   KL is low/stable.
+- Policy and target entropies are close and stable
+- Redundancy is not rising
+- KL is low/stable
 
-If temperature drops cause redundancy spikes or entropy collapse →
-revert/slow the schedule and increase noise.
+If temperature drops cause redundancy spikes or entropy collapse → revert/slow the schedule and increase noise.
 
-------------------------------------------------------------------------
+---
 
 ## Reduce noise / alpha when
 
--   selfplay redundancy is low and stable for many iterations,
--   unique_positions remains healthy,
--   and you want more exploitation.
+- Selfplay redundancy is low and stable for many iterations
+- Unique_positions remains healthy
+- You want more exploitation
 
 If reduction causes collapse: revert immediately.
 
-------------------------------------------------------------------------
+---
 
 ## Increase replay window when
 
--   train/val gap appears,
--   redundancy increases,
--   or you hit replay max_size and start cycling too fast.
+- Train/val gap appears
+- Redundancy increases
+- You hit replay max_size and start cycling too fast
 
-------------------------------------------------------------------------
+---
 
 # 8) FAQ (the stuff that burns time in the moment)
 
-### "Policy loss and policy entropy are close --- is that a bug?"
+### "Policy loss and policy entropy are close—is that a bug?"
 
-Not necessarily. CE(target, policy) can be close to H(policy) when KL is
-moderate and entropies are similar. Use: - `iter/target_entropy`,
-`iter/kl_divergence`, and `iter/approx_identity_check`. If
-identity_check is tiny, math/logging is consistent.
+Not necessarily. CE(target, policy) can be close to H(policy) when KL is moderate and entropies are similar. Use `iter/target_entropy`, `iter/kl_divergence`, and `iter/approx_identity_check`. If identity_check is tiny, math/logging is consistent.
 
 ### "What is a 'good' entropy value?"
 
-There is no universal number. The correct target is: - not collapsing
-abruptly, - and maintaining healthy diversity in selfplay. Upper bound
-is log(#legal), and the baseline is whatever produced good selfplay
-historically.
+There is no universal number. The correct target is: not collapsing abruptly, and maintaining healthy diversity in selfplay. Upper bound is log(#legal), and the baseline is whatever produced good selfplay historically.
 
-### "Val looks the same as train --- is val useless?"
+### "Val looks the same as train—is val useless?"
 
-Val is your "replay skew detector." If train and val always overlap,
-it's still useful as a safety check. If they diverge, it's extremely
-informative.
+Val is your "replay skew detector." If train and val always overlap, it's still useful as a safety check. If they diverge, it's extremely informative.
 
 ### "Which metric detects collapse earliest?"
 
-Usually selfplay: `avg_redundancy` up + `unique_positions` down,
-followed closely by `policy_entropy` collapse.
+Usually selfplay: `avg_redundancy` up + `unique_positions` down, followed closely by `policy_entropy` collapse.
 
 ### "Which metric is the best 'stop touching knobs' signal?"
 
-`iter/kl_divergence` stabilizing in a healthy band while selfplay
-diversity stays healthy.
+`iter/kl_divergence` stabilizing in a healthy band while selfplay diversity stays healthy.
 
-------------------------------------------------------------------------
+---
 
 ## Appendix: Metric list (canonical)
 
-Train: - train/learning_rate - train/total_loss - train/policy_loss -
-train/value_loss - train/grad_norm - train/policy_entropy -
-train/policy_accuracy - train/policy_top5_accuracy
+**Train:**  
+`train/learning_rate`, `train/total_loss`, `train/policy_loss`, `train/value_loss`, `train/grad_norm`, `train/policy_entropy`, `train/policy_accuracy`, `train/policy_top5_accuracy`
 
-Val: - val/total_loss - val/policy_loss - val/value_loss -
-val/policy_entropy - val/policy_accuracy - val/policy_top5_accuracy
+**Val:**  
+`val/total_loss`, `val/policy_loss`, `val/value_loss`, `val/policy_entropy`, `val/policy_accuracy`, `val/policy_top5_accuracy`
 
-Iter: - iter/kl_divergence - iter/policy_entropy - iter/target_entropy -
-iter/policy_cross_entropy - iter/value_mse - iter/step_skip_rate -
-iter/approx_identity_check
+**Iter:**  
+`iter/kl_divergence`, `iter/policy_entropy`, `iter/target_entropy`, `iter/policy_cross_entropy`, `iter/value_mse`, `iter/step_skip_rate`, `iter/approx_identity_check`
 
-Selfplay: - selfplay/games_per_min - selfplay/num_positions -
-selfplay/num_games - selfplay/avg_game_length -
-selfplay/unique_positions - selfplay/avg_redundancy -
-selfplay/avg_policy_entropy - selfplay/avg_top1_prob -
-selfplay/avg_num_legal - selfplay/avg_root_q - selfplay/generation_time
+**Selfplay:**  
+`selfplay/games_per_min`, `selfplay/num_positions`, `selfplay/num_games`, `selfplay/avg_game_length`, `selfplay/unique_positions`, `selfplay/avg_redundancy`, `selfplay/avg_policy_entropy`, `selfplay/avg_top1_prob`, `selfplay/avg_num_legal`, `selfplay/avg_root_q`, `selfplay/generation_time`
 
-Buffer: - buffer/total_positions - buffer/num_iterations
+**Buffer:**  
+`buffer/total_positions`, `buffer/num_iterations`
 
-------------------------------------------------------------------------
+---
 
 **End.**

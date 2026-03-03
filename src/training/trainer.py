@@ -1106,7 +1106,7 @@ class Trainer:
                 )
 
             if self.global_step % 10 == 0:
-                # Train metrics (canonical whitelist)
+                # Train metrics (canonical spec only)
                 self.writer.add_scalar("train/learning_rate", self.scheduler.get_last_lr()[0], self.global_step)
                 self.writer.add_scalar("train/total_loss", metrics["total_loss"], self.global_step)
                 self.writer.add_scalar("train/policy_loss", metrics["policy_loss"], self.global_step)
@@ -1114,14 +1114,16 @@ class Trainer:
                 self.writer.add_scalar("train/grad_norm", grad_norm.item(), self.global_step)
                 self.writer.add_scalar("train/policy_entropy", metrics["policy_entropy"], self.global_step)
                 self.writer.add_scalar("train/policy_accuracy", metrics["policy_accuracy"], self.global_step)
-                self.writer.add_scalar("train/policy_top5_accuracy", metrics["policy_top5_accuracy"], self.global_step)
 
             if val_loader is not None and self.global_step % self.config["training"]["val_frequency"] == 0:
                 val_metrics = self.validate(val_loader)
 
-                for k in ("total_loss", "policy_loss", "value_loss", "policy_entropy", "policy_accuracy", "policy_top5_accuracy"):
-                    if k in val_metrics:
-                        self.writer.add_scalar(f"val/{k}", val_metrics[k], self.global_step)
+                # Val metrics (canonical spec only)
+                self.writer.add_scalar("val/total_loss", val_metrics["total_loss"], self.global_step)
+                self.writer.add_scalar("val/policy_loss", val_metrics["policy_loss"], self.global_step)
+                self.writer.add_scalar("val/value_loss", val_metrics["value_loss"], self.global_step)
+                self.writer.add_scalar("val/policy_entropy", val_metrics["policy_entropy"], self.global_step)
+                self.writer.add_scalar("val/policy_accuracy", val_metrics["policy_accuracy"], self.global_step)
 
                 logger.debug(f"Step {self.global_step}: Val loss = {val_metrics['total_loss']:.4f}")
 
@@ -1153,6 +1155,8 @@ class Trainer:
         val_metrics = {
             "policy_loss": 0.0,
             "value_loss": 0.0,
+            "score_loss": 0.0,
+            "ownership_loss": 0.0,
             "total_loss": 0.0,
             "policy_accuracy": 0.0,
             "policy_top5_accuracy": 0.0,
