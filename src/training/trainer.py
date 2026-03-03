@@ -764,9 +764,12 @@ class Trainer:
                 ema_loaded = True
             except Exception as e:
                 logger.warning("[OPT_RESUME] EMA state mismatch, using fresh: %s", e)
-        # Only overwrite global_step when we actually resumed (keeps TensorBoard continuity)
+        # Only overwrite global_step when we actually resumed (keeps TensorBoard continuity).
+        # Never decrease step: the checkpoint may be from an older iteration (e.g. best_model from
+        # many iters ago), so use max(offset, ckpt) to avoid TensorBoard "snap to origin" artifacts.
         if opt_loaded or sched_loaded:
-            self.global_step = int(ckpt.get("global_step", self.global_step))
+            ckpt_step = int(ckpt.get("global_step", self.global_step))
+            self.global_step = max(self.global_step, ckpt_step)
         train_base = model_source if model_source is not None else checkpoint_path
         logger.info(
             "[OPT_RESUME] source=%s train_base=%s (must match)  enabled=opt:%s sched:%s scaler:%s ema:%s  loaded=opt:%s sched:%s scaler:%s ema:%s",

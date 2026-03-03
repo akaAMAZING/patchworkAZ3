@@ -810,6 +810,14 @@ Usually selfplay: `avg_redundancy` up + `unique_positions` down, followed closel
 
 `iter/kl_divergence` stabilizing in a healthy band while selfplay diversity stays healthy.
 
+### Train metrics "snap to the beginning of the chart" (e.g. around steps 22k–23k)
+
+**Symptom:** `train/*` scalars show a discontinuity where the line jumps from the current step range (e.g. 22870) back to step 0 (or a low step), then continues, so the plot appears to snap to the left and sometimes shows a vertical spike.
+
+**Cause:** Each iteration creates a new TensorBoard event file. Train metrics use a **run-wide** `global_step` (monotonic across iterations). When the trainer resumes optimizer/scheduler from a checkpoint, it used to overwrite `global_step` with the checkpoint’s value. If that checkpoint is from an **older** iteration (e.g. `best_model` from many iters ago) or has a lower step (e.g. 0), the next event file contained steps 0, 10, 20, … TensorBoard merges all event files in `logs/tensorboard/`, so the same tag gets two step sequences (…, 22870 and 0, 10, …), producing the snap/spike.
+
+**Fix (in code):** The trainer now keeps the run-wide step monotonic: when loading optimizer/scheduler state it sets `global_step = max(global_step_offset, checkpoint_global_step)` so the step never goes backwards. Existing runs that already wrote the bad event file will still show the artifact; new runs will not.
+
 ---
 
 ## Appendix: Metric list (canonical)
