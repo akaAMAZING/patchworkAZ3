@@ -50,7 +50,7 @@ const COLORS = {
 };
 
 /** Colors for last-turn placements (1st..4th), shown only after turn has ended */
-const PLACEMENT_COLORS = ["#00E5FF", "#FFEA00", "#FF00C8", "#00FF6A"]; // Electric Cyan, Pure Yellow, Hot Magenta, Neon Green
+const PLACEMENT_COLORS = ["#00FF6A", "#FFEA00", "#FF00C8", "#0044FF"]; // 1st Neon Green, 2nd Pure Yellow, 3rd Hot Magenta, 4th Electric Blue
 
 /** Per-piece hex colors (piece id 0..32); index 33 = patch (Abyss Navy) */
 const PIECE_HEX = [
@@ -1323,6 +1323,15 @@ export default function App() {
           <div>
             <div style={{ fontSize: 22, fontWeight: 900 }}>Patchwork Pro GUI</div>
             <div style={{ fontSize: 12, color: COLORS.muted }}>Hotkeys: Space=AI, L=legal, N=new, E=edit, P=pass</div>
+          </div>
+          <div style={{ flex: 1, display: "flex", justifyContent: "center", alignItems: "center", gap: 10, minWidth: 0 }}>
+            <span style={{ fontSize: 11, color: COLORS.muted }}>Last turn order:</span>
+            {PLACEMENT_COLORS.map((hex, i) => (
+              <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                <span style={{ width: 14, height: 14, borderRadius: 4, background: hex, border: `1px solid ${COLORS.border}` }} title={`Placement ${i + 1}`} />
+                <span style={{ fontSize: 11, color: COLORS.muted }}>{i + 1}</span>
+              </span>
+            ))}
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <Button onClick={() => setShowSetup((v) => !v)}>{showSetup ? "Hide Setup" : "Show Setup"}</Button>
