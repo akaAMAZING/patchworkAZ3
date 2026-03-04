@@ -476,6 +476,19 @@ class OptimizedAlphaZeroMCTS:
         """Reset the Dirichlet noise RNG. Call before each game for reproducibility."""
         self._noise_rng = np.random.default_rng(seed)
 
+    def clear_tree(self) -> None:
+        """Clear the MCTS tree (e.g. on new game). Used by GUI/API when starting a fresh game."""
+        self._root = None
+
+    def advance_tree(self, action: tuple) -> None:
+        """Move root to the child for the given action (GUI tree reuse). Next search continues from that node."""
+        if self._root is not None and self._root.children and action in self._root.children:
+            child = self._root.children[action]
+            if child is not None:
+                self._root = child
+                return
+        self._root = None
+
     # ------------------------------------------------------------------
     # Score utility (KataGo dual-head)
     # ------------------------------------------------------------------
