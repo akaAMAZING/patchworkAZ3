@@ -49,6 +49,9 @@ const COLORS = {
   amber: "#fbbf24",
 };
 
+/** Colors for last-turn placements (1st..4th), shown only after turn has ended */
+const PLACEMENT_COLORS = ["#00E5FF", "#FFEA00", "#FF00C8", "#00FF6A"]; // Electric Cyan, Pure Yellow, Hot Magenta, Neon Green
+
 /** Per-piece hex colors (piece id 0..32); index 33 = patch (Abyss Navy) */
 const PIECE_HEX = [
   "#2C3E50", "#8B2635", "#2D6A4F", "#7B3F00", "#4A235A", "#1A5276", "#6B4226", "#1C4E40", "#7D6608", "#512E5F",
@@ -270,7 +273,7 @@ function BoardGrid({
   overlayCells,
   highlightIdxSet,
   hintTopLeftSet,
-  lastMoveIdxSet,
+  lastMovePlacements,
   editMode,
 }) {
   const overlayMap = useMemo(() => {
@@ -279,6 +282,20 @@ function BoardGrid({
     for (const x of overlayCells) m.set(`${x.r},${x.c}`, x.val);
     return m;
   }, [overlayCells]);
+
+  const placementColorByKey = useMemo(() => {
+    const m = new Map();
+    if (!Array.isArray(lastMovePlacements)) return m;
+    for (let i = 0; i < Math.min(lastMovePlacements.length, 4); i++) {
+      const cells = lastMovePlacements[i];
+      if (!Array.isArray(cells)) continue;
+      const hex = PLACEMENT_COLORS[i] ?? PLACEMENT_COLORS[0];
+      for (const cell of cells) {
+        if (cell?.r != null && cell?.c != null) m.set(`${cell.r},${cell.c}`, hex);
+      }
+    }
+    return m;
+  }, [lastMovePlacements]);
 
   return (
     <div style={{ background: COLORS.panel, border: `2px solid ${active ? accent : COLORS.border}`, borderRadius: 14, padding: 12 }}>
@@ -312,10 +329,11 @@ function BoardGrid({
             const ov = overlayMap.get(`${r},${c}`);
             const patchLegal = highlightIdxSet && highlightIdxSet.has(idx);
             const hintTopLeft = hintTopLeftSet && hintTopLeftSet.has(idx);
-            const isLastMove = lastMoveIdxSet && lastMoveIdxSet.has(`${r},${c}`);
+            const placementHex = placementColorByKey.get(`${r},${c}`);
+            const isLastMove = !!placementHex;
             const filled = v !== 0;
             const pieceId = pieceIdBoard?.[r]?.[c];
-            const filledBg = isLastMove ? "rgba(251,191,36,0.45)" : filled ? getCellFillHex(pieceId) : "#0b1430";
+            const filledBg = isLastMove ? (placementHex + "99") : filled ? getCellFillHex(pieceId) : "#0b1430";
             const bg = over
               ? "rgba(251,191,36,0.22)"
               : patchLegal
@@ -326,7 +344,7 @@ function BoardGrid({
             const border = over
               ? `2px solid ${COLORS.amber}`
               : isLastMove
-                ? `2px solid ${COLORS.amber}`
+                ? `2px solid ${placementHex}`
                 : patchLegal
                   ? `2px solid ${COLORS.ok}`
                   : hintTopLeft
@@ -554,10 +572,12 @@ export default function App() {
   const [engine, setEngine] = useLocalStorageState("pw_engine", "nn");
   const [mctsIterations, setMctsIterations] = useLocalStorageState("pw_mcts_iters", 50000);
   const [mctsWorkers, setMctsWorkers] = useLocalStorageState("pw_mcts_workers", 4);
-  const [nnSimulations, setNnSimulations] = useLocalStorageState("pw_nn_sims", 800);
+  const [nnSimulations, setNnSimulations] = useLocalStorageState("pw_nn_sims", 3000);
 
   const [nnStatus, setNnStatus] = useState(null);
-  const [nnPath, setNnPath] = useLocalStorageState("pw_nn_path", "C:\\Users\\Shanks\\Desktop\\Codes\\patchworkaz - Copy - v2\\checkpoints\\latest_model.pt");
+  // Best model: committed iter69. Fallback default: latest_model.pt
+  const ITER69_PATH = "C:\\Users\\Shanks\\Desktop\\Codes\\patchworkaz - Copy - v2\\runs\\patchwork_production\\committed\\iter_069\\iteration_069.pt";
+  const [nnPath, setNnPath] = useLocalStorageState("pw_nn_path", ITER69_PATH);
   const [nnConfig, setNnConfig] = useLocalStorageState("pw_nn_cfg", "C:\\Users\\Shanks\\Desktop\\Codes\\patchworkaz - Copy - v2\\configs\\config_best.yaml");
   useEffect(() => {
     try {
@@ -565,6 +585,11 @@ export default function App() {
       if (raw != null && raw.includes("configs/config_best.yaml") && !raw.includes("Users\\\\Shanks")) {
         localStorage.setItem("pw_nn_cfg", JSON.stringify("C:\\Users\\Shanks\\Desktop\\Codes\\patchworkaz - Copy - v2\\configs\\config_best.yaml"));
         setNnConfig("C:\\Users\\Shanks\\Desktop\\Codes\\patchworkaz - Copy - v2\\configs\\config_best.yaml");
+      }
+      const pathRaw = localStorage.getItem("pw_nn_path");
+      if (pathRaw != null && (pathRaw.includes("latest_model.pt") || pathRaw.endsWith("checkpoints\\\\latest_model.pt"))) {
+        localStorage.setItem("pw_nn_path", JSON.stringify(ITER69_PATH));
+        setNnPath(ITER69_PATH);
       }
     } catch (_) {}
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -579,8 +604,8 @@ export default function App() {
   const [banner, setBanner] = useState({ kind: "info", text: "Ready." });
   const [moveLog, setMoveLog] = useState([]);
   const [solveBreakdown, setSolveBreakdown] = useState(null);
-  const [lastMoveCellsP0, setLastMoveCellsP0] = useState([]);
-  const [lastMoveCellsP1, setLastMoveCellsP1] = useState([]);
+  const [lastMovePlacementsP0, setLastMovePlacementsP0] = useState([]);
+  const [lastMovePlacementsP1, setLastMovePlacementsP1] = useState([]);
   const [pieceIdBoardP0, setPieceIdBoardP0] = useState(() => emptyPieceIdBoard());
   const [pieceIdBoardP1, setPieceIdBoardP1] = useState(() => emptyPieceIdBoard());
   const [gameStarted, setGameStarted] = useState(false);
@@ -785,8 +810,8 @@ export default function App() {
       setHintTopLeftSet(null);
       setSolveBreakdown(null);
       setMoveLog([]);
-      setLastMoveCellsP0([]);
-      setLastMoveCellsP1([]);
+      setLastMovePlacementsP0([]);
+      setLastMovePlacementsP1([]);
       setPieceIdBoardP0(emptyPieceIdBoard());
       setPieceIdBoardP1(emptyPieceIdBoard());
       setGameStarted(false);
@@ -884,15 +909,17 @@ export default function App() {
         const data = await api.post("/apply", { state: stateForApi, action: actionObj });
         applyServerState(data);
         const cells = actionObj?.cells ?? [];
+        const placement = Array.isArray(cells) && cells.length ? cells : [];
         if (playerIdx === 0) {
-          setLastMoveCellsP0((prev) => [...prev, ...cells]);
-          setLastMoveCellsP1([]);
+          setLastMovePlacementsP0((prev) => [...prev, placement].slice(-4));
+          setLastMovePlacementsP1([]);
         } else {
-          setLastMoveCellsP1((prev) => [...prev, ...cells]);
-          setLastMoveCellsP0([]);
+          setLastMovePlacementsP1((prev) => [...prev, placement].slice(-4));
+          setLastMovePlacementsP0([]);
         }
         setMoveLog((prev) => [...prev, { player: playerIdx, text: prettyOverride || actionObj?.pretty || actionObj?.type || "MOVE" }]);
-        setLegal(null);
+        if (data?.terminal) setLegal({ terminal: true, to_move: data.to_move });
+        else setLegal(null);
         setSelectedKey(null);
         setSelectedOrient(null);
         setPreviewAction(null);
@@ -930,7 +957,7 @@ export default function App() {
       const useNn = engine === "nn" && nnAvailable;
       const endpoint = useNn ? "/solve_nn" : "/solve";
       const body = useNn
-        ? { state: stateForApi, simulations: clamp(Number(nnSimulations) || 800, 50, 20000), temperature: 0.0 }
+        ? { state: stateForApi, simulations: clamp(Number(nnSimulations) || 3000, 50, 20000), temperature: 0.0 }
         : {
             state: stateForApi,
             iterations: clamp(Number(mctsIterations) || 50000, 500, 2000000),
@@ -944,6 +971,10 @@ export default function App() {
       _dbgLog("App.jsx:solveAndPlay", "solve response", { to_move: data?.to_move, terminal: data?.terminal, hasBestAction: Boolean(data?.best?.action), needs_opponent_move: data?.needs_opponent_move }, "H2");
       // #endregion
       setSolveBreakdown(data);
+      if (data?.terminal) {
+        setLegal({ terminal: true, to_move: data.to_move ?? toMove });
+        return;
+      }
       if (data?.best?.action) {
         const mover = data.to_move ?? toMove;
         // In human_vs_ai, never apply AI moves for the human player
@@ -1047,7 +1078,7 @@ export default function App() {
         model_path,
         config_path: String(nnConfig || "").trim() || "configs/config_best.yaml",
         device: String(nnDevice || "cuda").trim() || "cuda",
-        simulations: clamp(Number(nnSimulations) || 800, 50, 20000),
+        simulations: clamp(Number(nnSimulations) || 3000, 50, 20000),
       });
       await refreshNnStatus();
       setEngine("nn");
@@ -1133,6 +1164,8 @@ export default function App() {
       setGameState(parsed);
       setBoards([boardFromRows(parsed.players?.[0]?.board), boardFromRows(parsed.players?.[1]?.board)]);
       setLegal(null);
+      setLastMovePlacementsP0([]);
+      setLastMovePlacementsP1([]);
       setSelectedKey(null);
       setSelectedOrient(null);
       setPreviewAction(null);
@@ -1152,6 +1185,12 @@ export default function App() {
     setJsonDirty(false);
   }, [stateForApi]);
 
+  // Clear current mover's last-move placements when their turn starts (avoids AI "consideration" artifacts)
+  useEffect(() => {
+    if (toMove === 0) setLastMovePlacementsP0([]);
+    if (toMove === 1) setLastMovePlacementsP1([]);
+  }, [toMove]);
+
   // Auto-fetch legal when it becomes human's turn (only after game has started)
   useEffect(() => {
     if (!gameStarted || !gameState || editMode) return;
@@ -1164,17 +1203,28 @@ export default function App() {
     if (!gameStarted || !gameState || editMode || busy.thinking || busy.loading) return;
     if (gameMode !== "human_vs_ai") return;
     if (toMove === humanPlayer) return;
+    if (isTerminal) return;
     if (autoMoveLock.current) return;
     autoMoveLock.current = true;
     const t = setTimeout(async () => {
       try {
+        const leg = await fetchLegal();
+        if (leg?.terminal) {
+          setLegal(leg);
+          return;
+        }
+        if (leg?.pass_allowed && (!leg?.buy_groups || leg.buy_groups.length === 0)) {
+          await applyAction(toMove, { type: "pass" }, "PASS");
+          setInfo("AI passed (no piece to place).");
+          return;
+        }
         await solveAndPlay();
       } finally {
         autoMoveLock.current = false;
       }
     }, 0);
     return () => clearTimeout(t);
-  }, [gameStarted, gameState, editMode, busy.thinking, gameMode, toMove, humanPlayer, solveAndPlay]);
+  }, [gameStarted, gameState, editMode, busy.thinking, gameMode, toMove, humanPlayer, isTerminal, fetchLegal, applyAction, solveAndPlay, setInfo]);
 
   // AI vs AI autoplay (only after game started)
   useEffect(() => {
@@ -1222,18 +1272,14 @@ export default function App() {
 
   const overlayCellsP0 = useMemo(() => (previewAction?.cells && isHumanTurn && humanPlayer === 0 ? previewAction.cells : null), [previewAction, isHumanTurn, humanPlayer]);
   const overlayCellsP1 = useMemo(() => (previewAction?.cells && isHumanTurn && humanPlayer === 1 ? previewAction.cells : null), [previewAction, isHumanTurn, humanPlayer]);
-  const lastMoveIdxSetP0 = useMemo(() => {
-    if (!lastMoveCellsP0?.length) return null;
-    const s = new Set();
-    for (const cell of lastMoveCellsP0) if (cell?.r != null && cell?.c != null) s.add(`${cell.r},${cell.c}`);
-    return s;
-  }, [lastMoveCellsP0]);
-  const lastMoveIdxSetP1 = useMemo(() => {
-    if (!lastMoveCellsP1?.length) return null;
-    const s = new Set();
-    for (const cell of lastMoveCellsP1) if (cell?.r != null && cell?.c != null) s.add(`${cell.r},${cell.c}`);
-    return s;
-  }, [lastMoveCellsP1]);
+  const lastMovePlacementsForP0 = useMemo(
+    () => (Array.isArray(lastMovePlacementsP0) && lastMovePlacementsP0.length ? lastMovePlacementsP0.slice(-4) : null),
+    [lastMovePlacementsP0]
+  );
+  const lastMovePlacementsForP1 = useMemo(
+    () => (Array.isArray(lastMovePlacementsP1) && lastMovePlacementsP1.length ? lastMovePlacementsP1.slice(-4) : null),
+    [lastMovePlacementsP1]
+  );
   const patchHighlightSet = useMemo(() => {
     if (legal?.mode !== "patch" || !Array.isArray(legal?.actions)) return null;
     const s = new Set();
@@ -1416,7 +1462,7 @@ export default function App() {
             overlayCells={overlayCellsP0}
             highlightIdxSet={humanPlayer === 0 && isHumanTurn && legal?.mode === "patch" ? patchHighlightSet : null}
             hintTopLeftSet={humanPlayer === 0 && isHumanTurn && legal?.mode === "normal" ? hintTopLeftSet : null}
-            lastMoveIdxSet={toMove === 1 ? lastMoveIdxSetP0 : null}
+            lastMovePlacements={toMove === 1 ? lastMovePlacementsForP0 : null}
             editMode={editMode}
             onHoverCell={(r, c) => onHover(0, r, c)}
             onLeave={onLeaveBoard}
@@ -1602,7 +1648,7 @@ export default function App() {
             <Section title="ENGINE SETTINGS">
               <div style={{ display: "grid", gap: 10 }}>
                 <Field label="NN simulations (for /solve_nn)">
-                  <Input type="number" value={nnSimulations} onChange={(e) => setNnSimulations(parseInt(e.target.value || "800", 10))} min={50} max={20000} step={10} />
+                  <Input type="number" value={nnSimulations} onChange={(e) => setNnSimulations(parseInt(e.target.value || "3000", 10))} min={50} max={20000} step={10} />
                 </Field>
                 <Field label="Pure MCTS iterations (for /solve)">
                   <Input type="number" value={mctsIterations} onChange={(e) => setMctsIterations(parseInt(e.target.value || "50000", 10))} min={500} max={2000000} step={500} />
@@ -1778,7 +1824,7 @@ export default function App() {
             overlayCells={overlayCellsP1}
             highlightIdxSet={humanPlayer === 1 && isHumanTurn && legal?.mode === "patch" ? patchHighlightSet : null}
             hintTopLeftSet={humanPlayer === 1 && isHumanTurn && legal?.mode === "normal" ? hintTopLeftSet : null}
-            lastMoveIdxSet={toMove === 0 ? lastMoveIdxSetP1 : null}
+            lastMovePlacements={toMove === 0 ? lastMovePlacementsForP1 : null}
             editMode={editMode}
             onHoverCell={(r, c) => onHover(1, r, c)}
             onLeave={onLeaveBoard}

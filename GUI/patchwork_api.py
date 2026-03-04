@@ -22,7 +22,7 @@ from starlette.concurrency import run_in_threadpool
 # AlphaZero NN integration (lazy-loaded)
 # =========================
 _NN_AGENT = None  # Will hold PatchworkAgent if model is loaded
-_NN_SIMULATIONS = 800
+_NN_SIMULATIONS = 3000
 _NN_DEVICE = "cuda"
 _NN_MODEL_PATH: Optional[str] = None
 _NN_CONFIG_PATH: Optional[str] = None
@@ -1432,7 +1432,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--simulations", type=int, default=800, help="Default MCTS simulations for /solve_nn")
+    parser.add_argument("--simulations", type=int, default=3000, help="Default MCTS simulations for /solve_nn")
 
     args = parser.parse_args()
 
