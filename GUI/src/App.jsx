@@ -228,6 +228,14 @@ function computeLocalCellsFromShape(shape) {
   return cells;
 }
 
+/** Normalize placement cells to origin (0,0) for mini preview */
+function cellsToRelative(cells) {
+  if (!cells?.length) return [];
+  const minR = Math.min(...cells.map((c) => c.r));
+  const minC = Math.min(...cells.map((c) => c.c));
+  return cells.map((c) => ({ r: c.r - minR, c: c.c - minC, val: c.val ?? 1 }));
+}
+
 function BoardGrid({
   title,
   subtitle,
@@ -240,6 +248,7 @@ function BoardGrid({
   overlayCells,
   highlightIdxSet,
   hintTopLeftSet,
+  lastMoveIdxSet,
   editMode,
 }) {
   const overlayMap = useMemo(() => {
@@ -281,7 +290,9 @@ function BoardGrid({
             const ov = overlayMap.get(`${r},${c}`);
             const patchLegal = highlightIdxSet && highlightIdxSet.has(idx);
             const hintTopLeft = hintTopLeftSet && hintTopLeftSet.has(idx);
-            const filledBg = v === 2 ? COLORS.green : v === 1 ? COLORS.blue : "#0b1430";
+            const isLastMove = lastMoveIdxSet && lastMoveIdxSet.has(`${r},${c}`);
+            const filled = v !== 0;
+            const filledBg = isLastMove ? "rgba(251,191,36,0.45)" : filled ? "#1e3a5f" : "#0b1430";
             const bg = over
               ? "rgba(251,191,36,0.22)"
               : patchLegal
@@ -291,11 +302,13 @@ function BoardGrid({
                   : filledBg;
             const border = over
               ? `2px solid ${COLORS.amber}`
-              : patchLegal
-                ? `2px solid ${COLORS.ok}`
-                : hintTopLeft
-                  ? `1px dashed rgba(147,197,253,0.7)`
-                  : `1px solid ${COLORS.border}`;
+              : isLastMove
+                ? `2px solid ${COLORS.amber}`
+                : patchLegal
+                  ? `2px solid ${COLORS.ok}`
+                  : hintTopLeft
+                    ? `1px dashed rgba(147,197,253,0.7)`
+                    : `1px solid ${COLORS.border}`;
             const symbol = over ? (ov === 2 ? "●" : "■") : v === 2 ? "●" : v === 1 ? "■" : "";
             return (
               <button
@@ -533,6 +546,9 @@ export default function App() {
   const [banner, setBanner] = useState({ kind: "info", text: "Ready." });
   const [moveLog, setMoveLog] = useState([]);
   const [solveBreakdown, setSolveBreakdown] = useState(null);
+  const [lastMoveCellsP0, setLastMoveCellsP0] = useState([]);
+  const [lastMoveCellsP1, setLastMoveCellsP1] = useState([]);
+  const [gameStarted, setGameStarted] = useState(false);
 
   const boardsRef = useRef(boards);
   useEffect(() => {
@@ -722,9 +738,12 @@ export default function App() {
       setHintTopLeftSet(null);
       setSolveBreakdown(null);
       setMoveLog([]);
+      setLastMoveCellsP0([]);
+      setLastMoveCellsP1([]);
+      setGameStarted(false);
       setJsonDirty(false);
       setJsonText(JSON.stringify(st.state, null, 2));
-      // Fetch legal to get correct to_move before auto-play effect runs
+      // Fetch legal to get correct to_move (for display); game doesn't "start" until Start Game is pressed
       const legalData = await api.post("/legal", { state: st.state });
       setLegal(legalData);
       setToMoveServer(legalData?.to_move ?? null);
@@ -735,7 +754,7 @@ export default function App() {
       } else {
         setPatchIdxToAction(new Map());
       }
-      setInfo("New game ready.");
+      setInfo("Board set up. Press Start Game to begin.");
     } catch (e) {
       setErr(String(e?.message || e));
     } finally {
@@ -801,6 +820,9 @@ export default function App() {
         stampActionCells(playerIdx, actionObj);
         const data = await api.post("/apply", { state: stateForApi, action: actionObj });
         applyServerState(data);
+        const cells = actionObj?.cells ?? [];
+        if (playerIdx === 0) setLastMoveCellsP0(cells);
+        else setLastMoveCellsP1(cells);
         setMoveLog((prev) => [...prev, { player: playerIdx, text: prettyOverride || actionObj?.pretty || actionObj?.type || "MOVE" }]);
         setLegal(null);
         setSelectedKey(null);
@@ -895,6 +917,10 @@ export default function App() {
   const onClickCell = useCallback(
     async (playerIdx, r, c, idx) => {
       if (!gameState) return;
+      if (!gameStarted && !editMode) {
+        setWarn("Press Start Game first.");
+        return;
+      }
       if (editMode) {
         setBoards((prev) => {
           const next = [cloneBoard(prev[0]), cloneBoard(prev[1])];
@@ -921,7 +947,7 @@ export default function App() {
       const a = placementIndex.byOrient.get(selectedOrient)?.get(`${r},${c}`);
       if (a) await applyAction(humanPlayer, a, `BUY piece ${a.piece_id} @ (${r + 1},${c + 1})`);
     },
-    [gameState, editMode, isHumanTurn, humanPlayer, legal, patchIdxToAction, applyAction, placementIndex, selectedOrient, setWarn],
+    [gameState, gameStarted, editMode, isHumanTurn, humanPlayer, legal, patchIdxToAction, applyAction, placementIndex, selectedOrient, setWarn],
   );
 
   const onLeaveBoard = useCallback(() => setPreviewAction(null), []);
@@ -1045,16 +1071,16 @@ export default function App() {
     setJsonDirty(false);
   }, [stateForApi]);
 
-  // Auto-fetch legal when it becomes human's turn
+  // Auto-fetch legal when it becomes human's turn (only after game has started)
   useEffect(() => {
-    if (!gameState || editMode) return;
+    if (!gameStarted || !gameState || editMode) return;
     if (gameMode === "human_vs_ai" && toMove === humanPlayer) fetchLegal();
-  }, [gameState, editMode, gameMode, toMove, humanPlayer, fetchLegal]);
+  }, [gameStarted, gameState, editMode, gameMode, toMove, humanPlayer, fetchLegal]);
 
-  // Human vs AI: auto-play AI turns only (never for human)
+  // Human vs AI: auto-play AI turns only (never for human; only after game started)
   const autoMoveLock = useRef(false);
   useEffect(() => {
-    if (!gameState || editMode || busy.thinking || busy.loading) return;
+    if (!gameStarted || !gameState || editMode || busy.thinking || busy.loading) return;
     if (gameMode !== "human_vs_ai") return;
     if (toMove === humanPlayer) return;
     if (autoMoveLock.current) return;
@@ -1067,15 +1093,15 @@ export default function App() {
       }
     }, 0);
     return () => clearTimeout(t);
-  }, [gameState, editMode, busy.thinking, gameMode, toMove, humanPlayer, solveAndPlay]);
+  }, [gameStarted, gameState, editMode, busy.thinking, gameMode, toMove, humanPlayer, solveAndPlay]);
 
-  // AI vs AI autoplay
+  // AI vs AI autoplay (only after game started)
   useEffect(() => {
-    if (!gameState || editMode || busy.thinking) return;
+    if (!gameStarted || !gameState || editMode || busy.thinking) return;
     if (gameMode !== "ai_vs_ai" || !autoPlayAivsAi || isTerminal) return;
     const t = setTimeout(() => solveAndPlay(), clamp(Number(autoPlayDelayMs) || 350, 60, 5000));
     return () => clearTimeout(t);
-  }, [gameState, editMode, busy.thinking, gameMode, autoPlayAivsAi, autoPlayDelayMs, solveAndPlay, isTerminal]);
+  }, [gameStarted, gameState, editMode, busy.thinking, gameMode, autoPlayAivsAi, autoPlayDelayMs, solveAndPlay, isTerminal]);
 
   const refreshPiecesCb = refreshPieces;
   const refreshNnStatusCb = refreshNnStatus;
@@ -1115,12 +1141,37 @@ export default function App() {
 
   const overlayCellsP0 = useMemo(() => (previewAction?.cells && isHumanTurn && humanPlayer === 0 ? previewAction.cells : null), [previewAction, isHumanTurn, humanPlayer]);
   const overlayCellsP1 = useMemo(() => (previewAction?.cells && isHumanTurn && humanPlayer === 1 ? previewAction.cells : null), [previewAction, isHumanTurn, humanPlayer]);
+  const lastMoveIdxSetP0 = useMemo(() => {
+    if (!lastMoveCellsP0?.length) return null;
+    const s = new Set();
+    for (const cell of lastMoveCellsP0) if (cell?.r != null && cell?.c != null) s.add(`${cell.r},${cell.c}`);
+    return s;
+  }, [lastMoveCellsP0]);
+  const lastMoveIdxSetP1 = useMemo(() => {
+    if (!lastMoveCellsP1?.length) return null;
+    const s = new Set();
+    for (const cell of lastMoveCellsP1) if (cell?.r != null && cell?.c != null) s.add(`${cell.r},${cell.c}`);
+    return s;
+  }, [lastMoveCellsP1]);
   const patchHighlightSet = useMemo(() => {
     if (legal?.mode !== "patch" || !Array.isArray(legal?.actions)) return null;
     const s = new Set();
     for (const a of legal.actions) s.add(a.idx);
     return s;
   }, [legal]);
+
+  function computeFinalScore(board, buttons, bonusOwner, playerIdx) {
+    const empty = board.flat().filter((v) => v === 0).length;
+    return Number(buttons) - 2 * empty + (bonusOwner === playerIdx ? 7 : 0);
+  }
+  const finalScores = useMemo(() => {
+    if (!isTerminal || !gameState) return null;
+    const bonusOwner = gameState.bonus_owner ?? -1;
+    return {
+      p0: computeFinalScore(boards[0], p0.buttons, bonusOwner, 0),
+      p1: computeFinalScore(boards[1], p1.buttons, bonusOwner, 1),
+    };
+  }, [isTerminal, gameState, boards, p0.buttons, p1.buttons]);
 
   const bannerStyle = useMemo(() => {
     const kind = banner.kind;
@@ -1151,6 +1202,9 @@ export default function App() {
             <Button tone="primary" onClick={newGame} disabled={busy.loading}>
               New Game
             </Button>
+            <Button tone="ok" onClick={() => setGameStarted(true)} disabled={busy.loading || gameStarted}>
+              Start Game
+            </Button>
           </div>
         </div>
 
@@ -1177,6 +1231,14 @@ export default function App() {
               </Pill>
             )}
             {legal?.mode === "patch" && <Pill tone="warn">PATCH MODE ×{legal?.pending_patches ?? "?"}</Pill>}
+            {finalScores != null && (
+              <Pill tone="ok">
+                Game Over — P0: <b style={{ color: COLORS.text }}>{finalScores.p0}</b> pts | P1: <b style={{ color: COLORS.text }}>{finalScores.p1}</b> pts
+              </Pill>
+            )}
+            {!gameStarted && gameState && (
+              <Pill tone="warn">Press Start Game to begin</Pill>
+            )}
           </div>
         </div>
 
@@ -1209,13 +1271,13 @@ export default function App() {
           </div>
 
           <div style={{ display: "flex", alignItems: "end", gap: 8, flexWrap: "wrap" }}>
-            <Button onClick={fetchLegal} disabled={busy.legal || !stateForApi}>
+            <Button onClick={fetchLegal} disabled={busy.legal || !stateForApi || !gameStarted}>
               {busy.legal ? "Loading…" : "Refresh Legal"}
             </Button>
-            <Button tone="primary" onClick={solveAndPlay} disabled={busy.thinking || !stateForApi || isTerminal}>
+            <Button tone="primary" onClick={solveAndPlay} disabled={!gameStarted || busy.thinking || !stateForApi || isTerminal}>
               {busy.thinking ? "Thinking…" : "AI Move"}
             </Button>
-            <Button tone="warn" onClick={passTurn} disabled={!isHumanTurn || !legal?.pass_allowed || busy.thinking || legal?.mode === "patch"}>
+            <Button tone="warn" onClick={passTurn} disabled={!gameStarted || !isHumanTurn || !legal?.pass_allowed || busy.thinking || legal?.mode === "patch"}>
               Pass
             </Button>
             <label
@@ -1272,6 +1334,7 @@ export default function App() {
             overlayCells={overlayCellsP0}
             highlightIdxSet={humanPlayer === 0 && isHumanTurn && legal?.mode === "patch" ? patchHighlightSet : null}
             hintTopLeftSet={humanPlayer === 0 && isHumanTurn && legal?.mode === "normal" ? hintTopLeftSet : null}
+            lastMoveIdxSet={lastMoveIdxSetP0}
             editMode={editMode}
             onHoverCell={(r, c) => onHover(0, r, c)}
             onLeave={onLeaveBoard}
@@ -1327,20 +1390,40 @@ export default function App() {
 
                 {selectedGroup && placementIndex && (
                   <div style={{ display: "grid", gap: 8 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
                       <Pill tone="ok">
                         placements <b style={{ color: COLORS.text }}>{selectedGroup.placements?.length ?? 0}</b>
                       </Pill>
-                      <div style={{ minWidth: 140 }}>
-                        <Field label="Orientation">
-                          <Select value={selectedOrient ?? ""} onChange={(e) => setSelectedOrient(parseInt(e.target.value, 10))}>
-                            {placementIndex.orientList.map((oi) => (
-                              <option key={oi} value={oi}>
-                                {oi}
-                              </option>
-                            ))}
-                          </Select>
-                        </Field>
+                      <div>
+                        <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 6 }}>Pick orientation (click shape)</div>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "flex-start" }}>
+                          {placementIndex.orientList.map((oi) => {
+                            const placeMap = placementIndex.byOrient.get(oi);
+                            const firstPlace = placeMap && placeMap.size ? Array.from(placeMap.values())[0] : null;
+                            const relCells = firstPlace?.cells ? cellsToRelative(firstPlace.cells) : [];
+                            const isSelected = selectedOrient === oi;
+                            return (
+                              <button
+                                key={oi}
+                                type="button"
+                                onClick={() => setSelectedOrient(oi)}
+                                style={{
+                                  padding: 6,
+                                  borderRadius: 10,
+                                  border: `2px solid ${isSelected ? COLORS.amber : COLORS.border}`,
+                                  background: isSelected ? "rgba(251,191,36,0.15)" : COLORS.panel2,
+                                  cursor: "pointer",
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  justifyContent: "center",
+                                }}
+                                title={`Orientation ${oi}`}
+                              >
+                                {relCells.length > 0 ? <MiniShape cells={relCells} cellPx={12} /> : <span style={{ fontSize: 11, color: COLORS.dim }}>{oi}</span>}
+                              </button>
+                            );
+                          })}
+                        </div>
                       </div>
                     </div>
                     <div style={{ fontSize: 12, color: COLORS.muted }}>
@@ -1366,17 +1449,32 @@ export default function App() {
                       </Field>
                       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                         <div>
-                          <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 6 }}>Add piece</div>
+                          <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 6 }}>Add piece (greyed = already in circle)</div>
                           <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6, maxHeight: 260, overflow: "auto" }}>
                             {pieces.map((p) => {
+                              const inCircle = circle.includes(p.id);
                               const cells = p.shape ? computeLocalCellsFromShape(p.shape) : [];
                               return (
                                 <button
                                   key={`add-${p.id}`}
                                   type="button"
-                                  onClick={() => addPieceToCircle(p.id)}
-                                  style={{ padding: 8, borderRadius: 10, border: `1px solid ${COLORS.border}`, background: COLORS.panel2, color: COLORS.text, cursor: "pointer", textAlign: "left", display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}
-                                  title="Add to circle"
+                                  onClick={() => !inCircle && addPieceToCircle(p.id)}
+                                  disabled={inCircle}
+                                  style={{
+                                    padding: 8,
+                                    borderRadius: 10,
+                                    border: `1px solid ${COLORS.border}`,
+                                    background: inCircle ? COLORS.panel : COLORS.panel2,
+                                    color: inCircle ? COLORS.dim : COLORS.text,
+                                    cursor: inCircle ? "not-allowed" : "pointer",
+                                    textAlign: "left",
+                                    display: "flex",
+                                    justifyContent: "space-between",
+                                    gap: 8,
+                                    alignItems: "center",
+                                    opacity: inCircle ? 0.55 : 1,
+                                  }}
+                                  title={inCircle ? "Already in circle — remove it below to add again" : "Add to circle"}
                                 >
                                   <div>
                                     <div style={{ fontWeight: 900, fontSize: 12 }}>#{p.id}</div>
@@ -1441,16 +1539,18 @@ export default function App() {
               <Section title="PIECE ATLAS">
                 <div style={{ display: "grid", gap: 10 }}>
                   <div style={{ fontSize: 12, color: COLORS.muted }}>
-                    All pieces (click to add to circle builder). Income squares shown as ●.
+                    All pieces (click to add to circle). Greyed = already in circle — remove from circle to add again.
                   </div>
                   <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8, maxHeight: 420, overflow: "auto", paddingRight: 4 }}>
                     {pieces.map((p) => {
+                      const inCircle = circle.includes(p.id);
                       const cells = p.shape ? computeLocalCellsFromShape(p.shape) : [];
                       return (
                         <button
                           key={`atlas-${p.id}`}
                           type="button"
                           onClick={() => {
+                            if (inCircle) return;
                             if (!buildMode) {
                               setBuildMode(true);
                               setManualCircle(true);
@@ -1458,19 +1558,21 @@ export default function App() {
                             addPieceToCircle(p.id);
                             setInfo(`Added piece #${p.id} to circle.`);
                           }}
+                          disabled={inCircle}
                           style={{
                             padding: 10,
                             borderRadius: 12,
                             border: `1px solid ${COLORS.border}`,
-                            background: "rgba(59,130,246,0.08)",
-                            color: COLORS.text,
-                            cursor: "pointer",
+                            background: inCircle ? COLORS.panel : "rgba(59,130,246,0.08)",
+                            color: inCircle ? COLORS.dim : COLORS.text,
+                            cursor: inCircle ? "not-allowed" : "pointer",
                             textAlign: "left",
                             display: "flex",
                             justifyContent: "space-between",
                             gap: 10,
+                            opacity: inCircle ? 0.55 : 1,
                           }}
-                          title="Add to circle"
+                          title={inCircle ? "Already in circle — remove it in Circle builder to add again" : "Add to circle"}
                         >
                           <div style={{ display: "grid", gap: 2 }}>
                             <div style={{ fontWeight: 900 }}>#{p.id}</div>
@@ -1593,6 +1695,7 @@ export default function App() {
             overlayCells={overlayCellsP1}
             highlightIdxSet={humanPlayer === 1 && isHumanTurn && legal?.mode === "patch" ? patchHighlightSet : null}
             hintTopLeftSet={humanPlayer === 1 && isHumanTurn && legal?.mode === "normal" ? hintTopLeftSet : null}
+            lastMoveIdxSet={lastMoveIdxSetP1}
             editMode={editMode}
             onHoverCell={(r, c) => onHover(1, r, c)}
             onLeave={onLeaveBoard}
