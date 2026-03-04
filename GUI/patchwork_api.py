@@ -1105,7 +1105,7 @@ async def nn_load(request: Request):
     if not model_path:
         return JSONResponse({"error": "model_path is required"}, status_code=400)
 
-    config_path = str(payload.get("config_path", "configs/config_overnight.yaml")).strip()
+    config_path = str(payload.get("config_path", "configs/config_best.yaml")).strip()
     device = str(payload.get("device", _NN_DEVICE)).strip() or _NN_DEVICE
     simulations = int(payload.get("simulations", _NN_SIMULATIONS))
     simulations = max(50, min(simulations, 20000))

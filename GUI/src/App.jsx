@@ -49,12 +49,33 @@ const COLORS = {
   amber: "#fbbf24",
 };
 
+/** Per-piece hex colors (piece id 0..32); index 33 = patch (Abyss Navy) */
+const PIECE_HEX = [
+  "#2C3E50", "#8B2635", "#2D6A4F", "#7B3F00", "#4A235A", "#1A5276", "#6B4226", "#1C4E40", "#7D6608", "#512E5F",
+  "#922B21", "#1F618D", "#5D4037", "#2E4057", "#6D4C41", "#3B5323", "#7C3626", "#1B4F72", "#4E342E", "#424242",
+  "#5C4033", "#2C6975", "#6A1E55", "#3D3D3D", "#7A4419", "#1E5631", "#5B2C6F", "#884EA0", "#2C3A47", "#A04000",
+  "#1A3A4A", "#4D5656", "#6E2C00",
+];
+const PATCH_HEX = "#7F8C8D";
+const DEFAULT_FILL_HEX = "#1e3a5f";
+
+function getCellFillHex(pieceId) {
+  if (pieceId == null) return DEFAULT_FILL_HEX;
+  if (pieceId === "patch" || pieceId === 34) return PATCH_HEX;
+  const i = Number(pieceId);
+  return Number.isInteger(i) && i >= 0 && i < PIECE_HEX.length ? PIECE_HEX[i] : DEFAULT_FILL_HEX;
+}
+
 function clamp(n, lo, hi) {
   return Math.max(lo, Math.min(hi, n));
 }
 
 function emptyBoard() {
   return Array.from({ length: BOARD_N }, () => Array(BOARD_N).fill(0));
+}
+
+function emptyPieceIdBoard() {
+  return Array.from({ length: BOARD_N }, () => Array(BOARD_N).fill(null));
 }
 
 function cloneBoard(b) {
@@ -242,6 +263,7 @@ function BoardGrid({
   active,
   accent,
   board,
+  pieceIdBoard,
   onHoverCell,
   onLeave,
   onClickCell,
@@ -292,7 +314,8 @@ function BoardGrid({
             const hintTopLeft = hintTopLeftSet && hintTopLeftSet.has(idx);
             const isLastMove = lastMoveIdxSet && lastMoveIdxSet.has(`${r},${c}`);
             const filled = v !== 0;
-            const filledBg = isLastMove ? "rgba(251,191,36,0.45)" : filled ? "#1e3a5f" : "#0b1430";
+            const pieceId = pieceIdBoard?.[r]?.[c];
+            const filledBg = isLastMove ? "rgba(251,191,36,0.45)" : filled ? getCellFillHex(pieceId) : "#0b1430";
             const bg = over
               ? "rgba(251,191,36,0.22)"
               : patchLegal
@@ -534,8 +557,18 @@ export default function App() {
   const [nnSimulations, setNnSimulations] = useLocalStorageState("pw_nn_sims", 800);
 
   const [nnStatus, setNnStatus] = useState(null);
-  const [nnPath, setNnPath] = useLocalStorageState("pw_nn_path", "");
-  const [nnConfig, setNnConfig] = useLocalStorageState("pw_nn_cfg", "configs/config_overnight.yaml");
+  const [nnPath, setNnPath] = useLocalStorageState("pw_nn_path", "C:\\Users\\Shanks\\Desktop\\Codes\\patchworkaz - Copy - v2\\checkpoints\\latest_model.pt");
+  const [nnConfig, setNnConfig] = useLocalStorageState("pw_nn_cfg", "C:\\Users\\Shanks\\Desktop\\Codes\\patchworkaz - Copy - v2\\configs\\config_best.yaml");
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("pw_nn_cfg");
+      if (raw != null && raw.includes("configs/config_best.yaml") && !raw.includes("Users\\\\Shanks")) {
+        localStorage.setItem("pw_nn_cfg", JSON.stringify("C:\\Users\\Shanks\\Desktop\\Codes\\patchworkaz - Copy - v2\\configs\\config_best.yaml"));
+        setNnConfig("C:\\Users\\Shanks\\Desktop\\Codes\\patchworkaz - Copy - v2\\configs\\config_best.yaml");
+      }
+    } catch (_) {}
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [nnDevice, setNnDevice] = useLocalStorageState("pw_nn_dev", "cuda");
 
   const [jsonText, setJsonText] = useState("{");
@@ -548,6 +581,8 @@ export default function App() {
   const [solveBreakdown, setSolveBreakdown] = useState(null);
   const [lastMoveCellsP0, setLastMoveCellsP0] = useState([]);
   const [lastMoveCellsP1, setLastMoveCellsP1] = useState([]);
+  const [pieceIdBoardP0, setPieceIdBoardP0] = useState(() => emptyPieceIdBoard());
+  const [pieceIdBoardP1, setPieceIdBoardP1] = useState(() => emptyPieceIdBoard());
   const [gameStarted, setGameStarted] = useState(false);
 
   const boardsRef = useRef(boards);
@@ -671,10 +706,22 @@ export default function App() {
       _dbgLog("App.jsx:applyServerState", "applyServerState entry", { to_move: payload?.to_move, terminal: payload?.terminal, serverP0Twos, serverP1Twos }, "H1");
       // #endregion
 
+      const occ0 = boardFromRows(st?.players?.[0]?.board);
+      const occ1 = boardFromRows(st?.players?.[1]?.board);
+      setPieceIdBoardP0((prev) => {
+        const out = prev.map((row) => row.slice());
+        for (let r = 0; r < BOARD_N; r++) for (let c = 0; c < BOARD_N; c++) if (occ0[r][c] === 0) out[r][c] = null;
+        return out;
+      });
+      setPieceIdBoardP1((prev) => {
+        const out = prev.map((row) => row.slice());
+        for (let r = 0; r < BOARD_N; r++) for (let c = 0; c < BOARD_N; c++) if (occ1[r][c] === 0) out[r][c] = null;
+        return out;
+      });
       setBoards((prev) => {
         const next = [cloneBoard(prev[0]), cloneBoard(prev[1])];
         for (let p = 0; p < 2; p++) {
-          const occ = boardFromRows(st?.players?.[p]?.board);
+          const occ = p === 0 ? occ0 : occ1;
           for (let r = 0; r < BOARD_N; r++) {
             for (let c = 0; c < BOARD_N; c++) {
               if (occ[r][c] === 0) next[p][r][c] = 0;
@@ -740,6 +787,8 @@ export default function App() {
       setMoveLog([]);
       setLastMoveCellsP0([]);
       setLastMoveCellsP1([]);
+      setPieceIdBoardP0(emptyPieceIdBoard());
+      setPieceIdBoardP1(emptyPieceIdBoard());
       setGameStarted(false);
       setJsonDirty(false);
       setJsonText(JSON.stringify(st.state, null, 2));
@@ -800,6 +849,7 @@ export default function App() {
 
   const stampActionCells = useCallback((playerIdx, actionObj) => {
     if (!actionObj?.cells) return;
+    const pieceIdOrPatch = actionObj.piece_id !== undefined ? actionObj.piece_id : "patch";
     setBoards((prev) => {
       const next = [cloneBoard(prev[0]), cloneBoard(prev[1])];
       const b = next[playerIdx];
@@ -809,6 +859,19 @@ export default function App() {
       }
       return next;
     });
+    if (playerIdx === 0) {
+      setPieceIdBoardP0((prev) => {
+        const next = prev.map((row) => row.slice());
+        for (const cell of actionObj.cells) if (cell?.r != null && cell?.c != null) next[cell.r][cell.c] = pieceIdOrPatch;
+        return next;
+      });
+    } else {
+      setPieceIdBoardP1((prev) => {
+        const next = prev.map((row) => row.slice());
+        for (const cell of actionObj.cells) if (cell?.r != null && cell?.c != null) next[cell.r][cell.c] = pieceIdOrPatch;
+        return next;
+      });
+    }
   }, []);
 
   const applyAction = useCallback(
@@ -821,8 +884,13 @@ export default function App() {
         const data = await api.post("/apply", { state: stateForApi, action: actionObj });
         applyServerState(data);
         const cells = actionObj?.cells ?? [];
-        if (playerIdx === 0) setLastMoveCellsP0(cells);
-        else setLastMoveCellsP1(cells);
+        if (playerIdx === 0) {
+          setLastMoveCellsP0((prev) => [...prev, ...cells]);
+          setLastMoveCellsP1([]);
+        } else {
+          setLastMoveCellsP1((prev) => [...prev, ...cells]);
+          setLastMoveCellsP0([]);
+        }
         setMoveLog((prev) => [...prev, { player: playerIdx, text: prettyOverride || actionObj?.pretty || actionObj?.type || "MOVE" }]);
         setLegal(null);
         setSelectedKey(null);
@@ -927,6 +995,19 @@ export default function App() {
           next[playerIdx][r][c] = (next[playerIdx][r][c] + 1) % 3;
           return next;
         });
+        if (playerIdx === 0) {
+          setPieceIdBoardP0((prev) => {
+            const out = prev.map((row) => row.slice());
+            out[r][c] = null;
+            return out;
+          });
+        } else {
+          setPieceIdBoardP1((prev) => {
+            const out = prev.map((row) => row.slice());
+            out[r][c] = null;
+            return out;
+          });
+        }
         setJsonDirty(true);
         return;
       }
@@ -964,7 +1045,7 @@ export default function App() {
       if (!model_path) throw new Error("Model path is empty.");
       await api.post("/nn/load", {
         model_path,
-        config_path: String(nnConfig || "").trim() || "configs/config_overnight.yaml",
+        config_path: String(nnConfig || "").trim() || "configs/config_best.yaml",
         device: String(nnDevice || "cuda").trim() || "cuda",
         simulations: clamp(Number(nnSimulations) || 800, 50, 20000),
       });
@@ -1160,19 +1241,6 @@ export default function App() {
     return s;
   }, [legal]);
 
-  function computeFinalScore(board, buttons, bonusOwner, playerIdx) {
-    const empty = board.flat().filter((v) => v === 0).length;
-    return Number(buttons) - 2 * empty + (bonusOwner === playerIdx ? 7 : 0);
-  }
-  const finalScores = useMemo(() => {
-    if (!isTerminal || !gameState) return null;
-    const bonusOwner = gameState.bonus_owner ?? -1;
-    return {
-      p0: computeFinalScore(boards[0], p0.buttons, bonusOwner, 0),
-      p1: computeFinalScore(boards[1], p1.buttons, bonusOwner, 1),
-    };
-  }, [isTerminal, gameState, boards, p0.buttons, p1.buttons]);
-
   const bannerStyle = useMemo(() => {
     const kind = banner.kind;
     const isErr = kind === "error";
@@ -1188,6 +1256,19 @@ export default function App() {
 
   const p0 = gameState?.players?.[0] || { position: 0, buttons: 0, income: 0, board: [] };
   const p1 = gameState?.players?.[1] || { position: 0, buttons: 0, income: 0, board: [] };
+
+  function computeFinalScore(board, buttons, bonusOwner, playerIdx) {
+    const empty = board.flat().filter((v) => v === 0).length;
+    return Number(buttons) - 2 * empty + (bonusOwner === playerIdx ? 7 : 0);
+  }
+  const finalScores = useMemo(() => {
+    if (!isTerminal || !gameState) return null;
+    const bonusOwner = gameState.bonus_owner ?? -1;
+    return {
+      p0: computeFinalScore(boards[0], p0.buttons, bonusOwner, 0),
+      p1: computeFinalScore(boards[1], p1.buttons, bonusOwner, 1),
+    };
+  }, [isTerminal, gameState, boards, p0.buttons, p1.buttons]);
 
   return (
     <div style={{ minHeight: "100vh", background: COLORS.bg, color: COLORS.text, fontFamily: "Inter, ui-sans-serif, system-ui, -apple-system" }}>
@@ -1331,10 +1412,11 @@ export default function App() {
             active={toMove === 0}
             accent={COLORS.blue}
             board={boards[0]}
+            pieceIdBoard={pieceIdBoardP0}
             overlayCells={overlayCellsP0}
             highlightIdxSet={humanPlayer === 0 && isHumanTurn && legal?.mode === "patch" ? patchHighlightSet : null}
             hintTopLeftSet={humanPlayer === 0 && isHumanTurn && legal?.mode === "normal" ? hintTopLeftSet : null}
-            lastMoveIdxSet={lastMoveIdxSetP0}
+            lastMoveIdxSet={toMove === 1 ? lastMoveIdxSetP0 : null}
             editMode={editMode}
             onHoverCell={(r, c) => onHover(0, r, c)}
             onLeave={onLeaveBoard}
@@ -1692,10 +1774,11 @@ export default function App() {
             active={toMove === 1}
             accent={COLORS.purple}
             board={boards[1]}
+            pieceIdBoard={pieceIdBoardP1}
             overlayCells={overlayCellsP1}
             highlightIdxSet={humanPlayer === 1 && isHumanTurn && legal?.mode === "patch" ? patchHighlightSet : null}
             hintTopLeftSet={humanPlayer === 1 && isHumanTurn && legal?.mode === "normal" ? hintTopLeftSet : null}
-            lastMoveIdxSet={lastMoveIdxSetP1}
+            lastMoveIdxSet={toMove === 0 ? lastMoveIdxSetP1 : null}
             editMode={editMode}
             onHoverCell={(r, c) => onHover(1, r, c)}
             onLeave={onLeaveBoard}

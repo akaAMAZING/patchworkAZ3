@@ -1,20 +1,14 @@
 @echo off
 REM One-click launcher: API + GUI to play Patchwork vs AlphaZero
-REM Edit ITER below to play vs a different iteration (e.g. 59 for iter59)
+REM API starts with checkpoints\latest_model.pt (always the latest)
 
-set ITER=59
 set REPO=%~dp0
 cd /d "%REPO%"
 
-REM Zero-pad ITER to 3 digits (59 -> 059)
-set ITER3=%ITER%
-if %ITER% LSS 10 set ITER3=00%ITER%
-if %ITER% GEQ 10 if %ITER% LSS 100 set ITER3=0%ITER%
-
-set MODEL=runs\patchwork_production\committed\iter_%ITER3%\iteration_%ITER3%.pt
+set MODEL=checkpoints\latest_model.pt
 if not exist "%MODEL%" (
   echo Model not found: %MODEL%
-  echo Check that iter %ITER% exists in runs\patchwork_production\committed\
+  echo Make sure checkpoints\latest_model.pt exists in the repo.
   pause
   exit /b 1
 )
@@ -22,8 +16,8 @@ if not exist "%MODEL%" (
 REM Activate venv if present
 if exist "venv\Scripts\activate.bat" call venv\Scripts\activate.bat
 
-echo Starting API with iter%ITER3%...
-start "Patchwork API (iter%ITER3%)" cmd /k "cd /d "%REPO%" && (if exist venv\Scripts\activate.bat call venv\Scripts\activate.bat) && python GUI/patchwork_api.py --model "%MODEL%" --config configs/config_best.yaml --simulations 800 --host 127.0.0.1 --port 8000"
+echo Starting API with latest_model.pt...
+start "Patchwork API" cmd /k "cd /d "%REPO%" && (if exist venv\Scripts\activate.bat call venv\Scripts\activate.bat) && python GUI/patchwork_api.py --model "%MODEL%" --config configs/config_best.yaml --simulations 800 --host 127.0.0.1 --port 8000"
 
 echo Waiting for API to start...
 timeout /t 4 /nobreak >nul
@@ -36,7 +30,7 @@ timeout /t 6 /nobreak >nul
 start http://localhost:5173
 
 echo.
-echo API (iter%ITER3%): http://localhost:8000
+echo API: http://localhost:8000  (latest_model.pt)
 echo GUI: http://localhost:5173
 echo Close the API and GUI windows when done.
 pause

@@ -120,7 +120,7 @@ export default function PatchworkSolver() {
   const [nnAvailable, setNnAvailable] = useState(false);
   const [nnStatus, setNnStatus] = useState(null);
   const [nnPath, setNnPath] = useState("");
-  const [nnConfig, setNnConfig] = useState("configs/config_overnight.yaml");
+  const [nnConfig, setNnConfig] = useState("configs/config_best.yaml");
   const [nnDevice, setNnDevice] = useState("cuda");
   const autoMoveLock = useRef(false);
 
