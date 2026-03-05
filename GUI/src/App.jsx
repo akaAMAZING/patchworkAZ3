@@ -925,12 +925,8 @@ export default function App() {
         setPreviewAction(null);
         setHintTopLeftSet(null);
         // Don't fetchLegal here - it would use stale stateForApi from closure. The effect
-        // (toMove === humanPlayer) fetches legal with correct state after re-render.
-        // Human vs AI: when turn switches to AI, auto-play. Server's to_move already accounts
-        // for patch placement (pending_owner) so we never trigger during human's patch placement.
-        if (gameMode === "human_vs_ai" && data?.to_move != null && data.to_move !== humanPlayer && !data?.terminal) {
-          setTimeout(() => solveAndPlayRef.current?.(), 50);
-        }
+        // (toMove !== humanPlayer) is the single source for scheduling the next AI move;
+        // avoid scheduling here to prevent double-apply (same move logged and placed twice).
         return data;
       } catch (e) {
         // #region agent log
