@@ -40,6 +40,7 @@ from src.game.patchwork_engine import (
     compute_score_fast,
     current_player,
     current_player_fast,
+    empty_count_from_occ,
     get_winner,
     get_winner_fast,
     legal_actions_list,
@@ -48,8 +49,12 @@ from src.game.patchwork_engine import (
     terminal,
     terminal_fast,
     NEUTRAL,
+    BONUS_OWNER,
+    P0_BUTTONS,
     P0_OCC0, P0_OCC1, P0_OCC2,
+    P1_BUTTONS,
     P1_OCC0, P1_OCC1, P1_OCC2,
+    TIE_PLAYER,
 )
 
 from src.mcts.alphazero_mcts_optimized import create_optimized_mcts, encode_legal_actions_fast, engine_action_to_flat_index
@@ -590,6 +595,26 @@ class OptimizedSelfPlayWorker:
 
         winner = terminal_winner
 
+        # Audit: raw components for scoring verification (buttons, empty, bonus, true scores)
+        _empty0 = empty_count_from_occ(int(st[P0_OCC0]), int(st[P0_OCC1]), int(st[P0_OCC2]))
+        _empty1 = empty_count_from_occ(int(st[P1_OCC0]), int(st[P1_OCC1]), int(st[P1_OCC2]))
+        _bonus_owner = int(st[BONUS_OWNER])
+        out_audit = {
+            "final_buttons_p0": int(st[P0_BUTTONS]),
+            "final_buttons_p1": int(st[P1_BUTTONS]),
+            "empty_squares_p0": _empty0,
+            "empty_squares_p1": _empty1,
+            "bonus7x7_p0": 7 if _bonus_owner == 0 else 0,
+            "bonus7x7_p1": 7 if _bonus_owner == 1 else 0,
+            "final_score_p0": int(score0),
+            "final_score_p1": int(score1),
+            "winner": winner,
+            "tie_break_tie_player": int(st[TIE_PLAYER]),
+            "raw_margin_p0_perspective": float(score0 - score1),
+            "stored_score_margin_tanh_p0": value_and_score_from_scores(int(score0), int(score1), winner, 0)[1],
+            "stored_score_margin_tanh_p1": value_and_score_from_scores(int(score0), int(score1), winner, 1)[1],
+        }
+
         # Position redundancy: 1 - unique/total (0 = all unique, 1 = all duplicates)
         redundancy = 1.0 - len(seen_state_hashes) / max(1, move_count)
 
@@ -604,6 +629,7 @@ class OptimizedSelfPlayWorker:
             "game_length": int(move_count),
             "winner": int(winner),
             "final_score_diff": float(final_score_diff),
+            "audit": out_audit,
             # Policy collapse canary
             "avg_policy_entropy": float(np.mean(move_entropies)) if move_entropies else 0.0,
             "avg_top1_prob": float(np.mean(move_top1_probs)) if move_top1_probs else 0.0,

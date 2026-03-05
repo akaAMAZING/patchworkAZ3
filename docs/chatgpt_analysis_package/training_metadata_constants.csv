@@ -1,9 +1,11 @@
 key,value,description
-ema_decay,0.999,Polyak EMA decay (half-life ~1000 steps); applied each training step; not a per-iteration scalar
-ema_use_for_selfplay,true,Self-play uses EMA weights
-ema_use_for_eval,true,Eval uses EMA weights
+ema_decay,0.999,Polyak EMA per step; no per-iteration scalar
+ema_use_for_selfplay,true,
+ema_use_for_eval,true,
 max_grad_norm,1.0,Gradient clipping
 policy_loss_weight,1.0
 value_loss_weight,1.0
-score_loss_weight,0.1
-ownership_loss_weight,0.15
+score_loss_weight,0.1,CRITICAL: Score head (201-bin CE). If train_score_loss stalls, check target_dist and scale.
+ownership_loss_weight,0.15,CRITICAL: Auxiliary ownership head (BCE). If train_ownership_accuracy stalls ~86%, head may be underfitting or targets noisy.
+score_utility_scale,30.0,Must match value_targets._SCORE_NORMALISE_DIVISOR; tanh(margin/30) for replay
+score_target_sigma,1.5,Gaussian soft-label sigma for 201-bin score targets (trainer make_gaussian_score_targets)

@@ -956,6 +956,13 @@ class PatchworkNetwork(nn.Module):
 
             # Ownership accuracy (binary, threshold at 0.5) — only over valid samples
             ownership_accuracy = 0.0
+            # Class-imbalance / metric-lie diagnostics (E): empty-cell recall/precision, balanced acc, MAE empty count
+            ownership_empty_recall = 0.0
+            ownership_empty_precision = 0.0
+            ownership_balanced_accuracy = 0.0
+            ownership_mae_empty_count = 0.0
+            ownership_filled_fraction_mean = 0.0
+            ownership_accuracy_all_filled_baseline = 0.0
             if ownership_logits is not None:
                 ownership_pred = (ownership_logits > 0).float()  # sigmoid > 0.5
                 if ownership_valid_mask is not None and not ownership_valid_mask.all():
@@ -965,10 +972,57 @@ class PatchworkNetwork(nn.Module):
                         ownership_accuracy = float(
                             (valid_pred == valid_targets).float().mean().item()
                         )
+                        # E: filled fraction (mean target) = accuracy if we predicted "all filled"
+                        ownership_filled_fraction_mean = float(valid_targets.mean().item())
+                        ownership_accuracy_all_filled_baseline = ownership_filled_fraction_mean
+                        # Empty-cell: target==0
+                        n_empty_true = (valid_targets < 0.5).float().sum().item()
+                        n_empty_pred = (valid_pred < 0.5).float().sum().item()
+                        true_empty = (valid_targets < 0.5)
+                        pred_empty = (valid_pred < 0.5)
+                        if n_empty_true > 0:
+                            ownership_empty_recall = float((true_empty & pred_empty).float().sum().item() / n_empty_true)
+                        if n_empty_pred > 0:
+                            ownership_empty_precision = float((true_empty & pred_empty).float().sum().item() / n_empty_pred)
+                        # Filled recall (sensitivity): among target==1, how many pred==1
+                        n_filled_true = (valid_targets >= 0.5).float().sum().item()
+                        if n_filled_true > 0:
+                            filled_recall = float(((valid_targets >= 0.5) & (valid_pred >= 0.5)).float().sum().item() / n_filled_true)
+                        else:
+                            filled_recall = 0.0
+                        ownership_balanced_accuracy = 0.5 * (ownership_empty_recall + filled_recall) if n_filled_true > 0 else ownership_empty_recall
+                        # MAE empty count: per-sample over valid; need to aggregate per (B,2,9,9) sample then mean
+                        # valid_pred/targets are flattened; we don't have sample dim here. Skip MAE per-sample or compute on full tensors.
                 else:
                     ownership_accuracy = float(
                         (ownership_pred == target_ownership).float().mean().item()
                     )
+                    ownership_filled_fraction_mean = float(target_ownership.mean().item())
+                    ownership_accuracy_all_filled_baseline = ownership_filled_fraction_mean
+                    true_empty = (target_ownership < 0.5)
+                    pred_empty = (ownership_pred < 0.5)
+                    n_empty_true = true_empty.float().sum().item()
+                    n_empty_pred = pred_empty.float().sum().item()
+                    if n_empty_true > 0:
+                        ownership_empty_recall = float((true_empty & pred_empty).float().sum().item() / n_empty_true)
+                    if n_empty_pred > 0:
+                        ownership_empty_precision = float((true_empty & pred_empty).float().sum().item() / n_empty_pred)
+                    n_filled_true = (target_ownership >= 0.5).float().sum().item()
+                    if n_filled_true > 0:
+                        filled_recall = float(((target_ownership >= 0.5) & (ownership_pred >= 0.5)).float().sum().item() / n_filled_true)
+                        ownership_balanced_accuracy = 0.5 * (ownership_empty_recall + filled_recall)
+                    else:
+                        ownership_balanced_accuracy = ownership_empty_recall
+                    # MAE empty count: per sample (B, 2, 9, 9) -> empty count per sample
+                    pred_empty_per_sample = (ownership_pred < 0.5).float().view(ownership_pred.shape[0], -1).sum(dim=1)
+                    target_empty_per_sample = (target_ownership < 0.5).float().view(target_ownership.shape[0], -1).sum(dim=1)
+                    ownership_mae_empty_count = float((pred_empty_per_sample - target_empty_per_sample).abs().mean().item())
+
+                # When valid_mask used, compute MAE on full tensors (flattened valid only would need indexing)
+                if ownership_valid_mask is None or ownership_valid_mask.all():
+                    pred_empty_per_sample = (ownership_pred < 0.5).float().view(ownership_pred.shape[0], -1).sum(dim=1)
+                    target_empty_per_sample = (target_ownership < 0.5).float().view(target_ownership.shape[0], -1).sum(dim=1)
+                    ownership_mae_empty_count = float((pred_empty_per_sample - target_empty_per_sample).abs().mean().item())
 
         metrics = {
             "policy_loss": float(policy_loss.item()),
@@ -986,6 +1040,12 @@ class PatchworkNetwork(nn.Module):
             "kl_divergence": float(kl_div.item()),
             "approx_identity_check": float(approx_identity_error.item()),
             "ownership_accuracy": float(ownership_accuracy),
+            "ownership_filled_fraction_mean": float(ownership_filled_fraction_mean),
+            "ownership_accuracy_all_filled_baseline": float(ownership_accuracy_all_filled_baseline),
+            "ownership_empty_recall": float(ownership_empty_recall),
+            "ownership_empty_precision": float(ownership_empty_precision),
+            "ownership_balanced_accuracy": float(ownership_balanced_accuracy),
+            "ownership_mae_empty_count": float(ownership_mae_empty_count),
         }
         return total_loss, metrics
 

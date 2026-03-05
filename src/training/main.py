@@ -1494,6 +1494,8 @@ class AlphaZeroTrainer:
                 _iter_whitelist = (
                     "kl_divergence", "policy_entropy", "target_entropy", "policy_cross_entropy",
                     "value_mse", "step_skip_rate", "approx_identity_check",
+                    "ownership_accuracy", "ownership_filled_fraction_mean", "ownership_accuracy_all_filled_baseline",
+                    "ownership_empty_recall", "ownership_empty_precision", "ownership_balanced_accuracy", "ownership_mae_empty_count",
                 )
                 for k in _iter_whitelist:
                     if k in train_metrics:
