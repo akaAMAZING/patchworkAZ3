@@ -533,6 +533,7 @@ class Trainer:
         self.score_target_sigma = float(train_config.get("score_target_sigma", 1.5))
         self._score_bin_vals: Optional[torch.Tensor] = None
         self.ownership_weight = float(train_config.get("ownership_loss_weight", 0.0))
+        self.ownership_pos_weight = float(train_config.get("ownership_pos_weight", 1.0))
         self.max_grad_norm = train_config["max_grad_norm"]
 
         # Optional CE/entropy decomposition debug: log a few step-level samples.
@@ -1003,6 +1004,7 @@ class Trainer:
                         target_ownership=own_target,
                         ownership_weight=own_weight,
                         ownership_valid_mask=own_valid_mask,
+                        ownership_pos_weight=self.ownership_pos_weight,
                         x_global=xg, x_track=xt, shop_ids=si, shop_feats=sf,
                     )
             else:
@@ -1014,6 +1016,7 @@ class Trainer:
                         target_ownership=own_target,
                         ownership_weight=own_weight,
                         ownership_valid_mask=own_valid_mask,
+                        ownership_pos_weight=self.ownership_pos_weight,
                         x_global=xg, x_track=xt, shop_ids=si, shop_feats=sf,
                     )
             _t3 = time.perf_counter() if _t0 is not None else None
@@ -1220,6 +1223,7 @@ class Trainer:
                             target_ownership=own_target,
                             ownership_weight=own_weight,
                             ownership_valid_mask=own_valid_mask,
+                            ownership_pos_weight=self.ownership_pos_weight,
                             x_global=xg, x_track=xt, shop_ids=si, shop_feats=sf,
                         )
                 else:
@@ -1231,6 +1235,7 @@ class Trainer:
                         target_ownership=own_target,
                         ownership_weight=own_weight,
                         ownership_valid_mask=own_valid_mask,
+                        ownership_pos_weight=self.ownership_pos_weight,
                         x_global=xg, x_track=xt, shop_ids=si, shop_feats=sf,
                     )
 

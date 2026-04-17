@@ -28,7 +28,8 @@
       "Bash(python:*)",
       "Bash(py:*)",
       "Read(//c/Users/Shanks/Desktop/Codes/patchworkaz/**)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(wc -l \"/c/Users/Shanks/Desktop/Codes/patchworkaz - Copy - v2/src/mcts\"/*.py*)"
     ],
     "additionalDirectories": [
       "C:\\Users\\Shanks\\Desktop"

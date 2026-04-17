@@ -288,6 +288,7 @@ from src.training.run_layout import (
     committed_dir,
     get_run_id,
     get_run_root,
+    is_iter_committed,
     max_committed_iteration,
     reconcile_run_state,
     staging_dir,
@@ -824,6 +825,10 @@ class AlphaZeroTrainer:
             self.device = torch.device("cuda")
             gpu_name = torch.cuda.get_device_name(0)
             vram_mb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
+            logger.info(
+                "[LIFECYCLE] first parent CUDA touch parent_pid=%s (device=%s %.0f MB VRAM)",
+                os.getpid(), gpu_name, vram_mb,
+            )
             logger.info(f"Using GPU: {gpu_name} ({vram_mb:.0f} MB VRAM)")
         else:
             self.device = torch.device("cpu")
@@ -858,7 +863,26 @@ class AlphaZeroTrainer:
         _assert_encoding_config_consistent(self.config, self.device)
 
         self.selfplay_generator = create_selfplay_generator(self.config)
-        self.evaluator = Evaluator(self.config, self.device)
+
+        # Optional fixed anchor baseline (e.g. iter192 from a prior run at different architecture).
+        # Loaded once here; reused every eval iteration via baseline_type="anchor".
+        _anchor_cfg: dict | None = None
+        _anchor_path: str | None = None
+        _anchor_section = (self.config.get("evaluation") or {}).get("anchor_checkpoint") or {}
+        if _anchor_section.get("path") and _anchor_section.get("config"):
+            import yaml as _yaml
+            _acfg_path = Path(_anchor_section["config"])
+            if not _acfg_path.is_absolute():
+                _acfg_path = Path(__file__).resolve().parents[2] / _acfg_path
+            if _acfg_path.exists():
+                with open(_acfg_path) as _f:
+                    _anchor_cfg = _yaml.safe_load(_f)
+                _anchor_path = str(_anchor_section["path"])
+                logger.info("Anchor checkpoint configured: %s (config: %s)", _anchor_path, _acfg_path.name)
+            else:
+                logger.warning("Anchor config not found: %s — anchor eval disabled.", _acfg_path)
+
+        self.evaluator = Evaluator(self.config, self.device, anchor_config=_anchor_cfg, anchor_path=_anchor_path)
         self.elo_tracker = EloTracker(
             initial_rating=self.config["evaluation"]["elo"]["initial_rating"],
             k_factor=self.config["evaluation"]["elo"]["k_factor"],
@@ -1196,6 +1220,9 @@ class AlphaZeroTrainer:
         self,
         start_iteration: int = 0,
         resume_checkpoint: Optional[str] = None,
+        flush_replay_on_resume: bool = False,
+        reset_optimizer_on_resume: bool = False,
+        force_next_iter: bool = False,
     ):
         """Run complete AlphaZero training pipeline.
 
@@ -1208,11 +1235,24 @@ class AlphaZeroTrainer:
         """
         logger.info("Starting AlphaZero training pipeline")
         # Always discard partial staging on startup so each iteration restarts from self-play.
-        # (Previously this ran only when auto-resuming; without run_state.json it was skipped,
-        # leaving staging/iter_N from interrupted runs and causing self-play reuse.)
         last_comm = max_committed_iteration(self.run_root)
         cleanup_staging(self.run_root, last_comm, config=self.config)
         start_iteration, resume_checkpoint = self._try_auto_resume(start_iteration, resume_checkpoint)
+
+        # Safe resume: do not overwrite existing committed iter_N. Fail fast unless --force.
+        if resume_checkpoint and start_iteration > 0:
+            while is_iter_committed(self.run_root, start_iteration):
+                if force_next_iter:
+                    logger.warning(
+                        "[RESUME] committed/iter_%03d already exists; --force: advancing start_iteration to %d",
+                        start_iteration, start_iteration + 1,
+                    )
+                    start_iteration += 1
+                else:
+                    raise ValueError(
+                        f"[RESUME] committed/iter_{start_iteration:03d} already exists. "
+                        "Refusing to overwrite. Use --start-iteration with a higher value, or --force to use next free."
+                    )
 
         # Attach staging log handler for first iteration (captures all logs until commit)
         first_staging = staging_dir(self.run_root, start_iteration)
@@ -1223,9 +1263,13 @@ class AlphaZeroTrainer:
         if self._health_fs_last_committed is None:
             self._health_fs_last_committed = max_committed_iteration(self.run_root)
 
-        # Restore replay buffer sliding window on resume
+        # Restore or flush replay buffer on resume
         if start_iteration > 0:
-            self.replay_buffer.restore_state()
+            if flush_replay_on_resume:
+                self.replay_buffer.clear_persisted_state()
+                logger.info("[RESUME] Replay buffer flushed (--flush-replay-on-resume).")
+            else:
+                self.replay_buffer.restore_state()
 
         # Health line at process start
         startup_train_base = (
@@ -1368,9 +1412,35 @@ class AlphaZeroTrainer:
                     sp_label = "random"
                 _print_section(f"\n[1/3] SELF-PLAY  (generator: {sp_label})")
 
+                # Lifecycle instrumentation: parent CUDA state before child start (no overlap; child not started yet)
+                if torch.cuda.is_available():
+                    try:
+                        cuda_init = torch.cuda.is_initialized() if hasattr(torch.cuda, "is_initialized") else "N/A"
+                        alloc_mb = torch.cuda.memory_allocated(0) / (1024 ** 2)
+                        reserved_mb = torch.cuda.memory_reserved(0) / (1024 ** 2)
+                        logger.info(
+                            "[LIFECYCLE] before_child_start parent_pid=%s iter=%s cuda_initialized=%s alloc_mb=%.1f reserved_mb=%.1f",
+                            os.getpid(), iteration, cuda_init, alloc_mb, reserved_mb,
+                        )
+                    except Exception as e:
+                        logger.debug("[LIFECYCLE] before_child_start log failed: %s", e)
+
                 data_path, selfplay_stats = self._generate_selfplay_data(
                     iteration, selfplay_model, output_dir=staging_path, games_override=games_this_iter
                 )
+
+                # Lifecycle instrumentation: parent CUDA state after child stop
+                if torch.cuda.is_available():
+                    try:
+                        alloc_mb = torch.cuda.memory_allocated(0) / (1024 ** 2)
+                        reserved_mb = torch.cuda.memory_reserved(0) / (1024 ** 2)
+                        logger.info(
+                            "[LIFECYCLE] after_child_stop parent_pid=%s iter=%s alloc_mb=%.1f reserved_mb=%.1f",
+                            os.getpid(), iteration, alloc_mb, reserved_mb,
+                        )
+                    except Exception as e:
+                        logger.debug("[LIFECYCLE] after_child_stop log failed: %s", e)
+
                 logger.info(
                     "[1/3] Self-play complete: %d games, %d positions, %.1f games/min",
                     selfplay_stats.get("num_games", 0),
@@ -1420,6 +1490,20 @@ class AlphaZeroTrainer:
                     force_resume_ema = False
                     logger.info(
                         "[RESUME] seed warm-start: loading model weights only (optimizer/scheduler/EMA fresh) from %s",
+                        train_base,
+                    )
+                # User flag: reset optimizer/scheduler/scaler/EMA on resume boundary (e.g. after PW change).
+                if (
+                    iteration == start_iteration
+                    and reset_optimizer_on_resume
+                    and resume_checkpoint
+                ):
+                    force_resume_optimizer_state = False
+                    force_resume_scheduler_state = False
+                    force_resume_scaler_state = False
+                    force_resume_ema = False
+                    logger.info(
+                        "[RESUME] --reset-optimizer-on-resume: loading model weights only (optimizer/scheduler/scaler/EMA fresh) from %s; EMA not loaded from checkpoint.",
                         train_base,
                     )
                 if resume_from_committed_cfg and train_base and "staging" in Path(train_base).resolve().parts:
@@ -1485,6 +1569,42 @@ class AlphaZeroTrainer:
                 self.writer.add_scalar("selfplay/avg_num_legal", selfplay_stats.get("avg_num_legal", 0), iteration)
                 self.writer.add_scalar("selfplay/avg_root_q", selfplay_stats.get("avg_root_q", 0), iteration)
                 self.writer.add_scalar("selfplay/generation_time", selfplay_stats.get("generation_time", 0), iteration)
+                # Beat-humans: packing quality + search health (low-noise aggregates)
+                _beat_humans_keys = (
+                    "selfplay_avg_final_empty_squares_mean",
+                    "selfplay_avg_final_empty_components_mean",
+                    "selfplay_avg_final_isolated_1x1_holes_mean",
+                    "selfplay_p50_final_empty_squares_mean",
+                    "selfplay_p90_final_empty_squares_mean",
+                    "selfplay_p50_final_empty_components_mean",
+                    "selfplay_p90_final_empty_components_mean",
+                    "selfplay_p50_final_isolated_1x1_holes_mean",
+                    "selfplay_p90_final_isolated_1x1_holes_mean",
+                    "selfplay_avg_final_empty_squares_abs_diff",
+                    "selfplay_avg_final_empty_components_abs_diff",
+                    "selfplay_avg_final_isolated_1x1_holes_abs_diff",
+                    "selfplay_avg_root_legal_count",
+                    "selfplay_avg_root_expanded_count",
+                    "selfplay_avg_root_expanded_ratio",
+                    "selfplay_p90_root_legal_count",
+                    "selfplay_p90_root_expanded_ratio",
+                )
+                for _k in _beat_humans_keys:
+                    if _k in selfplay_stats:
+                        self.writer.add_scalar(f"selfplay/{_k}", selfplay_stats[_k], iteration)
+                # Opponent mix (vs packer)
+                for _k in (
+                    "selfplay_frac_games_vs_packer",
+                    "selfplay_nn_vs_packer_winrate",
+                    "selfplay_avg_final_empty_components_mean_vs_packer",
+                    "selfplay_avg_final_isolated_1x1_holes_mean_vs_packer",
+                ):
+                    if _k in selfplay_stats:
+                        self.writer.add_scalar(f"selfplay/{_k}", selfplay_stats[_k], iteration)
+                # Packing ordering heuristic (BUY rank for PW)
+                for _k in ("selfplay_avg_packing_ordering_enabled", "selfplay_avg_packing_score_top1"):
+                    if _k in selfplay_stats:
+                        self.writer.add_scalar(f"selfplay/{_k}", selfplay_stats[_k], iteration)
 
                 # Replay buffer
                 self.writer.add_scalar("buffer/total_positions", self.replay_buffer.total_positions, iteration)
@@ -1500,6 +1620,15 @@ class AlphaZeroTrainer:
                 for k in _iter_whitelist:
                     if k in train_metrics:
                         self.writer.add_scalar(f"iter/{k}", train_metrics[k], iteration)
+
+                # Evaluation vs anchor (iter192) and Elo
+                if "vs_anchor" in eval_results:
+                    self.writer.add_scalar("eval/anchor_win_rate", eval_results["vs_anchor"].get("win_rate", 0), iteration)
+                    self.writer.add_scalar("eval/anchor_avg_margin", eval_results["vs_anchor"].get("avg_model_score_margin", 0), iteration)
+                if "vs_pure_mcts" in eval_results:
+                    self.writer.add_scalar("eval/pure_mcts_win_rate", eval_results["vs_pure_mcts"].get("win_rate", 0), iteration)
+                if "elo_rating" in eval_results:
+                    self.writer.add_scalar("eval/elo", eval_results["elo_rating"], iteration)
 
                 # --- League-based evaluation & gating ---
                 if self.league_enabled and self.league is not None and iteration > 0:
@@ -1529,7 +1658,7 @@ class AlphaZeroTrainer:
                 # Write summary to staging (included in commit)
                 self._save_iteration_summary(iteration, summary, output_dir=staging_path)
                 mem_summary = dict(summary)
-                for eval_key in ("vs_previous_best", "vs_pure_mcts"):
+                for eval_key in ("vs_previous_best", "vs_pure_mcts", "vs_anchor"):
                     if eval_key in mem_summary.get("eval_results", {}):
                         mem_summary["eval_results"] = dict(mem_summary["eval_results"])
                         mem_summary["eval_results"][eval_key] = {
@@ -1564,6 +1693,16 @@ class AlphaZeroTrainer:
                     torch.cuda.synchronize()
                     torch.cuda.empty_cache()
                     time.sleep(3)
+                    # Per-cycle memory log (lifecycle debugging: spot parent-side growth)
+                    try:
+                        alloc_mb = torch.cuda.memory_allocated(0) / (1024 ** 2)
+                        reserved_mb = torch.cuda.memory_reserved(0) / (1024 ** 2)
+                        logger.debug(
+                            "[LIFECYCLE] iter %d end: CUDA allocated=%.1f MiB reserved=%.1f MiB",
+                            iteration, alloc_mb, reserved_mb,
+                        )
+                    except Exception:
+                        pass
 
         if _shutdown_requested:
             msg = f"  STOPPED GRACEFULLY  (last committed: iter{self.last_committed_iteration:03d})"
@@ -1665,6 +1804,9 @@ class AlphaZeroTrainer:
                 }
         if "vs_pure_mcts" in eval_results:
             entry["eval_vs_mcts_wr"] = eval_results["vs_pure_mcts"].get("win_rate")
+        if "vs_anchor" in eval_results:
+            entry["eval_vs_anchor_wr"] = eval_results["vs_anchor"].get("win_rate")
+            entry["eval_vs_anchor_margin"] = eval_results["vs_anchor"].get("avg_model_score_margin")
         if "elo_rating" in eval_results:
             entry["elo"] = eval_results["elo_rating"]
 
@@ -1760,11 +1902,27 @@ class AlphaZeroTrainer:
                 f"[EVAL] Skipping pure MCTS (iter {iteration} > skip_after={skip_after})"
             )
 
-        if self.config["evaluation"]["elo"]["enabled"] and "vs_pure_mcts" in eval_results:
+        # Anchor baseline eval (e.g. iter192 from a different architecture run).
+        # Runs when anchor_checkpoint is configured and games_vs_anchor > 0.
+        num_games_anchor = int(eval_cfg.get("games_vs_anchor", 0))
+        if num_games_anchor > 0 and self.evaluator._anchor_mcts is not None:
+            logger.info(f"[EVAL] Playing {num_games_anchor} games vs anchor baseline...")
+            anchor_results = self.evaluator.evaluate_vs_baseline(
+                model_path, baseline_type="anchor", num_games=num_games_anchor
+            )
+            eval_results["vs_anchor"] = anchor_results
+            logger.info(
+                f"[EVAL] vs anchor: WR={anchor_results['win_rate']:.1%}  "
+                f"avg_margin={anchor_results.get('avg_model_score_margin', 0):.1f}pts"
+            )
+
+        elo_key = "vs_anchor" if "vs_anchor" in eval_results else "vs_pure_mcts"
+        if self.config["evaluation"]["elo"]["enabled"] and elo_key in eval_results:
             player_id = f"iteration_{iteration:03d}"
-            for result in eval_results["vs_pure_mcts"]["results"]:
+            baseline_id = "anchor" if elo_key == "vs_anchor" else "pure_mcts"
+            for result in eval_results[elo_key]["results"]:
                 outcome = 1.0 if result["model_won"] is True else 0.0
-                self.elo_tracker.update(player_id, "pure_mcts", outcome)
+                self.elo_tracker.update(player_id, baseline_id, outcome)
 
             eval_results["elo_rating"] = self.elo_tracker.get_rating(player_id)
             logger.info(f"[EVAL] Elo: {eval_results['elo_rating']:.0f}")
@@ -2445,6 +2603,24 @@ def main():
         default=None,
         help="Override max_iterations for short runs (e.g. --iterations 1).",
     )
+    parser.add_argument(
+        "--flush-replay-on-resume",
+        action="store_true",
+        default=False,
+        help="On resume: clear replay buffer state before self-play for the first iteration (recommended with --reset-optimizer-on-resume).",
+    )
+    parser.add_argument(
+        "--reset-optimizer-on-resume",
+        action="store_true",
+        default=False,
+        help="On resume: load model weights only; reinitialize optimizer/scheduler/scaler/EMA (EMA not loaded from checkpoint).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="If committed/iter_N for start_iteration already exists, advance to next free iteration instead of failing.",
+    )
 
     args = parser.parse_args()
 
@@ -2463,7 +2639,13 @@ def main():
     )
 
     try:
-        trainer.train(args.start_iteration, args.resume)
+        trainer.train(
+            args.start_iteration,
+            args.resume,
+            flush_replay_on_resume=args.flush_replay_on_resume,
+            reset_optimizer_on_resume=args.reset_optimizer_on_resume,
+            force_next_iter=args.force,
+        )
     except KeyboardInterrupt:
         logger.info("")
         logger.info("Training interrupted by user.")
@@ -2488,4 +2670,6 @@ def main():
 
 
 if __name__ == "__main__":
+    import multiprocessing as _mp
+    _mp.freeze_support()  # Windows: required when using spawn (e.g. GPU server / self-play pool)
     main()

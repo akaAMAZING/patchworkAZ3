@@ -25,7 +25,6 @@ from typing import Dict, List, Optional, Tuple
 
 import h5py
 import numpy as np
-import torch
 
 from .run_layout import (
     ENCODING_VERSION_ATTR,
@@ -52,6 +51,7 @@ from .selfplay_optimized import (
 )
 from src.mcts.shared_state_buffer import WorkerSharedBuffer
 from src.training.replay_buffer import _validate_score_margins, SCORE_MARGIN_MAX_ABS
+from src.utils.packing_metrics import aggregate_packing_over_games, aggregate_root_over_moves
 
 
 def _init_worker_ignore_sigint(*args):
@@ -122,13 +122,16 @@ class SelfPlayGenerator:
         self._expected_n_slots: Optional[int] = None  # Set when GPU server SHM is created; used by workers
 
     def _should_use_gpu_server(self, network_path: Optional[str]) -> bool:
-        """Auto-detect if GPU inference server should be used."""
+        """Decide if GPU inference server should be used (Windows-safe: no parent CUDA touch).
+
+        Uses config only so the parent never calls torch.cuda.is_available() before spawn.
+        If CUDA is unavailable, the child will put ('error', ...) on ready_q and we raise.
+        """
         if network_path is None:
             return False  # Bootstrap mode (pure MCTS)
-
-        if not torch.cuda.is_available():
+        hw = (self.config.get("hardware", {}) or {}).get("device", "cpu")
+        if hw != "cuda":
             return False
-
         num_workers = int(self.config.get("selfplay", {}).get("num_workers", 1))
         return num_workers > 1
 
@@ -142,11 +145,12 @@ class SelfPlayGenerator:
             return max(int(e.get("parallel_leaves", base)) for e in pl_schedule)
         return base
 
-    def _start_gpu_server(self, network_path: str, num_workers: int):
+    def _start_gpu_server(self, network_path: str, num_workers: int, iteration: Optional[int] = None):
         """Start GPU inference server process with per-worker response queues.
 
         Uses expected_n_slots (max over schedule) for SHM sizing everywhere; same config
         is passed to the child. Cleanup (SHM close+unlink) runs in finally.
+        iteration: optional, for lifecycle logging (child PID is logged at info).
         """
         from src.network.gpu_inference_server import run_gpu_inference_server
 
@@ -193,26 +197,47 @@ class SelfPlayGenerator:
                 daemon=False,
             )
             self.gpu_process.start()
-            logger.debug("GPU inference server process started (PID: %s)", self.gpu_process.pid)
+            logger.info(
+                "[LIFECYCLE] GPU server process started parent_pid=%s child_pid=%s iter=%s",
+                os.getpid(), self.gpu_process.pid, iteration,
+            )
             logger.debug("Waiting for GPU server to initialize...")
 
             gpu_ready_timeout = float(
                 self.config.get("selfplay", {}).get("gpu_server_ready_timeout_s", 180)
             )
+            status = None
+            poll_interval = 1.0  # Check child liveness every second
+            deadline = time.time() + gpu_ready_timeout
             try:
-                status = ready_q.get(timeout=gpu_ready_timeout)
-            except queue.Empty:
-                if self.gpu_process.is_alive():
-                    self.gpu_process.terminate()
-                    self.gpu_process.join(timeout=5)
-                msg = (
-                    f"GPU server did not signal ready within {gpu_ready_timeout:.0f}s (timeout). "
-                    "Increase selfplay.gpu_server_ready_timeout_s to wait longer."
-                )
-                exitcode = getattr(self.gpu_process, "exitcode", None)
-                if exitcode is not None:
-                    msg += f" Child exit code: {exitcode}."
-                raise RuntimeError(msg)
+                while time.time() < deadline:
+                    if not self.gpu_process.is_alive():
+                        exitcode = getattr(self.gpu_process, "exitcode", None)
+                        raise RuntimeError(
+                            "GPU server child process exited before signalling ready. "
+                            "This usually indicates a crash during CUDA/model init (e.g. nvcuda64.dll). "
+                            f"Child exit code: {exitcode}. "
+                            "Check GPU_SERVER_BREADCRUMB_LOG or child stdout for last breadcrumb."
+                        )
+                    try:
+                        status = ready_q.get(timeout=min(poll_interval, max(0.1, deadline - time.time())))
+                        break
+                    except queue.Empty:
+                        continue
+                if status is None:
+                    if self.gpu_process.is_alive():
+                        self.gpu_process.terminate()
+                        self.gpu_process.join(timeout=5)
+                    exitcode = getattr(self.gpu_process, "exitcode", None)
+                    msg = (
+                        f"GPU server did not signal ready within {gpu_ready_timeout:.0f}s (timeout). "
+                        "Increase selfplay.gpu_server_ready_timeout_s to wait longer."
+                    )
+                    if exitcode is not None:
+                        msg += f" Child exit code: {exitcode}."
+                    raise RuntimeError(msg)
+            except RuntimeError:
+                raise
 
             if status == "ready":
                 started_ok = True
@@ -233,27 +258,54 @@ class SelfPlayGenerator:
                 self.gpu_process.join(timeout=5)
             raise
         finally:
-            # CLEANUP on startup failure only: release SHM so next run does not see stale segments
+            # On startup failure: full cleanup (queues, process ref, SHM) so next cycle does not leak
             if not started_ok:
-                for wid, buf in list(self._worker_shm_bufs.items()):
-                    try:
-                        buf.destroy()
-                    except Exception as e:
-                        logger.debug("Failed to destroy SHM buffer for worker %d: %s", wid, e)
-                self._worker_shm_bufs.clear()
-                self._worker_shm_names.clear()
+                self._stop_gpu_server()
 
     def _stop_gpu_server(self):
-        """Stop GPU inference server and destroy shared memory buffers."""
-        if self.gpu_process and self.gpu_process.is_alive():
-            logger.debug("Stopping GPU inference server...")
-            self.stop_evt.set()
-            self.gpu_process.join(timeout=5)
+        """Stop GPU inference server, close queues, and destroy shared memory buffers.
+
+        Lifecycle: ensures child is joined, queues are closed (Windows pipe leak avoidance),
+        SHM destroyed, and references cleared so the next cycle starts clean.
+        """
+        pid, exitcode = None, None
+        if self.gpu_process:
+            pid = getattr(self.gpu_process, "pid", None)
             if self.gpu_process.is_alive():
-                logger.warning("GPU server didn't stop gracefully, terminating...")
-                self.gpu_process.terminate()
-                self.gpu_process.join(timeout=2)
-            logger.debug("GPU inference server stopped")
+                logger.debug("Stopping GPU inference server...")
+                if self.stop_evt is not None:
+                    self.stop_evt.set()
+                self.gpu_process.join(timeout=5)
+                if self.gpu_process.is_alive():
+                    logger.warning("GPU server didn't stop gracefully, terminating...")
+                    self.gpu_process.terminate()
+                    self.gpu_process.join(timeout=2)
+            exitcode = getattr(self.gpu_process, "exitcode", None)
+            logger.info(
+                "[LIFECYCLE] GPU server stopped child_pid=%s exitcode=%s",
+                pid, exitcode,
+            )
+            self.gpu_process = None
+
+        # Close queues to release pipe handles (Windows: avoids accumulation across cycles)
+        if self.req_q is not None:
+            try:
+                self.req_q.close()
+                if hasattr(self.req_q, "cancel_join_thread"):
+                    self.req_q.cancel_join_thread()
+            except Exception as e:
+                logger.debug("Failed to close req_q: %s", e)
+            self.req_q = None
+        if self.resp_qs is not None:
+            for q in self.resp_qs:
+                try:
+                    q.close()
+                    if hasattr(q, "cancel_join_thread"):
+                        q.cancel_join_thread()
+                except Exception as e:
+                    logger.debug("Failed to close resp_q: %s", e)
+            self.resp_qs = None
+        self.stop_evt = None
 
         # Destroy shared memory buffers (must be done after GPU server exits)
         for wid, buf in list(self._worker_shm_bufs.items()):
@@ -326,7 +378,8 @@ class SelfPlayGenerator:
         # Start GPU server if beneficial
         use_gpu_server = self._should_use_gpu_server(network_path)
         if use_gpu_server:
-            self._start_gpu_server(network_path, num_workers)
+            logger.info("[LIFECYCLE] starting GPU server for iteration %s", iteration)
+            self._start_gpu_server(network_path, num_workers, iteration)
             self.use_gpu_server = True
 
         try:
@@ -519,7 +572,7 @@ class SelfPlayGenerator:
         """Merge NPZ shards into single HDF5. Supports gold_v2_multimodal schema."""
         shard_files = sorted(shard_dir.glob("*.npz"))
         exp_ch = int(self.config.get("network", {}).get("input_channels", 56))
-        is_gold_v2 = exp_ch == 56
+        is_gold_v2 = exp_ch in (56, 60)
 
         if not shard_files:
             logger.warning("No shard files found, creating empty HDF5")
@@ -851,6 +904,31 @@ class SelfPlayGenerator:
 
     def _compute_stats(self, summaries, generation_time) -> Dict:
         """Compute statistics from game summaries."""
+        empty_beat_humans = {
+            "selfplay_avg_final_empty_squares_mean": 0.0,
+            "selfplay_avg_final_empty_components_mean": 0.0,
+            "selfplay_avg_final_isolated_1x1_holes_mean": 0.0,
+            "selfplay_p50_final_empty_squares_mean": 0.0,
+            "selfplay_p90_final_empty_squares_mean": 0.0,
+            "selfplay_p50_final_empty_components_mean": 0.0,
+            "selfplay_p90_final_empty_components_mean": 0.0,
+            "selfplay_p50_final_isolated_1x1_holes_mean": 0.0,
+            "selfplay_p90_final_isolated_1x1_holes_mean": 0.0,
+            "selfplay_avg_final_empty_squares_abs_diff": 0.0,
+            "selfplay_avg_final_empty_components_abs_diff": 0.0,
+            "selfplay_avg_final_isolated_1x1_holes_abs_diff": 0.0,
+            "selfplay_avg_root_legal_count": 0.0,
+            "selfplay_avg_root_expanded_count": 0.0,
+            "selfplay_avg_root_expanded_ratio": 0.0,
+            "selfplay_p90_root_legal_count": 0.0,
+            "selfplay_p90_root_expanded_ratio": 0.0,
+            "selfplay_frac_games_vs_packer": 0.0,
+            "selfplay_nn_vs_packer_winrate": 0.0,
+            "selfplay_avg_final_empty_components_mean_vs_packer": 0.0,
+            "selfplay_avg_final_isolated_1x1_holes_mean_vs_packer": 0.0,
+            "selfplay_avg_packing_ordering_enabled": 0.0,
+            "selfplay_avg_packing_score_top1": 0.0,
+        }
         if not summaries:
             return {
                 "num_games": 0,
@@ -866,6 +944,7 @@ class SelfPlayGenerator:
                 "avg_redundancy": 0.0,
                 "unique_positions": 0,
                 "avg_root_q": 0.0,
+                **empty_beat_humans,
             }
 
         game_lengths = [s.get("game_length", 0) for s in summaries]
@@ -884,6 +963,43 @@ class SelfPlayGenerator:
         # Root Q stats
         root_qs = [s.get("avg_root_q", 0) for s in summaries if "avg_root_q" in s]
 
+        # Packing / quilt quality (beat-humans): per-game (e0, e1, c0, c1, i0, i1)
+        packing_per_game = []
+        for s in summaries:
+            e0 = s.get("empty_squares_p0", 0)
+            e1 = s.get("empty_squares_p1", 0)
+            c0 = s.get("empty_components_p0", 0)
+            c1 = s.get("empty_components_p1", 0)
+            i0 = s.get("isolated_1x1_holes_p0", 0)
+            i1 = s.get("isolated_1x1_holes_p1", 0)
+            packing_per_game.append((e0, e1, c0, c1, i0, i1))
+        packing_stats = aggregate_packing_over_games(packing_per_game) if packing_per_game else empty_beat_humans
+
+        # Root search health: flatten lists across all games
+        all_root_legal = []
+        all_root_expanded = []
+        for s in summaries:
+            all_root_legal.extend(s.get("root_legal_counts", []))
+            all_root_expanded.extend(s.get("root_expanded_counts", []))
+        root_stats = aggregate_root_over_moves(all_root_legal, all_root_expanded)
+
+        # Opponent mix (vs packer): fraction of games and NN win rate in those games
+        vs_packer_games = [s for s in summaries if s.get("vs_packer")]
+        nn_wons = [s.get("nn_won") for s in vs_packer_games if "nn_won" in s]
+        frac_vs_packer = len(vs_packer_games) / len(summaries) if summaries else 0.0
+        nn_vs_packer_wr = float(np.mean(nn_wons)) if nn_wons else 0.0
+        # Packing stats in vs_packer games only (per-game mean across both players)
+        comps_vs_packer = [
+            (s.get("empty_components_p0", 0) + s.get("empty_components_p1", 0)) / 2.0
+            for s in vs_packer_games
+        ]
+        isol_vs_packer = [
+            (s.get("isolated_1x1_holes_p0", 0) + s.get("isolated_1x1_holes_p1", 0)) / 2.0
+            for s in vs_packer_games
+        ]
+        mean_comp_vs_packer = float(np.mean(comps_vs_packer)) if comps_vs_packer else 0.0
+        mean_isol_vs_packer = float(np.mean(isol_vs_packer)) if isol_vs_packer else 0.0
+
         return {
             "num_games": len(summaries),
             "num_positions": num_positions,
@@ -901,6 +1017,14 @@ class SelfPlayGenerator:
             "unique_positions": int(unique_pos),
             # Root Q value stats
             "avg_root_q": float(np.mean(root_qs)) if root_qs else 0.0,
+            **packing_stats,
+            **root_stats,
+            "selfplay_frac_games_vs_packer": frac_vs_packer,
+            "selfplay_nn_vs_packer_winrate": nn_vs_packer_wr,
+            "selfplay_avg_final_empty_components_mean_vs_packer": mean_comp_vs_packer,
+            "selfplay_avg_final_isolated_1x1_holes_mean_vs_packer": mean_isol_vs_packer,
+            "selfplay_avg_packing_ordering_enabled": 1.0 if (self.config.get("selfplay", {}).get("mcts", {}).get("packing_ordering", {}).get("enabled", False)) else 0.0,
+            "selfplay_avg_packing_score_top1": float(np.mean([s.get("packing_score_top1", 0.0) for s in summaries if "packing_score_top1" in s])) if any("packing_score_top1" in s for s in summaries) else 0.0,
         }
 
 

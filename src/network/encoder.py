@@ -611,14 +611,23 @@ def _frontier_plane(occ0: int, occ1: int, occ2: int) -> np.ndarray:
 
 
 class GoldV2StateEncoder:
-    """Gold v2 multimodal encoder: x_spatial (32,9,9), x_global (61,), x_track (8,54), shop_ids, shop_feats.
+    """Gold v2 multimodal encoder.
 
-    Outputs 32 spatial channels (0-31): board occupancy, coords, frontier, valid_7x7, and
-    slot×orient shape planes.  Channels 32-55 (legalTL) are computed on-GPU by
-    DeterministicLegalityModule in PatchworkNetwork.forward().
+    encoding_version="gold_v2_36ch" (default): x_spatial (36,9,9), x_global (65,)
+        Includes packing quality planes ch 32-35 and global[61-64].
+    encoding_version="gold_v2_32ch" (legacy): x_spatial (32,9,9), x_global (61,)
+        Omits packing quality planes. Required for iter192 and earlier checkpoints.
+
+    In both cases channels 8-31 are slot×orient shape planes and legalTL (ch 32-55 or 36-59)
+    is computed on-GPU by DeterministicLegalityModule in PatchworkNetwork.forward().
     """
 
-    def __init__(self) -> None:
+    def __init__(self, encoding_version: str | None = None) -> None:
+        from src.network.gold_v2_constants import ENCODING_VERSION as _CURRENT
+        _enc = (encoding_version or _CURRENT).lower()
+        self._legacy_32ch: bool = _enc in ("gold_v2_32ch", "gold_v2_multimodal")
+        _n_sp: int = 32 if self._legacy_32ch else C_SPATIAL_ENC  # spatial channels (32 or 36)
+        _n_g: int  = 61 if self._legacy_32ch else F_GLOBAL        # global dims (61 or 65)
         self._coord_row = np.array(
             [[r / 8.0 for c in range(9)] for r in range(9)],
             dtype=np.float32,
@@ -671,8 +680,8 @@ class GoldV2StateEncoder:
 
         # Pre-allocated instance buffers — reused across encode calls (no per-call malloc).
         # encode_state_multimodal writes here then returns copies; encode_into writes in-place.
-        self._buf_spatial    = np.zeros((C_SPATIAL_ENC, 9, 9), dtype=np.float32)
-        self._buf_global     = np.zeros(F_GLOBAL, dtype=np.float32)
+        self._buf_spatial    = np.zeros((_n_sp, 9, 9), dtype=np.float32)
+        self._buf_global     = np.zeros(_n_g, dtype=np.float32)
         self._buf_track      = np.zeros((C_TRACK, TRACK_LEN), dtype=np.float32)
         self._buf_shop_ids   = np.full(NMAX, -1, dtype=np.int16)
         self._buf_shop_feats = np.zeros((NMAX, F_SHOP), dtype=np.float32)
@@ -683,6 +692,18 @@ class GoldV2StateEncoder:
             return self._slot_orient_shape_masks[key].copy()
         return self._get_shape(piece_id, orient)
 
+    @staticmethod
+    def _decode_occ_words(occ0_i: int, occ1_i: int, occ2_i: int) -> np.ndarray:
+        """Decode 3×32-bit occupancy words into a (9,9) float32 mask."""
+        words = np.array([
+            int(occ0_i) & 0xFFFFFFFF,
+            int(occ1_i) & 0xFFFFFFFF,
+            int(occ2_i) & 0xFFFFFFFF,
+        ], dtype=np.uint32)
+        byte_arr = words.view(np.uint8)
+        all_bits = np.unpackbits(byte_arr, bitorder="little")
+        return all_bits[:81].astype(np.float32).reshape(BOARD_SIZE_INT, BOARD_SIZE_INT)
+
     def encode_state_multimodal(
         self, state: np.ndarray, to_move: int
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -690,8 +711,8 @@ class GoldV2StateEncoder:
         Encode game state into multimodal inputs.
 
         Returns:
-            x_spatial: (32, 9, 9) float32  — channels 0-31 only; legalTL (32-55) computed on GPU
-            x_global: (61,) float32
+            x_spatial: (36, 9, 9) float32  — channels 0-35 only; legalTL (36-59) computed on GPU
+            x_global: (65,) float32
             x_track: (8, 54) float32
             shop_ids: (33,) int16, pad=-1
             shop_feats: (33, 10) float32
@@ -721,7 +742,7 @@ class GoldV2StateEncoder:
     ) -> None:
         """
         Zero-copy encode: write state directly into shared-memory buffer views.
-        Uses gold_v2_32ch logic (32 spatial channels, 61 global, 8x54 track, shop).
+        Uses gold_v2_36ch logic (36 spatial channels, 65 global, 8x54 track, shop).
         Caller must provide pre-allocated views (e.g. from WorkerSharedBuffer).
         """
         if int(to_move) == 0:
@@ -803,6 +824,41 @@ class GoldV2StateEncoder:
             x_global, x_track, shop_ids, shop_feats,
             TRACK_LENGTH, TRACK_LEN, _LOG1P_200, _LOG1P_20,
         )
+
+        # ---- ch 32-35 and global[61-64]: packing quality planes (36ch encoding only) ----
+        if not self._legacy_32ch:
+            # ch 32-33: isolated holes (empty cells with all 4 cardinal neighbors filled/OOB)
+            # ch 32 = current player board, ch 33 = opponent board
+            for ch_occ, ch_dst in ((0, 32), (1, 33)):
+                occ = x_spatial[ch_occ].astype(bool)
+                empty = ~occ
+                # Pad with True (filled): OOB is treated as a wall
+                padded = np.pad(occ, 1, mode='constant', constant_values=True)
+                n_nbr = padded[:-2, 1:-1]
+                s_nbr = padded[2:,  1:-1]
+                w_nbr = padded[1:-1, :-2]
+                e_nbr = padded[1:-1, 2:]
+                x_spatial[ch_dst] = (empty & n_nbr & s_nbr & w_nbr & e_nbr).astype(np.float32)
+
+            # ch 34-35: constrained empty (at most 1 empty 4-neighbor; isolated + dead-end cells)
+            # ch 34 = current player board, ch 35 = opponent board
+            for ch_occ, ch_dst in ((0, 34), (1, 35)):
+                occ = x_spatial[ch_occ].astype(bool)
+                empty = ~occ
+                padded_e = np.pad(empty, 1, mode='constant', constant_values=False)
+                n_e = padded_e[:-2, 1:-1]
+                s_e = padded_e[2:,  1:-1]
+                w_e = padded_e[1:-1, :-2]
+                e_e = padded_e[1:-1, 2:]
+                empty_nbr = (n_e.view(np.uint8) + s_e.view(np.uint8)
+                             + w_e.view(np.uint8) + e_e.view(np.uint8)).astype(np.int32)
+                x_spatial[ch_dst] = (empty & (empty_nbr <= 1)).astype(np.float32)
+
+            # x_global[61-64]: normalized counts (divisor 27 = rough max isolated holes in 9×9)
+            x_global[61] = float(x_spatial[32].sum()) / 27.0  # cur isolated holes
+            x_global[62] = float(x_spatial[33].sum()) / 27.0  # opp isolated holes
+            x_global[63] = float(x_spatial[34].sum()) / 27.0  # cur constrained empty
+            x_global[64] = float(x_spatial[35].sum()) / 27.0  # opp constrained empty
 
 
 # Module-level singleton encoder — avoids recreating the encoder (and
@@ -934,13 +990,19 @@ class LegacyStateEncoder:
 
 
 def get_state_encoder_for_channels(num_channels: int):
-    """Return encoder matching the given channel count (16, 32, or 56)."""
+    """Return encoder matching the given channel count (16, 32, 36, 56, or 60).
+
+    32 / 56 → GoldV2StateEncoder in legacy 32ch mode (for iter192 and earlier).
+    36 / 60 → GoldV2StateEncoder in new 36ch mode (gold_v2_36ch encoding).
+    """
     n = int(num_channels)
     if n == 16:
         return LegacyStateEncoder()
     if n in (32, 56):
+        return GoldV2StateEncoder("gold_v2_32ch")
+    if n in (36, 60):
         return GoldV2StateEncoder()
-    raise ValueError(f"No encoder for {num_channels} channels; expected 16, 32, or 56")
+    raise ValueError(f"No encoder for {num_channels} channels; expected 16, 32, 36, 56, or 60")
 
 
 # =========================================================================
@@ -1221,8 +1283,8 @@ class ActionEncoder:
         slot_piece_ids: List[Optional[int]],
         flip_type: str,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Apply board flip. Spatial channels: 0, 1, 2, 3, 4-27 (slot×orient shapes)."""
-        SPATIAL = list(range(0, 28))  # 0-1 boards, 2-3 coords, 4-27 slot×orient
+        """Apply board flip. Flips all C_SPATIAL_ENC spatial channels (boards, coords, shapes, packing planes)."""
+        SPATIAL = list(range(C_SPATIAL_ENC))  # all encoded spatial channels
         new_state = encoded_state.copy()
         ch_axis = 0 if flip_type == "vertical" else 1
         for ch in SPATIAL:

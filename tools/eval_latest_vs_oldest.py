@@ -34,8 +34,9 @@ if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
 from src.network.model import create_network, load_model_checkpoint
-from src.network.encoder import ActionEncoder, StateEncoder
+from src.network.encoder import ActionEncoder, StateEncoder, get_state_encoder_for_channels
 from src.mcts.alphazero_mcts_optimized import create_optimized_mcts
+from src.training.evaluation import build_eval_schedule
 from src.game.patchwork_engine import (
     apply_action_unchecked,
     compute_score_fast,
@@ -179,15 +180,24 @@ def run_eval(
     elo_file: Path | None = None,
     elo_style: str = "glicko2",
     win_first_enabled: bool | None = None,
+    cfg_b: dict | None = None,
 ) -> dict | None:
     """Run head-to-head evaluation between two checkpoints.
+
+    cfg_b: optional separate config for model B (cross-architecture eval).
+           When None, model B uses the same config as model A.
+           Example: compare iter192 (input_channels=56) vs new run (input_channels=60) by
+           passing config_best.yaml as cfg and config_fresh_run.yaml as cfg_b.
     If win_first_enabled is not None, overrides config selfplay.mcts.win_first.enabled for this run (A/B testing).
     """
-    cfg = copy.deepcopy(cfg)
+    cfg_a = copy.deepcopy(cfg)
+    cfg_b = copy.deepcopy(cfg_b) if cfg_b is not None else copy.deepcopy(cfg)
+
     if win_first_enabled is not None:
-        mcts_cfg = cfg.setdefault("selfplay", {}).setdefault("mcts", {})
-        wf = mcts_cfg.setdefault("win_first", {})
-        wf["enabled"] = bool(win_first_enabled)
+        for c in [cfg_a, cfg_b]:
+            mcts_cfg = c.setdefault("selfplay", {}).setdefault("mcts", {})
+            wf = mcts_cfg.setdefault("win_first", {})
+            wf["enabled"] = bool(win_first_enabled)
 
     id_a = model_elo_id(model_a_path)
     id_b = model_elo_id(model_b_path)
@@ -200,29 +210,38 @@ def run_eval(
         exp_a = expected_score(ra, rb, rda, rdb)
         log.info(f"ELO (pre):  A {id_a} {ra:.0f} ±{rda:.0f}  |  B {id_b} {rb:.0f} ±{rdb:.0f}  |  E[A win]={exp_a*100:.0f}%\n")
 
-    state_enc = StateEncoder()
+    in_ch_a = int(cfg_a.get("network", {}).get("input_channels", 56))
+    in_ch_b = int(cfg_b.get("network", {}).get("input_channels", 56))
+    state_enc_a = get_state_encoder_for_channels(in_ch_a)
+    state_enc_b = get_state_encoder_for_channels(in_ch_b)
     action_enc = ActionEncoder()
 
-    model_a = create_network(cfg)
+    if in_ch_a != in_ch_b:
+        log.info(f"Cross-architecture eval: A uses {in_ch_a}ch encoder, B uses {in_ch_b}ch encoder")
+
+    model_a = create_network(cfg_a)
     ckpt_a = torch_load(str(model_a_path), device)
     load_model_checkpoint(model_a, ckpt_a["model_state_dict"])
     model_a.to(device).eval()
 
-    model_b = create_network(cfg)
+    model_b = create_network(cfg_b)
     ckpt_b = torch_load(str(model_b_path), device)
     load_model_checkpoint(model_b, ckpt_b["model_state_dict"])
     model_b.to(device).eval()
 
-    mcts_a = create_optimized_mcts(model_a, cfg, device, state_enc, action_enc)
+    mcts_a = create_optimized_mcts(model_a, cfg_a, device, state_enc_a, action_enc)
     mcts_a.config.simulations = sims
     mcts_a.config.cpuct = cpuct
 
-    mcts_b = create_optimized_mcts(model_b, cfg, device, state_enc, action_enc)
+    mcts_b = create_optimized_mcts(model_b, cfg_b, device, state_enc_b, action_enc)
     mcts_b.config.simulations = sims
     mcts_b.config.cpuct = cpuct
 
-    max_moves = int(cfg["selfplay"]["max_game_length"])
-    base_seed = int(cfg.get("seed", 42))
+    max_moves = int(cfg_a["selfplay"]["max_game_length"])
+    base_seed = int(cfg_a.get("seed", 42))
+
+    # Paired eval: same seed twice (A first, B first) for fair WR and lower variance
+    schedule = build_eval_schedule(games, base_seed, paired_eval=True)
 
     a_wins = 0
     b_wins = 0
@@ -234,12 +253,11 @@ def run_eval(
     label_a = model_a_path.name
     label_b = model_b_path.name
 
-    for game_idx in range(games):
-        a_is_p0 = (game_idx % 2 == 0)
+    for game_idx, (seed, a_plays_first) in enumerate(schedule):
+        a_is_p0 = a_plays_first
         a_player = 0 if a_is_p0 else 1
         b_player = 1 - a_player
 
-        seed = base_seed + game_idx * 1000
         state = new_game(seed=seed)
 
         move_number = 0
@@ -628,7 +646,10 @@ def run_gui(
 
 def main():
     ap = argparse.ArgumentParser(description="Evaluate two Patchwork AlphaZero checkpoints head-to-head.")
-    ap.add_argument("--config", default="configs/config_best.yaml", help="Config file")
+    ap.add_argument("--config", default="configs/config_best.yaml", help="Config file for model A (and B if --config_b not set)")
+    ap.add_argument("--config_b", default=None, help="Config file for model B (cross-architecture eval). "
+                    "Example: compare iter192 (56ch) vs new run (60ch): "
+                    "--config configs/config_best.yaml --config_b configs/config_fresh_run.yaml")
     ap.add_argument("--games", type=int, default=20, help="Number of games")
     ap.add_argument("--override_sims", type=int, default=0, help="0 = use config eval sims")
     ap.add_argument("--override_cpuct", type=float, default=0.0, help="0 = use config eval cpuct")
@@ -685,9 +706,34 @@ def main():
     with open(cfg_path, "r") as f:
         cfg = yaml.safe_load(f)
 
+    cfg_b_loaded: dict | None = None
+    if getattr(args, "config_b", None):
+        cfg_b_path = Path(args.config_b)
+        if not cfg_b_path.is_absolute():
+            cfg_b_path = REPO_ROOT / cfg_b_path
+        if not cfg_b_path.exists():
+            raise SystemExit(f"Config B not found: {cfg_b_path}")
+        with open(cfg_b_path, "r") as f:
+            cfg_b_loaded = yaml.safe_load(f)
+        log.info(f"Cross-arch eval: A config={cfg_path.name}, B config={cfg_b_path.name}")
+
     eval_cfg = cfg["evaluation"]["eval_mcts"]
-    sims = int(args.override_sims) if args.override_sims > 0 else int(eval_cfg["simulations"])
-    cpuct = float(args.override_cpuct) if args.override_cpuct > 0 else float(eval_cfg["cpuct"])
+    # Fair strength test: default to strong-play sims (256) and cpuct aligned with selfplay when locked
+    if args.override_sims > 0:
+        sims = int(args.override_sims)
+    else:
+        sims = int(eval_cfg.get("simulations", 192))
+        # Use higher sims for true strength eval (both models get same budget)
+        if sims < 256:
+            sims = 256
+    if args.override_cpuct > 0:
+        cpuct = float(args.override_cpuct)
+    else:
+        lock = cfg.get("evaluation", {}).get("lock_eval_cpuct_to_selfplay", True)
+        if lock:
+            cpuct = float(cfg.get("selfplay", {}).get("mcts", {}).get("cpuct", eval_cfg["cpuct"]))
+        else:
+            cpuct = float(eval_cfg["cpuct"])
     device = torch.device("cuda" if (cfg["hardware"]["device"] == "cuda" and torch.cuda.is_available()) else "cpu")
     elo_file = (REPO_ROOT / args.elo_file) if args.elo else None
 
@@ -803,12 +849,14 @@ def main():
 
     log.info(f"Model A: {path_a.name}")
     log.info(f"Model B: {path_b.name}")
-    log.info(f"Games: {args.games}\n")
+    log.info(f"Games: {args.games}  (paired: same seed, both colors, for fair WR)")
+    log.info(f"Sims: {sims}  Cpuct: {cpuct}  (strong-play settings)\n")
 
     if getattr(args, "ab_win_first", False):
         run_ab_win_first(cfg, path_a, path_b, args.games, sims, cpuct, device, log)
     else:
-        run_eval(cfg, path_a, path_b, args.games, sims, cpuct, device, log, elo_file=elo_file, elo_style=args.elo_style)
+        run_eval(cfg, path_a, path_b, args.games, sims, cpuct, device, log,
+                 elo_file=elo_file, elo_style=args.elo_style, cfg_b=cfg_b_loaded)
 
 
 if __name__ == "__main__":

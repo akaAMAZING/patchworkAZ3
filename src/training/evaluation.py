@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 from src.mcts.alphazero_mcts_optimized import OptimizedAlphaZeroMCTS, MCTSConfig, create_optimized_mcts
-from src.network.encoder import ActionEncoder, StateEncoder, GoldV2StateEncoder
+from src.network.encoder import ActionEncoder, StateEncoder, GoldV2StateEncoder, get_state_encoder_for_channels
 from src.game.patchwork_engine import (
     apply_action,
     apply_action_unchecked,
@@ -233,16 +233,46 @@ class PureMCTSEvaluator:
 class Evaluator:
     """Evaluates model strength through competitive matches."""
 
-    def __init__(self, config: dict, device: torch.device):
+    def __init__(
+        self,
+        config: dict,
+        device: torch.device,
+        anchor_config: Optional[dict] = None,
+        anchor_path: Optional[str] = None,
+    ):
         self.config = config
         self.device = device
-        enc_ver = str((config.get("data", {}) or {}).get("encoding_version", ""))
         in_ch = int((config.get("network", {}) or {}).get("input_channels", 56))
-        if enc_ver.lower() in ("gold_v2_32ch", "gold_v2_multimodal") or in_ch in (32, 56):
-            self.state_encoder = GoldV2StateEncoder()
-        else:
-            self.state_encoder = StateEncoder()
+        self.state_encoder = get_state_encoder_for_channels(in_ch)
         self.action_encoder = ActionEncoder()
+
+        # Fixed anchor baseline: pre-loaded once, reused every eval iteration.
+        # Supports cross-architecture comparison (e.g. iter192 at 56ch vs new run at 60ch).
+        self._anchor_mcts: Optional[OptimizedAlphaZeroMCTS] = None
+        if anchor_config is not None and anchor_path is not None:
+            self._setup_anchor(anchor_config, anchor_path)
+
+    def _setup_anchor(self, anchor_config: dict, anchor_path: str) -> None:
+        """Load the fixed anchor model (e.g. iter192) once and keep it alive."""
+        from src.network.model import create_network, load_model_checkpoint, get_state_dict_for_inference
+        anchor_in_ch = int((anchor_config.get("network") or {}).get("input_channels", 56))
+        anchor_enc = get_state_encoder_for_channels(anchor_in_ch)
+        model = create_network(anchor_config)
+        ckpt = torch.load(anchor_path, map_location=self.device, weights_only=False)
+        state_dict = get_state_dict_for_inference(ckpt, anchor_config, for_selfplay=False)
+        load_model_checkpoint(model, state_dict)
+        model.to(self.device).eval()
+        # Use eval sims from the candidate config so the comparison is fair
+        eval_cfg = self.config.get("evaluation", {}).get("eval_mcts", {})
+        self._anchor_mcts = create_optimized_mcts(
+            model, anchor_config, self.device, anchor_enc, self.action_encoder
+        )
+        self._anchor_mcts.config.simulations = int(eval_cfg.get("simulations", 192))
+        self._anchor_mcts.config.cpuct = float(eval_cfg.get("cpuct", 1.75))
+        logger.info(
+            "Anchor baseline loaded: %s (%dch, %d sims)",
+            Path(anchor_path).name, anchor_in_ch, self._anchor_mcts.config.simulations,
+        )
 
     def evaluate_vs_checkpoint(
         self,
@@ -395,6 +425,16 @@ class Evaluator:
             )
             baseline_mcts.config.simulations = int(eval_config["simulations"])
             baseline_mcts.config.cpuct = float(eval_config["cpuct"])
+
+        elif baseline_type == "anchor":
+            # Fixed cross-architecture anchor (e.g. iter192 at 56ch vs new 60ch run).
+            # Model is loaded once in __init__ via _setup_anchor(); just borrow it here.
+            if self._anchor_mcts is None:
+                raise ValueError(
+                    "baseline_type='anchor' requested but no anchor configured. "
+                    "Set evaluation.anchor_checkpoint.{path,config} in your config."
+                )
+            baseline_mcts = self._anchor_mcts
 
         else:
             raise ValueError(f"Unknown baseline type: {baseline_type}")

@@ -112,6 +112,16 @@ class ReplayBuffer:
             os.fsync(f.fileno())
         os.replace(tmp, self._state_path)
 
+    def clear_persisted_state(self) -> None:
+        """Clear in-memory entries and delete persisted replay_state.json (e.g. for --flush-replay-on-resume)."""
+        self._entries = []
+        if self._state_path and self._state_path.exists():
+            try:
+                self._state_path.unlink()
+                logger.info("Replay buffer: cleared persisted state at %s", self._state_path)
+            except OSError as e:
+                logger.warning("Replay buffer: could not remove %s: %s", self._state_path, e)
+
     def restore_state(self) -> bool:
         """Restore replay buffer entries from disk after crash/resume.
 

@@ -127,19 +127,45 @@ Training uses `use_amp: true`, `amp_dtype: bfloat16`. Gradients are clipped with
 
 ---
 
-## 3. Metrics logged per iteration (all in CSV)
+## 3. Progressive widening (PW) — MCTS
+
+**Progressive widening** limits how many root children are expanded so MCTS can deepen search with limited sims. Config: `selfplay.mcts.progressive_widening.enabled: true`, `k_root: 64`, `k0: 32`, `k_sqrt_coef: 8`, `always_include_pass: true`, `always_include_patch: true`.
+
+**`src/mcts/alphazero_mcts_optimized.py`** — Root expansion is capped; `get_root_legal_count()` and `get_root_expanded_count()` return legal and expanded counts for the last search. Selfplay records these per move and aggregates into `selfplay_avg_root_legal_count`, `selfplay_avg_root_expanded_count`, `selfplay_avg_root_expanded_ratio`, and p90 variants (see **FULL_METRICS.md**). Too high ratio ⇒ too wide; too low ⇒ over-pruning.
+
+---
+
+## 4. Beat-humans metrics (packing + search health)
+
+**Packing / quilt quality** (terminal state, both players):
+
+- **`src/utils/packing_metrics.py`:** `empties_from_occ_words(occ0,occ1,occ2)`, `fragmentation_from_occ_words(occ0,occ1,occ2)` → (empty_components, isolated_1x1_holes). Same 4-neighbor BFS and isolated-hole definition as `tools/ab_test_*`.
+- **`src/training/selfplay_optimized.py`:** At game end, for each player we call `fragmentation_from_occ_words` on the board occupancy words; we add to the game output: `empty_squares_p0/p1`, `empty_components_p0/p1`, `isolated_1x1_holes_p0/p1`, and (per MCTS move) `root_legal_counts`, `root_expanded_counts`.
+- **`src/training/selfplay_optimized_integration.py`:** `_compute_stats()` builds per-game lists, then calls `aggregate_packing_over_games()` and `aggregate_root_over_moves()` from `src/utils/packing_metrics.py` to produce all `selfplay_avg_final_*`, `selfplay_p50_*`, `selfplay_p90_*`, and `*_abs_diff` / root stats. These are written into `selfplay_stats` and thus into iteration JSON and metadata.
+
+No per-player P0/P1 series are logged; only aggregates and asymmetry to keep TensorBoard low-noise. Full key list and interpretation: **FULL_METRICS.md**.
+
+---
+
+## 5. No automated evaluation (design choice)
+
+**Evaluation is intentionally off** in production: `evaluation.games_vs_best: 0`, `evaluation.games_vs_pure_mcts: 0`. We **manually evaluate** (head-to-head, A/B tests, GUI). So no eval_* win-rate or Elo series are produced; strength is judged via selfplay stats and beat-humans metrics.
+
+---
+
+## 6. Metrics logged per iteration (all in CSV)
 
 From **`src/training/trainer.py`** (epoch aggregation) and **`src/training/main.py`** (iter summary → JSON):
 
-- **train_metrics:** `total_loss`, `policy_loss`, `value_loss`, **`score_loss`**, **`ownership_loss`**, `value_mse`, `policy_accuracy`, `policy_top5_accuracy`, **`ownership_accuracy`**, `grad_norm`, `policy_entropy`, `kl_divergence`, `step_skip_rate`.
-- **selfplay_stats:** `num_games`, `num_positions`, `avg_game_length`, `p0_wins`, `p1_wins`, `games_per_minute`, `avg_policy_entropy`, `avg_top1_prob`, `avg_num_legal`, `avg_redundancy`, `unique_positions`, `avg_root_q`.
-- **applied_settings:** Flattened selfplay/training/replay/adaptive_games (games, lr, cpuct, dynamic_score_utility_weight, etc.).
+- **train_metrics:** `total_loss`, `policy_loss`, `value_loss`, **`score_loss`**, **`ownership_loss`**, `value_mse`, `policy_accuracy`, `policy_top5_accuracy`, **`ownership_accuracy`**, `grad_norm`, `policy_entropy`, `kl_divergence`, `step_skip_rate`, plus ownership diagnostics and `approx_identity_check`. Full list: **FULL_METRICS.md**.
+- **selfplay_stats:** `num_games`, `num_positions`, `avg_game_length`, `p0_wins`, `p1_wins`, `games_per_minute`, `avg_policy_entropy`, `avg_top1_prob`, `avg_num_legal`, `avg_redundancy`, `unique_positions`, `avg_root_q`, plus **beat-humans:** all `selfplay_avg_final_*`, `selfplay_p50_*`, `selfplay_p90_*`, `*_abs_diff`, and root legal/expanded/ratio (see **FULL_METRICS.md**).
+- **applied_settings:** Flattened selfplay/training/replay/adaptive_games (games, lr, cpuct, dynamic_score_utility_weight, PW params, etc.).
 
 If **score_loss** or **ownership_loss** / **ownership_accuracy** flatten over iterations, that is the suspected stall; the code paths above are where to reason about fixes (targets, weights, head size, or data validity).
 
 ---
 
-## 4. File map (where to look)
+## 7. File map (where to look)
 
 | Concern | File |
 |--------|------|
@@ -148,6 +174,9 @@ If **score_loss** or **ownership_loss** / **ownership_accuracy** flatten over it
 | Score margin labelling (tanh) | `src/training/value_targets.py` |
 | Ownership masking (valid samples) | `src/training/trainer.py` (ownership_valid_mask), `model.get_loss` |
 | D4 augmentation | `src/network/d4_augmentation.py`, `d4_augmentation_gpu.py` |
-| MCTS win-first, score utility | `src/mcts/alphazero_mcts_optimized.py` |
+| MCTS win-first, score utility, PW, root legal/expanded | `src/mcts/alphazero_mcts_optimized.py` |
+| Packing metrics (empties, components, isolated), aggregation | `src/utils/packing_metrics.py` |
+| Terminal packing + root stats per game | `src/training/selfplay_optimized.py` |
+| Selfplay stats aggregation (incl. beat-humans) | `src/training/selfplay_optimized_integration.py` |
 | Training loop, prefetch, EMA step | `src/training/trainer.py` |
 | Iteration loop, commit, JSON summary | `src/training/main.py` |

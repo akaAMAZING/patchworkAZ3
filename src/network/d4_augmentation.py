@@ -1,5 +1,5 @@
 """
-D4 symmetry augmentation for 32-channel gold_v2 spatial encoding.
+D4 symmetry augmentation for gold_v2 spatial encoding (36ch as of gold_v2_36ch).
 
 Provides full D4 group: identity, rot90, rot180, rot270, mirror (h-flip),
 mirror+rot90, mirror+rot180, mirror+rot270.
@@ -7,10 +7,12 @@ mirror+rot90, mirror+rot180, mirror+rot270.
 Transform indices: 0=id, 1=r90, 2=r180, 3=r270, 4=m, 5=m_r90, 6=m_r180, 7=m_r270.
 Mirror = horizontal flip (r,c) -> (r, 8-c).
 
-All 32 channels are spatial (no scalar channels):
+All C_SPATIAL_ENC channels are spatial (no scalar channels):
   0-7:   board, coord, frontier, valid_7x7
   8-31:  slot×orient shape planes
-  (legalTL is computed on-GPU; not stored in the state tensor)
+  32-35: packing quality planes (isolated holes cur/opp, constrained empty cur/opp)
+         [gold_v2_36ch only; absent in legacy gold_v2_32ch]
+  (legalTL channels 36-59 are computed on-GPU; not stored in the state tensor)
 """
 
 from __future__ import annotations
@@ -504,9 +506,10 @@ def transform_state(
     slot_piece_ids: List[Optional[int]],
 ) -> np.ndarray:
     """
-    Transform state (32, 9, 9) for gold_v2. All 32 channels spatial.
+    Transform state (C_SPATIAL_ENC, 9, 9) for gold_v2. All channels spatial.
     Channels 0-7: board/coord/frontier/valid_7x7 — direct spatial transform.
     Channels 8-31: shape planes — spatial + orient permute.
+    Channels 32+: packing quality planes (iso holes, constrained empty) — direct spatial transform.
     (legalTL is not stored in the state; computed on-GPU at inference time.)
     """
     out = state.copy()
@@ -536,6 +539,11 @@ def transform_state(
                 ch_dst = SLOT_ORIENT_BASE + slot * NUM_ORIENTS + o
                 plane = _transform_board_plane(state[ch_src], ti)
                 out[ch_dst] = plane
+
+    # 32+: packing quality planes (iso holes cur/opp, constrained empty cur/opp)
+    # Pure spatial transform — no orientation remapping needed.
+    for ch in range(32, state.shape[0]):
+        out[ch] = _transform_board_plane(state[ch], ti)
 
     return out
 
@@ -745,11 +753,12 @@ def _transform_state_batch_uniform(
 ) -> np.ndarray:
     """
     Vectorized transform_state for batch where all samples share same (ti, p0, p1, p2).
-    states: (B, 32, 9, 9) for gold_v2
+    states: (B, C_SPATIAL_ENC, 9, 9) for gold_v2
     """
     out = states.copy()
     ti = transform_idx
     p0, p1, p2 = slot_piece_ids
+    n_ch = states.shape[1]
 
     # 0-7: boards, coords, frontier, valid_7x7
     for ch in range(8):
@@ -778,6 +787,11 @@ def _transform_state_batch_uniform(
                 ch_src = SLOT_ORIENT_BASE + slot * NUM_ORIENTS + o_old
                 ch_dst = SLOT_ORIENT_BASE + slot * NUM_ORIENTS + o
                 out[:, ch_dst] = _transform_board_plane_batch(states[:, ch_src], ti)
+
+    # 32+: packing quality planes (iso holes cur/opp, constrained empty cur/opp)
+    # Pure spatial transform — no orientation remapping needed.
+    for ch in range(32, n_ch):
+        out[:, ch] = _transform_board_plane_batch(states[:, ch], ti)
 
     return out
 

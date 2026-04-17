@@ -13,6 +13,7 @@ Includes EVERY metric found in iteration_XXX.json:
 
 By default includes all committed iters. Use --max-iter N to only include
 iterations 0..N (exclude synthetic or non-real iterations above N).
+Use --min-iter M and optionally --output PATH to write a range (e.g. 70-86) to a separate file.
 """
 from __future__ import annotations
 
@@ -41,11 +42,25 @@ def flatten_dict(d: dict, prefix: str = "") -> dict:
 def main():
     parser = argparse.ArgumentParser(description="Build training_metrics_per_iteration.csv from committed iteration JSONs.")
     parser.add_argument(
+        "--min-iter",
+        type=int,
+        default=None,
+        metavar="M",
+        help="Only include iterations M..max (skip iters < M). Use with --output for range export (e.g. 70-86).",
+    )
+    parser.add_argument(
         "--max-iter",
         type=int,
         default=None,
         metavar="N",
         help="Only include iterations 0..N (exclude iters > N, e.g. synthetic). Default: include all.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Write CSV to this path instead of training_metrics_per_iteration.csv. Can be relative to this script's dir.",
     )
     args = parser.parse_args()
 
@@ -57,12 +72,15 @@ def main():
     rows: list[dict] = []
     all_keys_ordered: list[str] = []
 
-    # Discover all iteration_XXX.json files; optionally filter by max_iter.
+    # Discover all iteration_XXX.json files; optionally filter by min/max_iter.
     json_paths = sorted(run_root.glob("iter_*/iteration_*.json"))
     for p in json_paths:
         with open(p, encoding="utf-8") as f:
             data = json.load(f)
-        if args.max_iter is not None and data.get("iteration", -1) > args.max_iter:
+        i = data.get("iteration", -1)
+        if args.min_iter is not None and i < args.min_iter:
+            continue
+        if args.max_iter is not None and i > args.max_iter:
             continue
 
         row = {}
@@ -121,21 +139,32 @@ def main():
     other = [k for k in rest if k not in train_keys + selfplay_keys + eval_keys + applied_keys]
     fieldnames = priority + other + train_keys + selfplay_keys + eval_keys + applied_keys
 
-    out_path = Path(__file__).parent / "training_metrics_per_iteration.csv"
+    out_path = args.output
+    if out_path is None:
+        out_path = Path(__file__).parent / "training_metrics_per_iteration.csv"
+    else:
+        out_path = Path(out_path)
+        if not out_path.is_absolute():
+            out_path = Path(__file__).parent / out_path
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
 
     iters = [r["iteration"] for r in rows]
-    max_iter_note = f" (max_iter={args.max_iter})" if args.max_iter is not None else ""
+    range_note = []
+    if args.min_iter is not None:
+        range_note.append(f"min_iter={args.min_iter}")
+    if args.max_iter is not None:
+        range_note.append(f"max_iter={args.max_iter}")
+    range_note = " " + " ".join(range_note) if range_note else ""
     if rows:
         print(
             f"Wrote {out_path} with {len(rows)} rows "
-            f"(iterations {min(iters)}–{max(iters)}){max_iter_note}, {len(fieldnames)} columns."
+            f"(iterations {min(iters)}–{max(iters)}){range_note}, {len(fieldnames)} columns."
         )
     else:
-        print(f"No rows written (no iterations match). {max_iter_note}")
+        print(f"No rows written (no iterations match).{range_note}")
     return out_path
 
 

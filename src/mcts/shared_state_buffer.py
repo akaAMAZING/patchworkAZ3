@@ -7,16 +7,19 @@ n_slots = parallel_leaves (max concurrent pending inference requests per worker)
 
 Slot layout (all float32 except shop_ids int16, n_legal int32):
   Field         Shape                dtype    bytes
-  spatial       (32, 9, 9)           f32      10368
-  global        (61,)                f32        244
+  spatial       (36, 9, 9)           f32      11664   [C_SPATIAL_ENC=36]
+  global        (65,)                f32        260   [F_GLOBAL=65]
   track         (8, 54)              f32       1728
-  shop_ids      (33,)                i16         68  (66 + 2 pad for alignment)
+  shop_ids      (33,)                i16         68   (66 + 2 pad for alignment)
   shop_feats    (33, 10)             f32       1320
   mask          (2026,)              f32       8104
-  legal_idxs    (2026,)              i32       8104  (max size)
+  legal_idxs    (2026,)              i32       8104   (max size)
   n_legal       (1,)                 i32          4
                                              ------
-  SLOT_BYTES                                  29940
+  SLOT_BYTES                                  31252   [computed from gold_v2_constants]
+
+NOTE: All sizes are computed dynamically from gold_v2_constants (C_SPATIAL_ENC, F_GLOBAL, etc.)
+so this docstring must be updated whenever those constants change.
 """
 
 from __future__ import annotations
@@ -43,18 +46,18 @@ _max_payload_nbytes_seen: int = 0
 class WorkerSharedBuffer:
     """Per-worker shared memory block. GPU server reads from it without pickling."""
 
-    _S  = C_SPATIAL_ENC * 9 * 9 * 4        # spatial  (32,9,9)  f32: 10368 bytes
-    _G  = F_GLOBAL * 4                       # global   (61,)     f32:   244 bytes
-    _T  = C_TRACK * TRACK_LEN * 4           # track    (8,54)    f32:  1728 bytes
-    _SI = ((NMAX * 2) + 3) & ~3             # shop_ids (33,)     i16:    68 bytes (4-byte aligned)
-    _SF = NMAX * F_SHOP * 4                  # shop_feats (33,10) f32:  1320 bytes
-    _M  = MAX_ACTIONS * 4                    # mask     (2026,)   f32:  8104 bytes
-    _L  = MAX_ACTIONS * 4                    # legal_idxs (2026,) i32:  8104 bytes (max size)
-    _NL = 4                                  # n_legal  (1,)      i32:     4 bytes
-    SLOT_BYTES: int = _S + _G + _T + _SI + _SF + _M + _L + _NL  # = 29940
+    _S  = C_SPATIAL_ENC * 9 * 9 * 4        # spatial  (C_SPATIAL_ENC,9,9)  f32: C_SPATIAL_ENC*324 bytes
+    _G  = F_GLOBAL * 4                       # global   (F_GLOBAL,)          f32: F_GLOBAL*4 bytes
+    _T  = C_TRACK * TRACK_LEN * 4           # track    (8,54)                f32:  1728 bytes
+    _SI = ((NMAX * 2) + 3) & ~3             # shop_ids (33,)                 i16:    68 bytes (4-byte aligned)
+    _SF = NMAX * F_SHOP * 4                  # shop_feats (33,10)             f32:  1320 bytes
+    _M  = MAX_ACTIONS * 4                    # mask     (2026,)               f32:  8104 bytes
+    _L  = MAX_ACTIONS * 4                    # legal_idxs (2026,)             i32:  8104 bytes (max size)
+    _NL = 4                                  # n_legal  (1,)                  i32:     4 bytes
+    SLOT_BYTES: int = _S + _G + _T + _SI + _SF + _M + _L + _NL  # computed from constants
     # Bounds check: payload written = fixed part + n_legal*4; must not exceed one slot.
     HEADER_BYTES: int = 0  # no separate header; slot is contiguous layout
-    PAYLOAD_FIXED_BYTES: int = _S + _G + _T + _SI + _SF + _M + _NL  # = 21836 (slot minus legal_idxs max)
+    PAYLOAD_FIXED_BYTES: int = _S + _G + _T + _SI + _SF + _M + _NL  # computed (slot minus legal_idxs max)
 
     OFF_S  = 0
     OFF_G  = OFF_S  + _S

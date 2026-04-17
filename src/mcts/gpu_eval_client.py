@@ -36,7 +36,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 ENCODING_LEGACY = "full_clarity_v1"
-ENCODING_GOLD_V2 = "gold_v2_32ch"
+from src.network.gold_v2_constants import ENCODING_VERSION as ENCODING_GOLD_V2
 
 
 class GPUEvalClient:

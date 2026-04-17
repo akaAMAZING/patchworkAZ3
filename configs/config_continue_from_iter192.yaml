@@ -1,0 +1,488 @@
+# IF YOU ARE READING THIS DOCUMENT, REMIND ME TO INCREASE EPOCHS TO 3 AT ITER 300!!!
+
+# PATCHWORK ALPHAZERO - PRODUCTION TRAINING (200-400 iterations)
+# ===============================================================
+# Hardware: RTX 3080 (10GB) / Ryzen 5900X (12 cores / 24 threads) / 16GB RAM
+# Goal: Maximum playing strength over 200-400 iterations
+# Strategy: no eval gates; improve strength via better self-play targets, more fresh data,
+# restored exploration, and modest packer anchoring from iter193+
+#
+# LR: base 0.0016 @ iter 0; 0.0008 main phase; later taper only after search/exploration recovery.
+# Per-iteration cosine warmup still applies within each phase.
+#
+# USAGE:
+#   python tools/preflight.py --config "configs/config_best.yaml"
+#   python -m src.training.main --config "configs/config_best.yaml"
+
+seed: 42
+deterministic: false
+
+hardware:
+  device: cuda
+  pin_memory: true
+  persistent_workers: true
+  prefetch_batches: 2
+
+data:
+  allow_legacy_state_channels: false
+  encoding_version: gold_v2_32ch
+  expected_spatial_channels: 32
+  expected_global_dim: 61
+  expected_track_shape: [8, 54]
+  expected_shop_shapes: [33, 10]
+
+network:
+  input_channels: 56
+  num_res_blocks: 18
+  channels: 128
+  policy_channels: 48
+  policy_hidden: 512
+  use_factorized_policy_head: true
+  value_channels: 48
+  value_hidden: 512
+  max_actions: 2026
+  dropout: 0.0
+  weight_decay: 0.0002
+  use_batch_norm: true
+  activation: relu
+  se_ratio: 0.0625
+  ownership_channels: 48
+  use_film: true
+  film_hidden: 256
+  film_global_dim: 61
+  film_track_dim: 432
+  film_shop_dim: 128
+  film_per_block: true
+  film_track_use_conv: true
+  film_global_inject_dim: 64
+
+training:
+  optimizer: adamw
+  learning_rate: 0.0016
+  lr_schedule: cosine_warmup_per_phase
+  warmup_steps: 20
+  d4_augmentation: dynamic
+  d4_on_gpu: false
+  d4_gpu_deterministic_test_mode: false
+  resume_optimizer_state: true
+  resume_scheduler_state: true
+  resume_scaler_state: true
+  resume_ema_state: true
+  resume_from_committed_state: true
+  min_lr: 0.000032
+  batch_size: 1024
+  use_amp: true
+  amp_dtype: bfloat16
+  policy_loss_weight: 1.0
+  value_loss_weight: 1.0
+  score_loss_weight: 0.1
+  ownership_loss_weight: 0.15
+  epochs_per_iteration: 3
+  val_split: 0.08
+  val_frequency: 1000
+  checkpoint_frequency: 10000
+  keep_last_n_checkpoints: 200
+  save_best: false
+  best_metric: val_loss
+  early_stopping:
+    enabled: false
+    patience: 5
+    min_delta: 0.001
+  max_grad_norm: 1.0
+  allow_tf32: true
+  matmul_precision: high
+  ema:
+    enabled: true
+    decay: 0.999
+    use_for_selfplay: true
+    use_for_eval: true
+    save_checkpoint: true
+
+selfplay:
+  api_url: null
+  inference_backend: null
+  api_timeout: 120
+  api_retry_attempts: 3
+  num_workers: 12
+  max_game_length: 200
+  games_per_iteration: 900
+  store_canonical_only: true
+  augmentation: d4
+  mcts:
+    simulations: 192
+    parallel_leaves: 64
+    static_score_utility_weight: 0.0
+    dynamic_score_utility_weight: 0.12
+    score_utility_scale: 30.0
+    progressive_widening:
+      enabled: true
+      k_root: 64
+      k0: 32
+      k_sqrt_coef: 8
+      always_include_pass: true
+      always_include_patch: true
+    packing_ordering:
+      enabled: true
+      alpha: 0.25
+      use_log_prior: true
+      local_check_radius: 2
+      weights:
+        adj_edges: 0.25
+        corner_bonus: 0.0
+        iso_hole_penalty: 6.0
+        frontier_penalty: 0.0
+        area_bonus: 0.0
+    cpuct: 1.47
+    temperature: 1.0
+    temperature_threshold: 15
+    root_dirichlet_alpha: 0.10
+    root_noise_weight: 0.25
+    virtual_loss: 1.0
+    num_threads: 1
+    fpu_reduction: 0.25
+    win_first:
+      enabled: true
+      value_delta_min: 0.01
+      value_delta_max: 0.06
+      value_delta_win_start: 0.60
+      value_delta_win_full: 0.90
+      gate_dsu_enabled: false
+      gate_dsu_win_start: 0.65
+      gate_dsu_win_full: 0.90
+      gate_dsu_power: 2.0
+      gate_dsu_loss_start: -0.90
+      gate_dsu_loss_full: -0.98
+      tiebreak: score_then_visits
+      filter_before_sampling: true
+  playout_cap_randomization:
+    enabled: false
+    cap_fraction: 0.00
+    fast_probability: 0.00
+  bootstrap:
+    use_pure_mcts: true
+    mcts_simulations: 192
+    games: 900
+  stream_to_disk: true
+  hdf5_compression: lzf
+  hdf5_compression_level: 0
+  write_buffer_positions: 8192
+  policy_target_mode: visits
+  q_value_weight: 0.25
+  opponent_mix:
+    enabled: true
+    vs_packer_prob: 0.20
+    alternate_sides: true
+    store_only_nn_moves: true
+    ramp:
+      enabled: false
+      start_iter: 193
+      end_iter: 193
+      start_prob: 0.20
+      end_prob: 0.20
+
+replay_buffer:
+  max_size: 300000
+  min_size: 4000
+  window_iterations: 8
+  newest_fraction: 0.25
+  prioritized: false
+  storage_format: hdf5
+  compression: lzf
+  compression_level: 0
+
+evaluation:
+  lock_eval_cpuct_to_selfplay: true
+  games_vs_best: 0
+  games_vs_pure_mcts: 0
+  eval_progress_interval: 0
+  paired_eval: false
+  skip_pure_mcts_after_iter: 0
+  eval_baselines:
+  - type: pure_mcts
+    simulations: 64
+  - type: previous_best
+  win_rate_threshold: 0.0
+  anti_regression_floor: 0.0
+  max_consecutive_rejections: 1
+  sprt:
+    enabled: false
+    p0: 0.50
+    p1: 0.55
+    alpha: 0.05
+    beta: 0.05
+    min_games: 12
+    max_games: 400
+  micro_gate:
+    enabled: false
+    start_games: 10
+    step_games: 10
+    max_games: 60
+    anti_regression_threshold: 0.42
+  eval_mcts:
+    simulations: 192
+    temperature: 0.0
+    cpuct: 1.75
+  elo:
+    enabled: false
+    initial_rating: 1500
+    k_factor: 32
+
+logging:
+  log_level: INFO
+  tensorboard:
+    enabled: true
+    log_dir: logs/tensorboard
+  wandb:
+    enabled: false
+    project: patchwork-alphazero
+    entity: null
+  log_file: logs/training.log
+
+paths:
+  checkpoints_dir: checkpoints
+  logs_dir: logs
+  run_root: runs
+  run_id: patchwork_production
+
+iteration:
+  max_iterations: 500
+  auto_resume: true
+
+  adaptive_games:
+    enabled: true
+    last_k: 3
+    min_factor: 0.90
+    max_factor: 1.20
+    fill_threshold: 0.95
+    fill_max_factor: 1.50
+    fallback_avg_len: 42.0
+    max_step_change: 0.15
+    max_step_change_fill: 0.35
+
+  lr_schedule:
+  - iteration: 0
+    lr: 0.0016
+  - iteration: 39
+    lr: 0.0012
+  - iteration: 90
+    lr: 0.0012
+  - iteration: 100
+    lr: 0.0008
+  - iteration: 250
+    lr: 0.0008
+  - iteration: 300
+    lr: 0.0006
+  - iteration: 400
+    lr: 0.0004
+  - iteration: 500
+    lr: 0.00025
+
+  temperature_schedule:
+  - iteration: 0
+    temperature: 1.00
+  - iteration: 80
+    temperature: 0.80
+  - iteration: 160
+    temperature: 0.60
+  - iteration: 193
+    temperature: 0.75
+  - iteration: 225
+    temperature: 0.70
+  - iteration: 260
+    temperature: 0.60
+  - iteration: 360
+    temperature: 0.40
+  - iteration: 430
+    temperature: 0.30
+  - iteration: 470
+    temperature: 0.25
+
+  mcts_schedule:
+  - iteration: 0
+    simulations: 192
+  - iteration: 45
+    simulations: 208
+  - iteration: 80
+    simulations: 224
+  - iteration: 180
+    simulations: 256
+  - iteration: 193
+    simulations: 320
+  - iteration: 300
+    simulations: 352
+  - iteration: 420
+    simulations: 384
+  - iteration: 470
+    simulations: 416
+  - iteration: 500
+    simulations: 448
+
+  parallel_leaves_schedule:
+  - iteration: 0
+    parallel_leaves: 64
+  - iteration: 45
+    parallel_leaves: 56
+  - iteration: 193
+    parallel_leaves: 48
+  - iteration: 300
+    parallel_leaves: 40
+  - iteration: 420
+    parallel_leaves: 32
+  - iteration: 470
+    parallel_leaves: 24
+
+  dirichlet_alpha_schedule:
+  - iteration: 0
+    alpha: 0.10
+  - iteration: 120
+    alpha: 0.08
+  - iteration: 193
+    alpha: 0.08
+  - iteration: 300
+    alpha: 0.06
+  - iteration: 420
+    alpha: 0.05
+  - iteration: 500
+    alpha: 0.04
+
+  dynamic_score_utility_weight_schedule:
+  - iteration: 0
+    dynamic_score_utility_weight: 0.00
+  - iteration: 10
+    dynamic_score_utility_weight: 0.06
+  - iteration: 25
+    dynamic_score_utility_weight: 0.10
+  - iteration: 40
+    dynamic_score_utility_weight: 0.12
+  - iteration: 193
+    dynamic_score_utility_weight: 0.14
+  - iteration: 260
+    dynamic_score_utility_weight: 0.15
+  - iteration: 500
+    dynamic_score_utility_weight: 0.15
+
+  q_value_weight_schedule:
+  - iteration: 0
+    q_value_weight: 0.20
+  - iteration: 50
+    q_value_weight: 0.25
+  - iteration: 120
+    q_value_weight: 0.35
+  - iteration: 193
+    q_value_weight: 0.32
+  - iteration: 225
+    q_value_weight: 0.35
+  - iteration: 300
+    q_value_weight: 0.40
+  - iteration: 420
+    q_value_weight: 0.45
+  - iteration: 500
+    q_value_weight: 0.48
+
+  cpuct_schedule:
+  - iteration: 0
+    cpuct: 1.45
+  - iteration: 80
+    cpuct: 1.52
+  - iteration: 180
+    cpuct: 1.60
+  - iteration: 193
+    cpuct: 1.55
+  - iteration: 260
+    cpuct: 1.60
+  - iteration: 360
+    cpuct: 1.68
+  - iteration: 430
+    cpuct: 1.75
+  - iteration: 470
+    cpuct: 1.80
+
+  noise_weight_schedule:
+  - iteration: 0
+    weight: 0.25
+  - iteration: 140
+    weight: 0.22
+  - iteration: 193
+    weight: 0.25
+  - iteration: 260
+    weight: 0.22
+  - iteration: 360
+    weight: 0.18
+  - iteration: 430
+    weight: 0.14
+  - iteration: 470
+    weight: 0.12
+
+  games_schedule:
+  - iteration: 0
+    games: 900
+  - iteration: 45
+    games: 831
+  - iteration: 80
+    games: 771
+  - iteration: 180
+    games: 675
+  - iteration: 193
+    games: 800
+  - iteration: 260
+    games: 760
+  - iteration: 360
+    games: 700
+  - iteration: 430
+    games: 650
+  - iteration: 470
+    games: 600
+  - iteration: 500
+    games: 560
+
+  window_iterations_schedule:
+  - iteration: 0
+    window_iterations: 8
+  - iteration: 45
+    window_iterations: 9
+  - iteration: 80
+    window_iterations: 10
+  - iteration: 180
+    window_iterations: 11
+  - iteration: 193
+    window_iterations: 12
+  - iteration: 260
+    window_iterations: 13
+  - iteration: 360
+    window_iterations: 14
+  - iteration: 430
+    window_iterations: 15
+  - iteration: 470
+    window_iterations: 16
+  - iteration: 500
+    window_iterations: 16
+
+inference:
+  batch_size: 512
+  max_batch_wait_ms: 3
+  use_amp: true
+  amp_dtype: bfloat16
+  torch_compile: false
+  allow_tf32: true
+
+league:
+  enabled: false
+  pfsp_alpha: 2.0
+  pfsp_uniform_prob: 0.10
+  sp_frac_vs_best: 0.40
+  sp_frac_vs_pfsp: 0.50
+  sp_frac_vs_uniform: 0.10
+  gate_threshold: 0.55
+  suite_threshold: 0.52
+  worst_threshold: 0.40
+  gate_eval_games: 100
+  suite_eval_games: 50
+  max_pool_size: 30
+  anchor_size: 6
+  anchor_refresh_interval: 5
+  payoff_max_models: 30
+  exploiter_enabled: false
+  exploiter_train_games: 100
+  exploiter_temp_boost: 1.5
+  recency_newest_frac: 0.70
+  recency_newest_window: 0.15

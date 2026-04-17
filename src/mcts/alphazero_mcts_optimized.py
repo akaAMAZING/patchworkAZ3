@@ -23,6 +23,7 @@ from src.game.patchwork_engine import (
     apply_action_unchecked,
     current_player,
     current_player_fast,
+    empty_count_from_occ,
     legal_actions_list,
     legal_actions_fast,
     terminal,
@@ -37,7 +38,15 @@ from src.game.patchwork_engine import (
     CIRCLE_LEN,
     NEUTRAL,
     CIRCLE_START,
+    P0_OCC0,
+    P0_OCC1,
+    P0_OCC2,
+    P1_OCC0,
+    P1_OCC1,
+    P1_OCC2,
 )
+
+from src.utils.packing_metrics import fragmentation_from_occ_words
 
 # Use the unified slot lookup from encoder
 from src.network.encoder import encode_state_multimodal, get_slot_piece_id
@@ -135,6 +144,107 @@ def engine_action_to_flat_index(action) -> int:
     return _BUY_START + (slot_index * _NUM_ORIENTS + orient) * (_BOARD_SZ * _BOARD_SZ) + pos
 
 
+def _apply_progressive_widening_order(
+    node: "MCTSNode",
+    pw_config: ProgressiveWideningConfig,
+    is_root: bool,
+    packing_config: Optional["PackingOrderingConfig"] = None,
+) -> None:
+    """
+    Reorder node.legal_actions to [PASS, PATCH..., top BUY by prior (or rank_key if packing_ordering enabled)], set _pw_*.
+    Call after _init_arrays and after priors are set. Mutates node.legal_actions and node._prior.
+    """
+    if not pw_config.enabled or not node.legal_actions or node._prior is None:
+        return
+    legal = node.legal_actions
+    action_to_idx = node._action_to_idx
+    pass_actions = [a for a in legal if int(a[0]) == AT_PASS] if pw_config.always_include_pass else []
+    patch_actions = [a for a in legal if int(a[0]) == AT_PATCH] if pw_config.always_include_patch else []
+    buy_actions = [a for a in legal if int(a[0]) == AT_BUY]
+    if packing_config and packing_config.enabled and buy_actions and node.state is not None:
+        from src.mcts.packing_heuristic import (
+            packing_heuristic_scores_batch,
+            occ_words_to_bitboard_for_node,
+            cache_index,
+        )
+        alpha = packing_config.alpha
+        use_log = packing_config.use_log_prior
+        w = packing_config.weights
+        w_adj = float(w.get("adj_edges", 1.0))
+        w_corner = float(w.get("corner_bonus", 0.5))
+        w_iso = float(w.get("iso_hole_penalty", 2.0))
+        w_front = float(w.get("frontier_penalty", 0.25))
+        w_area = float(w.get("area_bonus", 0.0))
+        radius_index = min(max(0, packing_config.local_check_radius), 3)
+        k0_buy = pw_config.k_root if is_root else pw_config.k0
+        L_buy = len(buy_actions)
+        M = min(L_buy, k0_buy + (16 if is_root else 8))
+
+        if node._packing_filled_bb is None:
+            pl = node.to_move
+            if pl == 0:
+                o0, o1, o2 = int(node.state[P0_OCC0]), int(node.state[P0_OCC1]), int(node.state[P0_OCC2])
+            else:
+                o0, o1, o2 = int(node.state[P1_OCC0]), int(node.state[P1_OCC1]), int(node.state[P1_OCC2])
+            node._packing_filled_bb = occ_words_to_bitboard_for_node(o0, o1, o2)
+        filled_bb = node._packing_filled_bb
+
+        buy_with_prior = [(a, float(node._prior[action_to_idx[a]])) for a in buy_actions]
+        buy_with_prior.sort(key=lambda x: -x[1])
+        # Reuse preallocated int32 buffer to avoid per-call list + np.array allocation
+        if node._packing_indices_buf is None or node._packing_indices_buf.shape[0] < M:
+            node._packing_indices_buf = np.empty(max(M, 64), dtype=np.int32)
+        buf = node._packing_indices_buf
+        for i, (a, _) in enumerate(buy_with_prior[:M]):
+            buf[i] = cache_index(int(a[2]), int(a[3]), int(a[4]) * 9 + int(a[5]))
+        pack_scores = packing_heuristic_scores_batch(
+            filled_bb, buf[:M], radius_index, w_adj, w_corner, w_iso, w_front, w_area
+        )
+        buy_with_rank = []
+        for i, (a, prior) in enumerate(buy_with_prior):
+            base = math.log(max(prior, 1e-10)) if use_log else max(prior, 1e-10)
+            pack_score = pack_scores[i] if i < M else 0.0
+            rank_key = base + alpha * pack_score
+            buy_with_rank.append((a, rank_key, prior, pack_score))
+        buy_with_rank.sort(key=lambda x: -x[1])
+        buy_ordered = [a for a, _, _, _ in buy_with_rank]
+        if is_root and buy_with_rank:
+            node._packing_score_top1 = buy_with_rank[0][3]
+        if is_root and logger.isEnabledFor(logging.DEBUG):
+            top5_by_prior = sorted(buy_with_rank, key=lambda x: -x[2])[:5]
+            top5_by_rank = buy_with_rank[:5]
+            logger.debug(
+                "[packing_ordering] root top5 by prior: %s",
+                [(a, "prior=%.4f" % p, "pack=%.3f" % s) for a, _rk, p, s in top5_by_prior],
+            )
+            logger.debug(
+                "[packing_ordering] root top5 by rank_key: %s (M=%d)",
+                [(a, "rank=%.4f" % rk, "prior=%.4f" % p, "pack=%.3f" % s) for a, rk, p, s in top5_by_rank],
+                M,
+            )
+    else:
+        buy_with_prior = [(a, float(node._prior[action_to_idx[a]])) for a in buy_actions]
+        buy_with_prior.sort(key=lambda x: -x[1])
+        buy_ordered = [a for a, _ in buy_with_prior]
+    ordered_legal = pass_actions + patch_actions + buy_ordered
+    n_always = len(pass_actions) + len(patch_actions)
+    L_buy = len(buy_actions)
+    k0_buy = pw_config.k_root if is_root else pw_config.k0
+    node.legal_actions = ordered_legal
+    new_prior = np.array([node._prior[action_to_idx[a]] for a in ordered_legal], dtype=np.float64)
+    node._prior = new_prior
+    node._action_to_idx = {a: i for i, a in enumerate(ordered_legal)}
+    node._pw_n_always = n_always
+    node._pw_L_buy = L_buy
+    node._pw_k0_buy = k0_buy
+    n_total = len(ordered_legal)
+    node._visit_count = np.zeros(n_total, dtype=np.int32)
+    node._total_value = np.zeros(n_total, dtype=np.float64)
+    node._virtual_loss = np.zeros(n_total, dtype=np.float64)
+    node._value_sum = np.zeros(n_total, dtype=np.float64)
+    node._score_sum = np.zeros(n_total, dtype=np.float64)
+
+
 def encode_legal_actions_fast(legal_actions: list) -> tuple:
     """Encode list of engine actions directly to (indices_np, mask_np).
 
@@ -154,6 +264,102 @@ def encode_legal_actions_fast(legal_actions: list) -> tuple:
 # ---------------------------------------------------------------------------
 # MCTS Configuration
 # ---------------------------------------------------------------------------
+
+@dataclass
+class ProgressiveWideningConfig:
+    """Progressive widening (top-K BUY expansion) for MCTS. Reduces branching at root/internal nodes."""
+    enabled: bool = False
+    k_root: int = 64
+    k0: int = 32
+    k_sqrt_coef: float = 8.0  # With sims~208, sqrt(N)~14; coef=8 keeps expansion tighter for depth
+    always_include_pass: bool = True
+    always_include_patch: bool = True
+
+
+def _parse_progressive_widening(cfg: dict) -> ProgressiveWideningConfig:
+    """Parse progressive_widening block from MCTS config."""
+    pw = cfg or {}
+    return ProgressiveWideningConfig(
+        enabled=bool(pw.get("enabled", False)),
+        k_root=int(pw.get("k_root", 64)),
+        k0=int(pw.get("k0", 32)),
+        k_sqrt_coef=float(pw.get("k_sqrt_coef", 8.0)),
+        always_include_pass=bool(pw.get("always_include_pass", True)),
+        always_include_patch=bool(pw.get("always_include_patch", True)),
+    )
+
+
+@dataclass
+class PackingOrderingConfig:
+    """Packing placement-ordering for BUY actions (PW rank key = prior + alpha*heuristic). Default OFF."""
+    enabled: bool = False
+    alpha: float = 0.15
+    use_log_prior: bool = True
+    weights: dict = field(default_factory=lambda: {
+        "adj_edges": 1.0,
+        "corner_bonus": 0.5,
+        "iso_hole_penalty": 2.0,
+        "frontier_penalty": 0.25,
+    })
+    local_check_radius: int = 2
+
+
+def _parse_packing_ordering(cfg: dict) -> PackingOrderingConfig:
+    """Parse packing_ordering block from MCTS config."""
+    po = cfg or {}
+    w = po.get("weights") or {}
+    return PackingOrderingConfig(
+        enabled=bool(po.get("enabled", False)),
+        alpha=float(po.get("alpha", 0.15)),
+        use_log_prior=bool(po.get("use_log_prior", True)),
+        weights={
+            "adj_edges": float(w.get("adj_edges", 1.0)),
+            "corner_bonus": float(w.get("corner_bonus", 0.5)),
+            "iso_hole_penalty": float(w.get("iso_hole_penalty", 2.0)),
+            "frontier_penalty": float(w.get("frontier_penalty", 0.25)),
+            "area_bonus": float(w.get("area_bonus", 0.0)),
+        },
+        local_check_radius=int(po.get("local_check_radius", 2)),
+    )
+
+
+@dataclass
+class PatchTiebreakConfig:
+    """Root-only tie-break among PATCH actions when value is saturated / tied."""
+    enabled: bool = False
+    mode: str = "packing"  # "packing" | "score" | "hybrid"
+    value_tie_eps: float = 0.01  # treat actions within eps of best Qv as tied
+    win_prob_floor: float = 0.98  # only apply when best win prob is very high (Qv >= 2*floor-1)
+    weights: dict = field(default_factory=lambda: {
+        "empty_squares": 1.0,
+        "empty_components": 2.0,
+        "isolated_1x1": 3.0,
+    })
+    score_weight: float = 0.05  # small secondary preference for higher score_est_raw (points)
+
+
+def _parse_patch_tiebreak(cfg: dict) -> PatchTiebreakConfig:
+    pt = cfg or {}
+    w = pt.get("weights") or {}
+    mode = str(pt.get("mode", "packing")).lower()
+    if mode not in ("packing", "score", "hybrid"):
+        mode = "packing"
+    value_tie_eps = max(0.0, min(0.5, float(pt.get("value_tie_eps", 0.01))))
+    win_prob_floor = max(0.0, min(1.0, float(pt.get("win_prob_floor", 0.98))))
+    score_weight = max(0.0, float(pt.get("score_weight", 0.05)))
+    return PatchTiebreakConfig(
+        enabled=bool(pt.get("enabled", False)),
+        mode=mode,
+        value_tie_eps=value_tie_eps,
+        win_prob_floor=win_prob_floor,
+        weights={
+            "empty_squares": float(w.get("empty_squares", 1.0)),
+            "empty_components": float(w.get("empty_components", 2.0)),
+            "isolated_1x1": float(w.get("isolated_1x1", 3.0)),
+        },
+        score_weight=score_weight,
+    )
+
 
 @dataclass
 class WinFirstConfig:
@@ -240,6 +446,9 @@ class MCTSConfig:
     score_min: int = -100
     score_max: int = 100
     win_first: WinFirstConfig = field(default_factory=WinFirstConfig)
+    progressive_widening: ProgressiveWideningConfig = field(default_factory=ProgressiveWideningConfig)
+    packing_ordering: PackingOrderingConfig = field(default_factory=PackingOrderingConfig)
+    patch_tiebreak: PatchTiebreakConfig = field(default_factory=PatchTiebreakConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +469,10 @@ class MCTSNode:
         "_value_sum", "_score_sum",  # Win-first: per-child value and score (root-perspective at backup)
         "legal_actions", "_action_to_idx", "terminal", "terminal_value", "n_total",
         "score_estimate",  # raw tanh-normalised score from last network evaluation; used for dynamic centering on tree reuse
+        "_pw_n_always", "_pw_L_buy", "_pw_k0_buy",  # Progressive widening: always-include count, num BUY, K0 for BUY
+        "_packing_filled_bb",  # Cached: current-player occupancy bitboard for packing heuristic (once per node)
+        "_packing_indices_buf",  # Reusable int32 buffer for packing_heuristic_scores_batch (no per-call alloc)
+        "_packing_score_top1",  # Packing score of top-ranked BUY after ordering (root only, for logging)
     )
 
     def __init__(self, state, to_move: int, parent: Optional["MCTSNode"] = None):
@@ -280,6 +493,12 @@ class MCTSNode:
         self.terminal_value: Optional[float] = None
         self.n_total = 0
         self.score_estimate: float = 0.0  # network score prediction; 0.0 = uninitialised / neutral
+        self._pw_n_always: Optional[int] = None  # Progressive widening: count of always-included (PASS + PATCH)
+        self._pw_L_buy: Optional[int] = None      # number of legal BUY actions
+        self._pw_k0_buy: Optional[int] = None   # K0 or K_root for BUY widening formula
+        self._packing_filled_bb: Optional[int] = None  # Cached occupancy bitboard for packing (lazy)
+        self._packing_indices_buf: Optional[np.ndarray] = None  # int32 buffer for packing batch (lazy)
+        self._packing_score_top1: Optional[float] = None  # top-1 BUY packing score at root (logging only)
 
     def _init_arrays(self) -> None:
         """Allocate arrays once legal_actions are known."""
@@ -294,6 +513,37 @@ class MCTSNode:
 
     def is_expanded(self) -> bool:
         return self.legal_actions is not None
+
+    def get_expanded_count(self, pw_config: Optional[ProgressiveWideningConfig]) -> int:
+        """Number of actions that are selectable (expanded). When PW disabled, all legal.
+
+        CRITICAL: Widening uses NODE VISITS N (self.n_total), not number of legal actions.
+        N = total simulations that passed through this node (sum of child visit counts).
+        Formula: K_buy = min(L_buy, k0_buy + floor(k_sqrt_coef * sqrt(N))); expanded = n_always + K_buy.
+        """
+        if self.legal_actions is None or self._visit_count is None:
+            return 0
+        L = len(self.legal_actions)
+        if pw_config is None or not pw_config.enabled or self._pw_n_always is None:
+            return L
+        n_always = self._pw_n_always
+        L_buy = self._pw_L_buy
+        k0_buy = self._pw_k0_buy
+        if L_buy is None or k0_buy is None or L_buy <= 0:
+            return L
+        # N = node total visit count (updated in update() on backup), NOT len(legal_actions)
+        N = max(0, self.n_total)
+        K_buy = min(L_buy, k0_buy + int(math.floor(pw_config.k_sqrt_coef * math.sqrt(N))))
+        return min(L, n_always + K_buy)
+
+    def get_K_buy(self, pw_config: Optional[ProgressiveWideningConfig]) -> Optional[int]:
+        """Current K_buy for this node (for reporting). Returns None if PW disabled or no BUY."""
+        if pw_config is None or not pw_config.enabled or self._pw_L_buy is None or self._pw_k0_buy is None:
+            return None
+        if self._pw_L_buy <= 0:
+            return 0
+        N = max(0, self.n_total)
+        return min(self._pw_L_buy, self._pw_k0_buy + int(math.floor(pw_config.k_sqrt_coef * math.sqrt(N))))
 
     @property
     def visit_count(self) -> Dict[tuple, int]:
@@ -346,19 +596,27 @@ class MCTSNode:
         exploration = cpuct * p * math.sqrt(self.n_total + 1) / (1 + n)
         return q_value + exploration
 
-    def select_action(self, cpuct: float, fpu_reduction: float = 0.0) -> tuple:
-        """Vectorized UCB action selection."""
-        n = self._visit_count.astype(np.float64)
-        vl = self._virtual_loss
+    def select_action(
+        self,
+        cpuct: float,
+        fpu_reduction: float = 0.0,
+        pw_config: Optional[ProgressiveWideningConfig] = None,
+    ) -> tuple:
+        """Vectorized UCB action selection. When progressive widening is enabled, only over expanded (top-K) actions."""
+        cap = self.get_expanded_count(pw_config)
+        n = self._visit_count[:cap].astype(np.float64)
+        vl = self._virtual_loss[:cap]
+        prior_slice = self._prior[:cap]
+        total_value_slice = self._total_value[:cap]
         effective_n = n + vl
         # Q values
         with np.errstate(divide='ignore', invalid='ignore'):
             q = np.where(effective_n > 0,
-                          (self._total_value - vl) / effective_n,
+                          (total_value_slice - vl) / effective_n,
                           -fpu_reduction if self.parent else 0.0)
         # Exploration
         sqrt_total = math.sqrt(self.n_total + 1)
-        exploration = cpuct * self._prior * sqrt_total / (1.0 + n)
+        exploration = cpuct * prior_slice * sqrt_total / (1.0 + n)
         ucb = q + exploration
         best_idx = int(np.argmax(ucb))
         return self.legal_actions[best_idx]
@@ -440,15 +698,15 @@ class OptimizedAlphaZeroMCTS:
             conv = getattr(network, "conv_input", None)
             if conv is not None:
                 in_ch = getattr(conv, "in_channels", 56)
-            self._use_multimodal = use_film or (in_ch == 56)
+            self._use_multimodal = use_film or (in_ch in (56, 60))
         elif full_config:
             data_cfg = full_config.get("data", {}) or {}
             enc = str(data_cfg.get("encoding_version", ""))
-            if enc and enc.lower() in ("gold_v2_32ch", "gold_v2_multimodal"):
+            if enc and enc.lower().startswith("gold_v2"):
                 self._use_multimodal = True
             else:
                 in_ch = int(full_config.get("network", {}).get("input_channels", 56))
-                self._use_multimodal = in_ch == 56
+                self._use_multimodal = in_ch in (56, 60)
         else:
             self._use_multimodal = False
 
@@ -479,6 +737,38 @@ class OptimizedAlphaZeroMCTS:
     def clear_tree(self) -> None:
         """Clear the MCTS tree (e.g. on new game). Used by GUI/API when starting a fresh game."""
         self._root = None
+
+    def get_root_legal_count(self) -> int:
+        """Number of legal actions at root (after last search). For reporting / A-B tests."""
+        if self._root is None or self._root.legal_actions is None:
+            return 0
+        return len(self._root.legal_actions)
+
+    def get_root_expanded_count(self) -> int:
+        """Number of expanded (selectable) actions at root. For reporting / A-B tests."""
+        if self._root is None:
+            return 0
+        pw = self.config.progressive_widening if self.config.progressive_widening.enabled else None
+        return self._root.get_expanded_count(pw)
+
+    def get_root_n_total(self) -> int:
+        """Total node visits N at root (for PW reporting)."""
+        if self._root is None:
+            return 0
+        return int(self._root.n_total)
+
+    def get_root_K_buy(self) -> Optional[int]:
+        """Current K_buy at root (for PW reporting). None if PW disabled."""
+        if self._root is None:
+            return None
+        pw = self.config.progressive_widening if self.config.progressive_widening.enabled else None
+        return self._root.get_K_buy(pw)
+
+    def get_root_packing_score_top1(self) -> Optional[float]:
+        """Packing score of top-ranked BUY at root (for logging). None if packing ordering didn't run."""
+        if self._root is None:
+            return None
+        return self._root._packing_score_top1
 
     def advance_tree(self, action: tuple) -> None:
         """Move root to the child for the given action (GUI tree reuse). Next search continues from that node."""
@@ -569,21 +859,20 @@ class OptimizedAlphaZeroMCTS:
         self._search_effective_static_w = self.config.static_score_utility_weight
         self._search_effective_dynamic_w = self.config.dynamic_score_utility_weight
 
-        root: Optional[MCTSNode] = None
-        if self._root is not None and self._root.children:
-            for _action, child in self._root.children.items():
-                if child is not None and np.array_equal(child.state, state):
-                    self._root = child
-                    root = child
-                    break
-        if root is None:
-            root = MCTSNode(state, int(to_move))
-            self._root = root  # Ensure root is available for is_root_player checks
-            self._expand_and_evaluate(root, precomputed_legal=root_legal_actions)
-            if add_noise and root.legal_actions and len(root.legal_actions) > 0:
-                self._add_dirichlet_noise(root)
-        else:
-            self._root = root
+        # GUI/API inference is intentionally stateless per solve to avoid stale-tree carryover
+        # after undo, refresh, or accidental inputs. Always start from a fresh root.
+        root = MCTSNode(state, int(to_move))
+        self._root = root  # Ensure root is available for is_root_player checks
+        self._expand_and_evaluate(root, precomputed_legal=root_legal_actions)
+        if add_noise and root.legal_actions and len(root.legal_actions) > 0:
+            self._add_dirichlet_noise(root)
+        # Apply progressive widening order at root AFTER noise (so top-K BUY uses noisy priors in self-play)
+        if self.config.progressive_widening.enabled and root.legal_actions:
+            _apply_progressive_widening_order(
+                root, self.config.progressive_widening,
+                is_root=True,
+                packing_config=self.config.packing_ordering,
+            )
 
         # Reused root may need expansion if it was a leaf (shouldn't happen, but be safe)
         if not root.is_expanded() and not root.terminal:
@@ -608,6 +897,19 @@ class OptimizedAlphaZeroMCTS:
         self.total_time += search_time
 
         self._root = root
+
+        # Progressive widening debug: ensure we use NODE VISITS N, not legal count; log root stats when PW enabled
+        if self.config.progressive_widening.enabled and root is not None and root.legal_actions is not None:
+            N = int(root.n_total)
+            pw = self.config.progressive_widening
+            expanded = root.get_expanded_count(pw)
+            K_buy = root.get_K_buy(pw)
+            root_legal = len(root.legal_actions)
+            logger.debug(
+                "[PW root] root_legal_count=%d root_expanded_count=%d N=%d K_buy=%s",
+                root_legal, expanded, N, K_buy,
+            )
+            assert expanded <= root_legal, "expanded_count must not exceed legal_count"
 
         # Build visit counts from the array-backed node
         if root.legal_actions and root._visit_count is not None:
@@ -706,24 +1008,147 @@ class OptimizedAlphaZeroMCTS:
         visit_counts: Dict[tuple, int],
         temperature: float = 1.0,
         deterministic: bool = False,
+        *,
+        patch_tiebreak_override: Optional[bool] = None,
     ) -> tuple:
-        """Select action from visit counts. When win_first.enabled, uses root node for strict win-first selection."""
+        """Select action from visit counts. When win_first.enabled, uses root node for strict win-first selection.
+
+        If patch_tiebreak is enabled (or overridden), may apply a root-only deterministic tie-break among
+        near-equal PATCH actions in sure-winning positions. This does NOT affect tree search.
+        """
         if not visit_counts:
             raise ValueError("No visit counts")
 
+        use_pt = self.config.patch_tiebreak.enabled if patch_tiebreak_override is None else bool(patch_tiebreak_override)
+
         if self.config.win_first.enabled and self._root is not None and self._root._value_sum is not None:
-            return self._select_action_win_first(temperature, deterministic)
+            action = self._select_action_win_first(temperature, deterministic)
+            if use_pt:
+                action = self._maybe_apply_patch_tiebreak(selected_action=action)
+            return action
 
         if temperature == 0 or deterministic:
-            return max(visit_counts.items(), key=lambda x: x[1])[0]
+            action = max(visit_counts.items(), key=lambda x: x[1])[0]
+            if use_pt:
+                action = self._maybe_apply_patch_tiebreak(selected_action=action)
+            return action
 
         actions = list(visit_counts.keys())
         visits = np.array([visit_counts[a] for a in actions], dtype=np.float64)
         if visits.sum() == 0:
-            return actions[int(self._noise_rng.integers(0, len(actions)))]
+            action = actions[int(self._noise_rng.integers(0, len(actions)))]
+            if use_pt:
+                action = self._maybe_apply_patch_tiebreak(selected_action=action)
+            return action
         visits_temp = visits ** (1.0 / temperature)
         probs = visits_temp / visits_temp.sum()
-        return actions[int(self._noise_rng.choice(len(actions), p=probs))]
+        action = actions[int(self._noise_rng.choice(len(actions), p=probs))]
+        if use_pt:
+            action = self._maybe_apply_patch_tiebreak(selected_action=action)
+        return action
+
+    def _maybe_apply_patch_tiebreak(self, selected_action: tuple) -> tuple:
+        """Root-only tie-break among PATCH actions when value saturates / is tied.
+
+        Only breaks ties among actions within value_tie_eps of best Qv (value head).
+        Never overrides a clearly better-Q action.
+        """
+        cfg = self.config.patch_tiebreak
+        root = self._root
+        if root is None or not root.legal_actions:
+            return selected_action
+        if root._visit_count is None or root._value_sum is None or root._score_sum is None:
+            return selected_action
+
+        # We only ever consider PATCH actions at the root.
+        legal = root.legal_actions
+        patch_idxs = [i for i, a in enumerate(legal) if int(a[0]) == AT_PATCH]
+        if not patch_idxs:
+            return selected_action
+
+        visits = root._visit_count.astype(np.float64)
+        has_visits = visits > 0
+        if not np.any(has_visits):
+            return selected_action
+
+        safe_visits = np.where(has_visits, visits, 1.0)
+        qv = np.where(has_visits, root._value_sum / safe_visits, -np.inf)  # value head [-1,1]
+        qs_points = np.where(has_visits, root._score_sum / safe_visits, -np.inf)  # points (margin) estimate
+
+        best_qv = float(np.max(qv))
+        if not math.isfinite(best_qv):
+            return selected_action
+
+        # Trigger condition: sure-win OR there exist ties within eps.
+        best_win_prob = 0.5 * (best_qv + 1.0)
+        within_eps = np.where(qv >= (best_qv - float(cfg.value_tie_eps)))[0]
+        if within_eps.size <= 1 and best_win_prob < float(cfg.win_prob_floor):
+            return selected_action
+
+        # Candidate set for tie-break: PATCH actions that are within eps of best value.
+        cand = [i for i in patch_idxs if qv[i] >= (best_qv - float(cfg.value_tie_eps))]
+        if len(cand) <= 1:
+            return selected_action
+
+        # Compute pre-move packing metrics once for root player (the one placing the patch).
+        to_move = int(root.to_move)
+        if to_move == 0:
+            base_occ = (int(root.state[P0_OCC0]), int(root.state[P0_OCC1]), int(root.state[P0_OCC2]))
+        else:
+            base_occ = (int(root.state[P1_OCC0]), int(root.state[P1_OCC1]), int(root.state[P1_OCC2]))
+        base_empty = int(empty_count_from_occ(*base_occ))
+        base_comp, base_iso = fragmentation_from_occ_words(*base_occ)
+
+        w_empty = float(cfg.weights.get("empty_squares", 1.0))
+        w_comp = float(cfg.weights.get("empty_components", 2.0))
+        w_iso = float(cfg.weights.get("isolated_1x1", 3.0))
+        score_w = float(cfg.score_weight)
+
+        best_i = cand[0]
+        best_pack = None
+        best_score = None
+        best_combined = None
+
+        for i in cand:
+            a = legal[i]
+            # Apply patch to a copy; compute metrics for the SAME player (root.to_move).
+            ns = apply_action_unchecked(root.state, a)
+            if to_move == 0:
+                occ = (int(ns[P0_OCC0]), int(ns[P0_OCC1]), int(ns[P0_OCC2]))
+            else:
+                occ = (int(ns[P1_OCC0]), int(ns[P1_OCC1]), int(ns[P1_OCC2]))
+            empty = int(empty_count_from_occ(*occ))
+            comp, iso = fragmentation_from_occ_words(*occ)
+
+            pack_cost = (
+                w_empty * float(empty) +
+                w_comp * float(comp) +
+                w_iso * float(iso)
+            )
+            # Use backed-up mean points estimate as "score_est_raw" proxy.
+            score_raw = float(qs_points[i]) if math.isfinite(float(qs_points[i])) else 0.0
+
+            if cfg.mode == "packing":
+                key = (pack_cost, -score_raw, i)  # deterministic final tie-break by index
+            elif cfg.mode == "score":
+                key = (-score_raw, pack_cost, i)
+            else:  # hybrid: lexicographic packing then score, plus a tiny combined guard
+                combined = pack_cost - score_w * score_raw
+                key = (pack_cost, -score_raw, combined, i)
+
+            if best_combined is None or key < best_combined:
+                best_combined = key
+                best_i = i
+                best_pack = pack_cost
+                best_score = score_raw
+
+        # Only override if it changes the selected action AND the selected action is in the tied set.
+        selected_idx = root._action_to_idx.get(selected_action) if root._action_to_idx is not None else None
+        if selected_idx is None:
+            return legal[int(best_i)]
+        if selected_idx in cand:
+            return legal[int(best_i)]
+        return selected_action
 
     # ------------------------------------------------------------------
     # Tree traversal
@@ -733,8 +1158,11 @@ class OptimizedAlphaZeroMCTS:
         node = root
         search_path: List[Tuple[MCTSNode, tuple]] = []
 
+        pw = self.config.progressive_widening if self.config.progressive_widening.enabled else None
         while node.is_expanded() and not node.terminal:
-            action = node.select_action(self.config.cpuct, self.config.fpu_reduction)
+            action = node.select_action(
+                self.config.cpuct, self.config.fpu_reduction, pw_config=pw
+            )
             search_path.append((node, action))
             node.add_virtual_loss(action, self.config.virtual_loss)
 
@@ -780,8 +1208,11 @@ class OptimizedAlphaZeroMCTS:
         node = root
         search_path: List[Tuple[MCTSNode, tuple]] = []
 
+        pw = self.config.progressive_widening if self.config.progressive_widening.enabled else None
         while node.is_expanded() and not node.terminal:
-            action = node.select_action(self.config.cpuct, self.config.fpu_reduction)
+            action = node.select_action(
+                self.config.cpuct, self.config.fpu_reduction, pw_config=pw
+            )
             search_path.append((node, action))
             node.add_virtual_loss(action, self.config.virtual_loss)
 
@@ -912,7 +1343,7 @@ class OptimizedAlphaZeroMCTS:
                 self._shm_buf.write_nlegal(slot, n_lj)
                 shm_slot_list.append((slot, n_lj))
             elif self._use_multimodal:
-                x_spatial, x_global, x_track, shop_ids, shop_feats = encode_state_multimodal(node.state, node.to_move)
+                x_spatial, x_global, x_track, shop_ids, shop_feats = self.state_encoder.encode_state_multimodal(node.state, node.to_move)
                 states_np.append(x_spatial.astype(np.float32, copy=False))
                 mm_extras.append((x_global.astype(np.float32), x_track.astype(np.float32), shop_ids, shop_feats.astype(np.float32)))
             else:
@@ -984,6 +1415,12 @@ class OptimizedAlphaZeroMCTS:
                     continue
                 priors_legal = resp_priors[nonterm_idx]
                 node._prior[:] = priors_legal[:len(node.legal_actions)]
+                if self.config.progressive_widening.enabled:
+                    _apply_progressive_widening_order(
+                        node, self.config.progressive_widening,
+                        is_root=False,
+                        packing_config=self.config.packing_ordering,
+                    )
                 node.normalize_priors()
                 v = resp_values[nonterm_idx]
                 s_points = resp_mean_pts[nonterm_idx]
@@ -1071,6 +1508,12 @@ class OptimizedAlphaZeroMCTS:
             priors = torch.softmax(legal_logits, dim=0)
             priors_cpu = priors.float().cpu().numpy()
             node._prior[:] = priors_cpu[:len(node.legal_actions)]
+            if self.config.progressive_widening.enabled:
+                _apply_progressive_widening_order(
+                    node, self.config.progressive_widening,
+                    is_root=False,
+                    packing_config=self.config.packing_ordering,
+                )
             node.normalize_priors()
             v = float(value_cpu[nonterm_idx])
             s_points = float(mean_points_cpu[nonterm_idx])
@@ -1104,7 +1547,7 @@ class OptimizedAlphaZeroMCTS:
         node._init_arrays()
 
         if self._use_multimodal:
-            x_spatial, x_global, x_track, shop_ids, shop_feats = encode_state_multimodal(node.state, node.to_move)
+            x_spatial, x_global, x_track, shop_ids, shop_feats = self.state_encoder.encode_state_multimodal(node.state, node.to_move)
             state_np = x_spatial.astype(np.float32, copy=False)
             mm = (x_global, x_track, shop_ids, shop_feats)
         else:
@@ -1135,6 +1578,12 @@ class OptimizedAlphaZeroMCTS:
                 self._search_root_value = v
             u = v + su
             node._prior[:] = priors_legal[:len(node.legal_actions)]
+            # Root: PW order applied in search() after Dirichlet noise. Non-root: apply here.
+            if self.config.progressive_widening.enabled and not (self._root is not None and node is self._root):
+                _apply_progressive_widening_order(
+                    node, self.config.progressive_widening,
+                    is_root=False,
+                )
         else:
             if self.network is None:
                 raise RuntimeError("MCTS requires either a network or eval_client")
@@ -1193,6 +1642,13 @@ class OptimizedAlphaZeroMCTS:
 
             priors_cpu = priors.float().cpu().numpy()
             node._prior[:] = priors_cpu[:len(node.legal_actions)]
+            # Root: PW order applied in search() after Dirichlet noise. Non-root: apply here.
+            if self.config.progressive_widening.enabled and not (self._root is not None and node is self._root):
+                _apply_progressive_widening_order(
+                    node, self.config.progressive_widening,
+                    is_root=False,
+                    packing_config=self.config.packing_ordering,
+                )
 
         node.normalize_priors()
         return (v, s_points, u)
@@ -1257,6 +1713,9 @@ def create_optimized_mcts(
     """Factory function to create MCTS from config."""
     mcts_cfg = config.get("selfplay", {}).get("mcts", {}) or {}
     win_first = _parse_and_validate_win_first(mcts_cfg.get("win_first"))
+    progressive_widening = _parse_progressive_widening(mcts_cfg.get("progressive_widening"))
+    packing_ordering = _parse_packing_ordering(mcts_cfg.get("packing_ordering"))
+    patch_tiebreak = _parse_patch_tiebreak(mcts_cfg.get("patch_tiebreak"))
     mcts_config = MCTSConfig(
         simulations=int(mcts_cfg.get("simulations", 800)),
         parallel_leaves=int(mcts_cfg.get("parallel_leaves", 32)),
@@ -1279,6 +1738,9 @@ def create_optimized_mcts(
         score_max=int(mcts_cfg.get("score_max", 100)),
         enable_tree_reuse=enable_tree_reuse if enable_tree_reuse is not None else bool(mcts_cfg.get("enable_tree_reuse", False)),
         win_first=win_first,
+        progressive_widening=progressive_widening,
+        packing_ordering=packing_ordering,
+        patch_tiebreak=patch_tiebreak,
     )
 
     # [C1 FIX] Safety clamp: parallel_leaves must be < simulations so the tree

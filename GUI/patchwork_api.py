@@ -22,7 +22,7 @@ from starlette.concurrency import run_in_threadpool
 # AlphaZero NN integration (lazy-loaded)
 # =========================
 _NN_AGENT = None  # Will hold PatchworkAgent if model is loaded
-_NN_SIMULATIONS = 3000
+_NN_SIMULATIONS = 2048
 _NN_DEVICE = "cuda"
 _NN_MODEL_PATH: Optional[str] = None
 _NN_CONFIG_PATH: Optional[str] = None
@@ -1105,13 +1105,18 @@ async def nn_load(request: Request):
     if not model_path:
         return JSONResponse({"error": "model_path is required"}, status_code=400)
 
-    config_path = str(payload.get("config_path", "configs/config_best.yaml")).strip()
+    config_path = str(payload.get("config_path", "configs/config_gui_max_strength.yaml")).strip()
     device = str(payload.get("device", _NN_DEVICE)).strip() or _NN_DEVICE
+    # If payload omits simulations, we'll use the loaded config's value after load (so "max strength" configs take effect)
+    simulations_in_payload = "simulations" in payload
     simulations = int(payload.get("simulations", _NN_SIMULATIONS))
     simulations = max(50, min(simulations, 20000))
 
     try:
         _load_nn_agent(model_path=model_path, config_path=config_path, device=device)
+        if not simulations_in_payload and _NN_AGENT is not None:
+            simulations = getattr(_NN_AGENT.mcts.config, "simulations", simulations)
+            simulations = max(50, min(simulations, 20000))
         _NN_SIMULATIONS = simulations
         return {
             "ok": True,
@@ -1331,7 +1336,14 @@ def _solve_nn(state_dict: dict, simulations: int, temperature: float) -> dict:
         state_from_dict as engine_state_from_dict,
         current_player as engine_current_player,
         terminal as engine_terminal,
+        apply_action_unchecked as engine_apply_action_unchecked,
+        empty_count_from_occ,
+        AT_PATCH,
+        P0_OCC0, P0_OCC1, P0_OCC2,
+        P1_OCC0, P1_OCC1, P1_OCC2,
     )
+    from src.utils.packing_metrics import fragmentation_from_occ_words
+    import math
 
     engine_state = engine_state_from_dict(state_dict)
     to_move = int(engine_current_player(engine_state))
@@ -1354,23 +1366,92 @@ def _solve_nn(state_dict: dict, simulations: int, temperature: float) -> dict:
                 "best": {"pretty": "PASS", "action": {"type": "pass"}, "winProb": 0.5, "visits": 0}, "top": []}
 
     total_visits = sum(visit_counts.values())
-    # root_q is backed-up value from tree search ([-1,1] from to_move's perspective)
-    # Convert to win prob for to_move: (root_q + 1) / 2; frontend converts to P0 for display
-    root_q_val = float(root_q) if root_q is not None else 0.0
-    win_prob = max(0.0, min(1.0, (root_q_val + 1.0) / 2.0))
+
+    # Root-level per-action diagnostics (prefer array-backed root to get Qv/Qs/utility).
+    root = getattr(_NN_AGENT.mcts, "_root", None)
+    score_scale = float(getattr(_NN_AGENT.mcts, "config", None).score_utility_scale) if getattr(_NN_AGENT.mcts, "config", None) is not None else 30.0
+
+    def _safe_tanh(x: float) -> float:
+        return math.tanh(float(x) / max(1e-9, float(score_scale)))
+
+    # Pre-compute BEFORE packing metrics for patch deltas (root player only).
+    if to_move == 0:
+        before_occ = (int(engine_state[P0_OCC0]), int(engine_state[P0_OCC1]), int(engine_state[P0_OCC2]))
+    else:
+        before_occ = (int(engine_state[P1_OCC0]), int(engine_state[P1_OCC1]), int(engine_state[P1_OCC2]))
+    before_empty = int(empty_count_from_occ(*before_occ))
+    before_comp, before_iso = fragmentation_from_occ_words(*before_occ)
 
     items = []
     for engine_action, visits in visit_counts.items():
         api_tuple = _engine_action_to_api_tuple(engine_action)
-        items.append((api_tuple, visits, visits / max(1, total_visits)))
+
+        qv = None
+        qu = None
+        score_raw = None
+        if root is not None and getattr(root, "_action_to_idx", None) is not None and getattr(root, "_visit_count", None) is not None:
+            idx = root._action_to_idx.get(engine_action)
+            if idx is not None and int(root._visit_count[idx]) > 0:
+                n = float(root._visit_count[idx])
+                qv = float(root._value_sum[idx] / n) if getattr(root, "_value_sum", None) is not None else None
+                qu = float(root._total_value[idx] / n) if getattr(root, "_total_value", None) is not None else None
+                score_raw = float(root._score_sum[idx] / n) if getattr(root, "_score_sum", None) is not None else None
+
+        # PATCH packing deltas (root-only; cheap).
+        patch_delta = None
+        if int(engine_action[0]) == int(AT_PATCH):
+            ns = engine_apply_action_unchecked(engine_state, engine_action)
+            if to_move == 0:
+                occ = (int(ns[P0_OCC0]), int(ns[P0_OCC1]), int(ns[P0_OCC2]))
+            else:
+                occ = (int(ns[P1_OCC0]), int(ns[P1_OCC1]), int(ns[P1_OCC2]))
+            after_empty = int(empty_count_from_occ(*occ))
+            after_comp, after_iso = fragmentation_from_occ_words(*occ)
+            patch_delta = {
+                "dEmpty": int(after_empty - before_empty),
+                "dComp": int(after_comp - before_comp),
+                "dIso": int(after_iso - before_iso),
+            }
+
+        # Per-move win prob derived from value-head Q (not utility).
+        win_prob_move = None
+        if qv is not None:
+            win_prob_move = max(0.0, min(1.0, (float(qv) + 1.0) / 2.0))
+
+        items.append(
+            (
+                api_tuple,
+                visits,
+                visits / max(1, total_visits),
+                {
+                    "Q": qv,
+                    "U": qu,
+                    "score_raw": score_raw,
+                    "score_tanh": (_safe_tanh(score_raw) if score_raw is not None else None),
+                    "winProb": win_prob_move,
+                    "patchDelta": patch_delta,
+                },
+            )
+        )
 
     items.sort(key=lambda x: x[1], reverse=True)
 
+    # GUI solves are intentionally stateless: do not advance/retain tree here
+    # so each turn searches from the fresh state (avoids stale-tree issues after undo/misclicks).
     selected_engine_action = _NN_AGENT.mcts.select_action(visit_counts, temperature=temperature)
-    _NN_AGENT.mcts.advance_tree(selected_engine_action)  # GUI permanent brain: reuse subtree
     selected_api_tuple = _engine_action_to_api_tuple(selected_engine_action)
 
     top_list = items[:min(10, len(items))]
+
+    # Best/selected action diagnostics (match the actually-selected move).
+    selected_visits = int(visit_counts.get(selected_engine_action, 0))
+    selected_meta = None
+    for (a, _vis, _frac, meta) in items:
+        if a == selected_api_tuple:
+            selected_meta = meta
+            break
+    if selected_meta is None:
+        selected_meta = {}
 
     return {
         "terminal": False,
@@ -1380,17 +1461,26 @@ def _solve_nn(state_dict: dict, simulations: int, temperature: float) -> dict:
         "best": {
             "pretty": pretty_action(selected_api_tuple),
             "action": action_to_obj(selected_api_tuple),
-            "winProb": win_prob,
-            "visits": items[0][1],
+            "winProb": selected_meta.get("winProb", None),
+            "visits": selected_visits,
+            "Q": selected_meta.get("Q", None),
+            "U": selected_meta.get("U", None),
+            "score_raw": selected_meta.get("score_raw", None),
+            "score_tanh": selected_meta.get("score_tanh", None),
         },
         "top": [
             {
                 "pretty": pretty_action(a),
                 "action": action_to_obj(a),
-                "winProb": win_prob,
                 "visits": vis,
+                "winProb": meta.get("winProb", None),
+                "Q": meta.get("Q", None),
+                "U": meta.get("U", None),
+                "score_raw": meta.get("score_raw", None),
+                "score_tanh": meta.get("score_tanh", None),
+                "patchDelta": meta.get("patchDelta", None),
             }
-            for (a, vis, _) in top_list
+            for (a, vis, _, meta) in top_list
         ],
     }
 
@@ -1428,11 +1518,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Patchwork API Server")
     parser.add_argument("--model", type=str, default=None, help="Path to AlphaZero checkpoint (enables /solve_nn)")
-    parser.add_argument("--config", type=str, default="configs/config_best.yaml", help="Config for NN architecture")
+    parser.add_argument("--config", type=str, default="configs/config_gui_max_strength.yaml", help="Config for NN architecture (max strength)")
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--simulations", type=int, default=3000, help="Default MCTS simulations for /solve_nn")
+    parser.add_argument("--simulations", type=int, default=2048, help="Default MCTS simulations for /solve_nn (max strength)")
 
     args = parser.parse_args()
 

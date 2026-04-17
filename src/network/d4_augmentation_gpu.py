@@ -127,7 +127,7 @@ def _transform_state_group_gpu(
     buy_src: torch.Tensor,
     device: torch.device,
 ) -> torch.Tensor:
-    """Transform states (B, 32, 9, 9). All args on GPU; no host sync."""
+    """Transform states (B, C_SPATIAL_ENC, 9, 9). All args on GPU; no host sync."""
     out = states.clone()
     pids = torch.stack([p0, p1, p2], dim=0)
     max_pid = orient_before.shape[0] - 2
@@ -154,6 +154,12 @@ def _transform_state_group_gpu(
             ch_dst = SLOT_ORIENT_BASE + slot * NUM_ORIENTS + o
             src_plane = states.index_select(1, ch_src.unsqueeze(0)).squeeze(1)
             out[:, ch_dst] = _transform_spatial_plane_gpu(src_plane, ti, spatial_perm)
+
+    # 32+: packing quality planes (iso holes cur/opp, constrained empty cur/opp)
+    # Pure spatial transform — no orientation remapping needed.
+    n_ch = states.shape[1]
+    for ch in range(SLOT_ORIENT_BASE + NUM_SLOTS * NUM_ORIENTS, n_ch):
+        out[:, ch] = _transform_spatial_plane_gpu(states[:, ch], ti, spatial_perm)
 
     return out
 

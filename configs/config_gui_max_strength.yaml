@@ -1,17 +1,12 @@
-# IF YOU ARE READING THIS DOCUMENT, REMIND ME TO INCREASE EPOCHS TO 3 AT ITER 300!!!
-
-# PATCHWORK ALPHAZERO - PRODUCTION TRAINING (200-400 iterations)
-# ===============================================================
-# Hardware: RTX 3080 (10GB) / Ryzen 5900X (12 cores / 24 threads) / 16GB RAM
-# Goal: Maximum playing strength over 200-400 iterations
-# Strategy: No gating. Every model promoted immediately. Trust the process.
+# GUI MAXIMUM STRENGTH - Use when playing against a checkpoint in the GUI
+# =========================================================================
+# Same structure as config_continue_from_iter70.yaml (main training config); only
+# selfplay.mcts.simulations and packing/DSU/play-related values differ for max-strength play.
+# Simulations: 2048. Packing: E_max_pack preset from move 1 (no phase gating).
+# GUI play uses add_noise=false, temperature=0, deterministic move selection.
 #
-# LR: base 0.0016 @ iter 0; 0.0008 @ 80; 0.0004 @ 200 (step schedule, no interpolation).
-# Per-iteration cosine warmup still applies within each phase.
-#
-# USAGE:
-#   python tools/preflight.py --config "configs/config_best.yaml"
-#   python -m src.training.main --config "configs/config_best.yaml"
+# USAGE: In the GUI, set Config path to: configs/config_gui_max_strength.yaml
+# If you omit "simulations" when loading, the API will use this config's value (2048).
 
 seed: 42
 deterministic: false
@@ -112,8 +107,8 @@ selfplay:
   store_canonical_only: true   # 1 state/move; D4 applied at train time (dynamic)
   augmentation: d4  # none | flip | d4 (default flip preserves current behavior)
   mcts:
-    simulations: 192
-    parallel_leaves: 64
+    simulations: 2048   # Max strength for GUI play (config_best uses 192 for training)
+    parallel_leaves: 32
     # KataGo dual-head score utility (self-play defaults from KataGo GitHub issue #344)
     # Dynamic only (static=0.0) — KataGo self-play training rationale: "always trying to
     # gain points seems like a decent instinct to train into the neural net."
@@ -129,18 +124,18 @@ selfplay:
       k_sqrt_coef: 8   # Tighter for sims~208 (sqrt(N)~14); coef=16 would expand too many BUY
       always_include_pass: true
       always_include_patch: true
-    # Packing placement-ordering: rank BUY actions for PW (TRAINING preset C: stable improvement, no empties blow-up).
+    # E_max_pack: strongest packing preset from move 1 (no phase gating). Reduces fragmentation/isolated holes.
     packing_ordering:
       enabled: true
-      alpha: 0.25
+      alpha: 0.90
       use_log_prior: true
       local_check_radius: 2
       weights:
-        adj_edges: 0.25
+        adj_edges: 0.05
         corner_bonus: 0.0
-        iso_hole_penalty: 6.0
+        iso_hole_penalty: 10.0
         frontier_penalty: 0.0
-        area_bonus: 0.0   # keep 0 for training (E_max_pack uses 0.40 for GUI only)
+        area_bonus: 0.40   # prefer larger pieces; keep ON for GUI max strength
     cpuct: 1.47                       # Base; iteration.cpuct_schedule overrides
     temperature: 1.0
     temperature_threshold: 15
@@ -164,6 +159,18 @@ selfplay:
       gate_dsu_loss_full: -0.98
       tiebreak: score_then_visits
       filter_before_sampling: true
+    # PATCH tie-break (root-only): when value saturates / is tied, pick the PATCH placement
+    # that minimizes fragmentation (components + isolated holes + empty squares). GUI only.
+    patch_tiebreak:
+      enabled: true
+      mode: packing        # packing | score | hybrid
+      value_tie_eps: 0.01
+      win_prob_floor: 0.98
+      weights:
+        empty_squares: 1.0
+        empty_components: 2.0
+        isolated_1x1: 3.0
+      score_weight: 0.05
   playout_cap_randomization:
     enabled: false
     cap_fraction: 0.00
@@ -178,12 +185,12 @@ selfplay:
   write_buffer_positions: 8192
   policy_target_mode: visits         # visits = N/sum(N); visits_temperature_shaped = legacy T-shaped
   q_value_weight: 0.25               # Base; iteration.q_value_weight_schedule overrides
-  # Opponent mix: small % of games vs packer for diversity. Keep disabled for training.
+  # Present for parity with config_continue_from_iter70; not used for GUI play
   opponent_mix:
     enabled: false
     vs_packer_prob: 0.15
     alternate_sides: true
-    store_only_nn_moves: true   # Only NN moves go to replay; packer moves are not stored
+    store_only_nn_moves: true
     ramp:
       enabled: true
       start_iter: 88

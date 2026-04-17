@@ -416,11 +416,12 @@ function Button({ children, onClick, disabled, tone = "neutral", title }) {
   );
 }
 
-function Field({ label, children }) {
+function Field({ label, hint, children }) {
   return (
     <label style={{ display: "grid", gap: 6, fontSize: 12, color: COLORS.muted }}>
       <span>{label}</span>
       {children}
+      {hint && <span style={{ fontSize: 11, opacity: 0.9 }}>{hint}</span>}
     </label>
   );
 }
@@ -534,6 +535,15 @@ function TopMoves({ solveResult }) {
             <div style={{ display: "flex", gap: 10, flexShrink: 0 }}>
               {x.visits != null && <span>v={x.visits}</span>}
               {x.winProb != null && <span>p={(100 * x.winProb).toFixed(1)}%</span>}
+              {x.Q != null && <span>Q={Number(x.Q).toFixed(2)}</span>}
+              {x.U != null && <span>U={Number(x.U).toFixed(2)}</span>}
+              {x.score_raw != null && <span>score={Number(x.score_raw).toFixed(1)}</span>}
+              {x.score_tanh != null && <span>sT={Number(x.score_tanh).toFixed(2)}</span>}
+              {x.patchDelta != null && (
+                <span style={{ color: COLORS.dim }}>
+                  ΔE={x.patchDelta.dEmpty} ΔC={x.patchDelta.dComp} ΔIso={x.patchDelta.dIso}
+                </span>
+              )}
             </div>
           </div>
         ))}
@@ -572,20 +582,14 @@ export default function App() {
   const [engine, setEngine] = useLocalStorageState("pw_engine", "nn");
   const [mctsIterations, setMctsIterations] = useLocalStorageState("pw_mcts_iters", 50000);
   const [mctsWorkers, setMctsWorkers] = useLocalStorageState("pw_mcts_workers", 4);
-  const [nnSimulations, setNnSimulations] = useLocalStorageState("pw_nn_sims", 3000);
+  const [nnSimulations, setNnSimulations] = useLocalStorageState("pw_nn_sims", 2048);
 
   const [nnStatus, setNnStatus] = useState(null);
   // Best model: committed iter69. Fallback default: latest_model.pt
   const ITER69_PATH = "C:\\Users\\Shanks\\Desktop\\Codes\\patchworkaz - Copy - v2\\runs\\patchwork_production\\committed\\iter_069\\iteration_069.pt";
   const [nnPath, setNnPath] = useLocalStorageState("pw_nn_path", ITER69_PATH);
-  const [nnConfig, setNnConfig] = useLocalStorageState("pw_nn_cfg", "C:\\Users\\Shanks\\Desktop\\Codes\\patchworkaz - Copy - v2\\configs\\config_best.yaml");
   useEffect(() => {
     try {
-      const raw = localStorage.getItem("pw_nn_cfg");
-      if (raw != null && raw.includes("configs/config_best.yaml") && !raw.includes("Users\\\\Shanks")) {
-        localStorage.setItem("pw_nn_cfg", JSON.stringify("C:\\Users\\Shanks\\Desktop\\Codes\\patchworkaz - Copy - v2\\configs\\config_best.yaml"));
-        setNnConfig("C:\\Users\\Shanks\\Desktop\\Codes\\patchworkaz - Copy - v2\\configs\\config_best.yaml");
-      }
       const pathRaw = localStorage.getItem("pw_nn_path");
       if (pathRaw != null && (pathRaw.includes("latest_model.pt") || pathRaw.endsWith("checkpoints\\\\latest_model.pt"))) {
         localStorage.setItem("pw_nn_path", JSON.stringify(ITER69_PATH));
@@ -609,11 +613,40 @@ export default function App() {
   const [pieceIdBoardP0, setPieceIdBoardP0] = useState(() => emptyPieceIdBoard());
   const [pieceIdBoardP1, setPieceIdBoardP1] = useState(() => emptyPieceIdBoard());
   const [gameStarted, setGameStarted] = useState(false);
+  const [history, setHistory] = useState([]);
 
   const boardsRef = useRef(boards);
   useEffect(() => {
     boardsRef.current = boards;
   }, [boards]);
+
+  const MAX_HISTORY = 512;
+
+  function cloneBoardMatrix(b) {
+    return b.map((row) => row.slice());
+  }
+
+  const pushHistorySnapshot = useCallback(() => {
+    if (!gameState) return;
+    setHistory((prev) => {
+      const snapshot = {
+        gameState: JSON.parse(JSON.stringify(gameState)),
+        boards: [cloneBoardMatrix(boardsRef.current[0]), cloneBoardMatrix(boardsRef.current[1])],
+        pieceIdBoardP0: pieceIdBoardP0.map((row) => row.slice()),
+        pieceIdBoardP1: pieceIdBoardP1.map((row) => row.slice()),
+        legal: legal ? JSON.parse(JSON.stringify(legal)) : null,
+        toMoveServer,
+        lastMovePlacementsP0: Array.isArray(lastMovePlacementsP0) ? lastMovePlacementsP0.map((cells) => (Array.isArray(cells) ? cells.map((c) => ({ ...c })) : [])) : [],
+        lastMovePlacementsP1: Array.isArray(lastMovePlacementsP1) ? lastMovePlacementsP1.map((cells) => (Array.isArray(cells) ? cells.map((c) => ({ ...c })) : [])) : [],
+        moveLog: moveLog.slice(),
+      };
+      const next = [...prev, snapshot];
+      if (next.length > MAX_HISTORY) {
+        return next.slice(next.length - MAX_HISTORY);
+      }
+      return next;
+    });
+  }, [gameState, legal, toMoveServer, lastMovePlacementsP0, lastMovePlacementsP1, moveLog, pieceIdBoardP0, pieceIdBoardP1]);
 
   const solveAndPlayRef = useRef(null);
 
@@ -815,6 +848,7 @@ export default function App() {
       setPieceIdBoardP0(emptyPieceIdBoard());
       setPieceIdBoardP1(emptyPieceIdBoard());
       setGameStarted(false);
+      setHistory([]);
       setJsonDirty(false);
       setJsonText(JSON.stringify(st.state, null, 2));
       // Fetch legal to get correct to_move (for display); game doesn't "start" until Start Game is pressed
@@ -905,6 +939,7 @@ export default function App() {
       setBusy((b) => ({ ...b, thinking: true }));
       const prevBoards = boardsRef.current;
       try {
+        pushHistorySnapshot();
         stampActionCells(playerIdx, actionObj);
         const data = await api.post("/apply", { state: stateForApi, action: actionObj });
         applyServerState(data);
@@ -940,10 +975,12 @@ export default function App() {
         setBusy((b) => ({ ...b, thinking: false }));
       }
     },
-    [api, stateForApi, stampActionCells, applyServerState, setErr, gameMode, humanPlayer],
+    [api, stateForApi, stampActionCells, applyServerState, setErr, gameMode, humanPlayer, pushHistorySnapshot],
   );
 
   const solveAndPlay = useCallback(async () => {
+    // Human turns in human_vs_ai mode must be completely stateless: no hints, no solves, no side effects.
+    if (isHumanTurn) return;
     if (!stateForApi) return;
     // #region agent log
     _dbgLog("App.jsx:solveAndPlay", "solveAndPlay called", { engine, nnAvailable, circleLen: stateForApi?.circle?.length, neutral: stateForApi?.neutral }, "H2");
@@ -953,7 +990,7 @@ export default function App() {
       const useNn = engine === "nn" && nnAvailable;
       const endpoint = useNn ? "/solve_nn" : "/solve";
       const body = useNn
-        ? { state: stateForApi, simulations: clamp(Number(nnSimulations) || 3000, 50, 20000), temperature: 0.0 }
+        ? { state: stateForApi, simulations: clamp(Number(nnSimulations) || 2048, 50, 20000), temperature: 0.0 }
         : {
             state: stateForApi,
             iterations: clamp(Number(mctsIterations) || 50000, 500, 2000000),
@@ -986,7 +1023,7 @@ export default function App() {
     } finally {
       setBusy((b) => ({ ...b, thinking: false }));
     }
-  }, [api, engine, nnAvailable, nnSimulations, mctsIterations, mctsWorkers, stateForApi, applyAction, toMove, gameMode, humanPlayer, setInfo, setErr]);
+  }, [api, engine, nnAvailable, nnSimulations, mctsIterations, mctsWorkers, stateForApi, applyAction, toMove, gameMode, humanPlayer, isHumanTurn, setInfo, setErr]);
 
   useEffect(() => {
     solveAndPlayRef.current = solveAndPlay;
@@ -1072,9 +1109,9 @@ export default function App() {
       if (!model_path) throw new Error("Model path is empty.");
       await api.post("/nn/load", {
         model_path,
-        config_path: String(nnConfig || "").trim() || "configs/config_best.yaml",
+        config_path: "configs/config_gui_max_strength.yaml",
         device: String(nnDevice || "cuda").trim() || "cuda",
-        simulations: clamp(Number(nnSimulations) || 3000, 50, 20000),
+        simulations: clamp(Number(nnSimulations) || 2048, 50, 20000),
       });
       await refreshNnStatus();
       setEngine("nn");
@@ -1084,7 +1121,7 @@ export default function App() {
     } finally {
       setBusy((b) => ({ ...b, nn: false }));
     }
-  }, [api, nnPath, nnConfig, nnDevice, nnSimulations, refreshNnStatus, setEngine, setInfo, setErr]);
+  }, [api, nnPath, nnDevice, nnSimulations, refreshNnStatus, setEngine, setInfo, setErr]);
 
   const unloadNnCheckpoint = useCallback(async () => {
     setBusy((b) => ({ ...b, nn: true }));
@@ -1099,6 +1136,81 @@ export default function App() {
       setBusy((b) => ({ ...b, nn: false }));
     }
   }, [api, refreshNnStatus, setEngine, setInfo, setErr]);
+
+  const undoLastAction = useCallback(() => {
+    setHistory((prev) => {
+      if (!prev.length) return prev;
+
+      // In human_vs_ai mode, revert to the state at the *start* of the human's last turn.
+      if (gameMode === "human_vs_ai") {
+        // Walk history backwards to find the most recent snapshot that:
+        // - Has to-move = humanPlayer, and
+        // - Is the *start* of that turn (either first snapshot, or previous snapshot is not humanPlayer's turn).
+        let targetIdx = -1;
+        for (let i = prev.length - 1; i >= 0; i--) {
+          const snap = prev[i];
+          if (!snap?.gameState) continue;
+          const snapToMove =
+            snap.legal?.to_move ??
+            (snap.toMoveServer != null ? snap.toMoveServer : currentPlayerFromState(snap.gameState));
+          if (snapToMove !== humanPlayer) continue;
+          if (i === 0) {
+            targetIdx = 0;
+            break;
+          }
+          const prevSnap = prev[i - 1];
+          const prevToMove =
+            prevSnap?.legal?.to_move ??
+            (prevSnap?.toMoveServer != null ? prevSnap.toMoveServer : currentPlayerFromState(prevSnap?.gameState));
+          if (prevToMove !== humanPlayer) {
+            targetIdx = i;
+            break;
+          }
+        }
+
+        if (targetIdx >= 0) {
+          const snapshot = prev[targetIdx];
+          setGameState(snapshot.gameState);
+          setBoards(snapshot.boards);
+          setPieceIdBoardP0(snapshot.pieceIdBoardP0);
+          setPieceIdBoardP1(snapshot.pieceIdBoardP1);
+          setLegal(snapshot.legal);
+          setToMoveServer(snapshot.toMoveServer);
+          setLastMovePlacementsP0(snapshot.lastMovePlacementsP0);
+          setLastMovePlacementsP1(snapshot.lastMovePlacementsP1);
+          setMoveLog(snapshot.moveLog);
+          setSelectedKey(null);
+          setSelectedOrient(null);
+          setPreviewAction(null);
+          setHintTopLeftSet(null);
+          setSolveBreakdown(null);
+          // Truncate history to everything *before* the restored state,
+          // so another Undo will move to the previous human turn.
+          return prev.slice(0, targetIdx);
+        }
+        // If we somehow didn't find a human turn boundary, fall through to single-step undo.
+      }
+
+      // Default: single-step undo (last snapshot).
+      const next = prev.slice(0, -1);
+      const snapshot = prev[prev.length - 1];
+      setGameState(snapshot.gameState);
+      setBoards(snapshot.boards);
+      setPieceIdBoardP0(snapshot.pieceIdBoardP0);
+      setPieceIdBoardP1(snapshot.pieceIdBoardP1);
+      setLegal(snapshot.legal);
+      setToMoveServer(snapshot.toMoveServer);
+      setLastMovePlacementsP0(snapshot.lastMovePlacementsP0);
+      setLastMovePlacementsP1(snapshot.lastMovePlacementsP1);
+      setMoveLog(snapshot.moveLog);
+      setSelectedKey(null);
+      setSelectedOrient(null);
+      setPreviewAction(null);
+      setHintTopLeftSet(null);
+      setSolveBreakdown(null);
+      return next;
+    });
+  }, [gameMode, humanPlayer]);
 
   const buySelect = useCallback(
     (off, pieceId) => {
@@ -1202,8 +1314,11 @@ export default function App() {
     if (isTerminal) return;
     if (autoMoveLock.current) return;
     autoMoveLock.current = true;
-    const t = setTimeout(async () => {
+    let cancelled = false;
+    let started = false;
+    const runAutoMove = async () => {
       try {
+        started = true;
         const leg = await fetchLegal();
         if (leg?.terminal) {
           setLegal(leg);
@@ -1218,8 +1333,18 @@ export default function App() {
       } finally {
         autoMoveLock.current = false;
       }
+    };
+    const t = setTimeout(() => {
+      if (cancelled) return;
+      runAutoMove();
     }, 0);
-    return () => clearTimeout(t);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+      // Only release the lock if we never actually started the auto-move.
+      // If runAutoMove is in-flight, it will clear the lock in its own finally block.
+      if (!started) autoMoveLock.current = false;
+    };
   }, [gameStarted, gameState, editMode, busy.thinking, gameMode, toMove, humanPlayer, isTerminal, fetchLegal, applyAction, solveAndPlay, setInfo]);
 
   // AI vs AI autoplay (only after game started)
@@ -1261,10 +1386,16 @@ export default function App() {
       if (ev.key.toLowerCase() === "n") newGame();
       if (ev.key.toLowerCase() === "e") setEditMode((v) => !v);
       if (ev.key.toLowerCase() === "p") passTurn();
+      if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "z") {
+        ev.preventDefault();
+        if (!busy.thinking && !busy.loading && !busy.legal && !busy.nn && history.length > 0) {
+          undoLastAction();
+        }
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [solveAndPlay, fetchLegal, newGame, passTurn, setEditMode]);
+  }, [solveAndPlay, fetchLegal, newGame, passTurn, setEditMode, undoLastAction, busy.thinking, busy.loading, busy.legal, busy.nn, history.length]);
 
   const overlayCellsP0 = useMemo(() => (previewAction?.cells && isHumanTurn && humanPlayer === 0 ? previewAction.cells : null), [previewAction, isHumanTurn, humanPlayer]);
   const overlayCellsP1 = useMemo(() => (previewAction?.cells && isHumanTurn && humanPlayer === 1 ? previewAction.cells : null), [previewAction, isHumanTurn, humanPlayer]);
@@ -1406,11 +1537,23 @@ export default function App() {
             <Button onClick={fetchLegal} disabled={busy.legal || !stateForApi || !gameStarted}>
               {busy.legal ? "Loading…" : "Refresh Legal"}
             </Button>
-            <Button tone="primary" onClick={solveAndPlay} disabled={!gameStarted || busy.thinking || !stateForApi || isTerminal}>
+            <Button
+              tone="primary"
+              onClick={solveAndPlay}
+              disabled={!gameStarted || busy.thinking || !stateForApi || isTerminal || isHumanTurn}
+            >
               {busy.thinking ? "Thinking…" : "AI Move"}
             </Button>
             <Button tone="warn" onClick={passTurn} disabled={!gameStarted || !isHumanTurn || !legal?.pass_allowed || busy.thinking || legal?.mode === "patch"}>
               Pass
+            </Button>
+            <Button
+              tone="neutral"
+              onClick={undoLastAction}
+              disabled={!gameStarted || busy.thinking || busy.loading || busy.legal || busy.nn || history.length === 0}
+              title="Undo last move (human or AI). Does not affect Edit Mode or JSON editor."
+            >
+              Undo
             </Button>
             <label
               style={{
@@ -1653,7 +1796,7 @@ export default function App() {
             <Section title="ENGINE SETTINGS">
               <div style={{ display: "grid", gap: 10 }}>
                 <Field label="NN simulations (for /solve_nn)">
-                  <Input type="number" value={nnSimulations} onChange={(e) => setNnSimulations(parseInt(e.target.value || "3000", 10))} min={50} max={20000} step={10} />
+                  <Input type="number" value={nnSimulations} onChange={(e) => setNnSimulations(parseInt(e.target.value || "2048", 10))} min={50} max={20000} step={10} />
                 </Field>
                 <Field label="Pure MCTS iterations (for /solve)">
                   <Input type="number" value={mctsIterations} onChange={(e) => setMctsIterations(parseInt(e.target.value || "50000", 10))} min={500} max={2000000} step={500} />
@@ -1746,9 +1889,6 @@ export default function App() {
                     </Select>
                   </Field>
                 )}
-                <Field label="Config path">
-                  <Input value={nnConfig} onChange={(e) => setNnConfig(e.target.value)} />
-                </Field>
                 <Field label="Device">
                   <Select value={nnDevice} onChange={(e) => setNnDevice(e.target.value)}>
                     <option value="cuda">cuda</option>

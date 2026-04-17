@@ -8,12 +8,12 @@ Production-grade design for Windows/Linux:
 - Response: (rid, priors_legal, value, mean_points, score_utility) — no 201-dim over IPC.
 
 Protocol (dict payload):
-  encoding_version: "gold_v2_32ch" | "full_clarity_v1"
+  encoding_version: "gold_v2_36ch" | "full_clarity_v1"  (version read from gold_v2_constants.ENCODING_VERSION)
   action_mask: (2026,) float32, legal_idxs: (K,) int32
   score_center_points: float32 (point space, for dynamic score utility)
   effective_static_w, effective_dynamic_w: float32 (DSU-gated weights from worker)
   Legacy (deprecated): spatial-only state
-  Gold v2: x_spatial (32,9,9), x_global (61,), x_track (8,54), shop_ids (33,), shop_feats (33,10)
+  Gold v2: x_spatial (36,9,9), x_global (65,), x_track (8,54), shop_ids (33,), shop_feats (33,10)
 
 Response: (rid, priors_legal, value, mean_points, score_utility) — 5-tuple.
 
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import queue
 import sys
 import time
@@ -36,6 +37,20 @@ import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def _breadcrumb(msg: str, log_path: Optional[str] = None) -> None:
+    """Emit a startup breadcrumb for Windows CUDA crash diagnosis. Flushes stdout."""
+    line = f"[GPU Server] BREADCRUMB: {msg}\n"
+    sys.stdout.write(line)
+    sys.stdout.flush()
+    if log_path:
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line)
+                f.flush()
+        except Exception:
+            pass
 
 
 @dataclass
@@ -63,9 +78,12 @@ class GPUInferenceServer:
     """Single-process GPU inference server that batches requests."""
 
     def __init__(self, config: dict, checkpoint_path: str, device: str = "cuda",
-                 worker_shm_names: Optional[dict] = None, expected_n_slots: Optional[int] = None):
+                 worker_shm_names: Optional[dict] = None, expected_n_slots: Optional[int] = None,
+                 _breadcrumb_log: Optional[str] = None):
         self.config = config
+        _breadcrumb("4_first_cuda_query_begin", _breadcrumb_log)
         self.device = torch.device(device)
+        _breadcrumb("5_first_cuda_query_complete", _breadcrumb_log)
         self._expected_n_slots_for_shm = expected_n_slots
 
         # Settings (safe defaults if config has no "inference" section)
@@ -82,6 +100,7 @@ class GPUInferenceServer:
         _apply_determinism_if_requested(config)
 
         # Model
+        _breadcrumb("6_model_load_begin", _breadcrumb_log)
         from src.network.model import create_network, load_model_checkpoint, get_state_dict_for_inference
 
         self.model = create_network(config).to(self.device)
@@ -109,7 +128,7 @@ class GPUInferenceServer:
 
         self._amp_dtype = torch.float16 if self.settings.amp_dtype.lower() == "float16" else torch.bfloat16
 
-        # Expected encoding from model (use_film => gold_v2_32ch)
+        # Expected encoding from model (use_film => gold_v2_*; version read from constants)
         from src.network.gold_v2_constants import ENCODING_VERSION as _GV2_ENC
         self._expected_encoding = (
             _GV2_ENC if getattr(self.model, "use_film", False) else "full_clarity_v1"
@@ -165,7 +184,7 @@ class GPUInferenceServer:
             enc = self._expected_encoding
             B = min(self.settings.batch_size, 32)  # small but representative batch
 
-            if enc == "gold_v2_32ch":
+            if enc.startswith("gold_v2"):
                 from src.network.gold_v2_constants import C_SPATIAL_ENC, F_GLOBAL, C_TRACK, TRACK_LEN, NMAX, F_SHOP
                 states = torch.zeros((B, C_SPATIAL_ENC, 9, 9), dtype=torch.float32, device=self.device)
                 masks  = torch.ones((B, 2026), dtype=torch.float32, device=self.device)
@@ -282,7 +301,7 @@ class GPUInferenceServer:
                         else:
                             continue
                         if self._expected_encoding != "full_clarity_v1":
-                            self._send_error(resp_qs, {"rid": rid, "wid": wid}, "server expects gold_v2_32ch, got legacy tuple")
+                            self._send_error(resp_qs, {"rid": rid, "wid": wid}, f"server expects {self._expected_encoding}, got legacy tuple")
                             continue
                         mcts_cfg = (self.config.get("selfplay", {}) or {}).get("mcts", {}) or {}
                         parsed.append({
@@ -310,7 +329,7 @@ class GPUInferenceServer:
                 dynamic_w_list = [float(p.get("effective_dynamic_w", default_dynamic_w)) for p in parsed]
                 enc = parsed[0]["encoding_version"]
 
-                if enc == "gold_v2_32ch":
+                if enc.startswith("gold_v2"):
                     # Mixed-batch safe: each request is routed individually.
                     # SHM requests carry {"slot", "wid", "n_legal"} (no arrays).
                     # Pickle requests carry {"x_spatial", "x_global", ...} (full arrays).
@@ -372,7 +391,7 @@ class GPUInferenceServer:
                 masks = torch.from_numpy(masks_np_arr).to(self.device, non_blocking=non_block)
 
                 x_global_t = x_track_t = shop_ids_t = shop_feats_t = None
-                if enc == "gold_v2_32ch":
+                if enc.startswith("gold_v2"):
                     x_global_t = torch.from_numpy(x_global_np).to(self.device, non_blocking=non_block)
                     x_track_t = torch.from_numpy(x_track_np).to(self.device, non_blocking=non_block)
                     shop_ids_t = torch.from_numpy(shop_ids_np).to(self.device, non_blocking=non_block)
@@ -472,12 +491,17 @@ def run_gpu_inference_server(
     import signal
     import sys
 
+    # Breadcrumb 1: child entry (before any other imports/touches in this process)
+    _breadcrumb("1_child_entry")
+    log_path = os.environ.get("GPU_SERVER_BREADCRUMB_LOG")
+
     # Ignore SIGINT — parent process handles CTRL+C via stop_evt.
     try:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
     except (OSError, ValueError):
         pass
 
+    _breadcrumb("2_imports_complete", log_path)
     logging.basicConfig(level=logging.INFO, format='[GPU Server] %(message)s')
     logger = logging.getLogger(__name__)
 
@@ -487,13 +511,18 @@ def run_gpu_inference_server(
         server = GPUInferenceServer(
             config=config, checkpoint_path=checkpoint_path, device=device,
             worker_shm_names=worker_shm_names, expected_n_slots=expected_n_slots,
+            _breadcrumb_log=log_path,
         )
+        _breadcrumb("7_model_load_complete", log_path)
         logger.debug("GPU server initialized successfully, running warmup...")
         sys.stdout.flush()
+        _breadcrumb("8_warmup_begin", log_path)
         server._warmup_inference()
+        _breadcrumb("9_warmup_complete", log_path)
         # Signal ready ONLY after SHM attach + model load + warmup (prevents workers starting before safe).
         if ready_q is not None:
             ready_q.put("ready")
+        _breadcrumb("10_ready_signal_sent", log_path)
         server.serve(req_q=req_q, resp_qs=resp_qs, stop_evt=stop_evt)
     except Exception as e:
         logger.error("GPU server failed: %s", e, exc_info=True)

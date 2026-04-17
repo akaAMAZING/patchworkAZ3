@@ -2,6 +2,8 @@
 
 This folder is a **complete, maximum data package** for an AI (e.g. ChatGPT) to understand and analyze our training. **Omit nothing.** Use the CSVs, config, and code context as the single source of truth.
 
+**No automated evaluation:** We set `evaluation.games_vs_best: 0` and `evaluation.games_vs_pure_mcts: 0` by design. **Evaluation is manual** (head-to-head games, A/B tests with `tools/ab_test_*`, or the GUI). Strength is judged via selfplay stats and the beat-humans metrics (packing quality + search health). See **FULL_METRICS.md** for the full metric set.
+
 ---
 
 ## ⚠️ Stall concern: score loss, ownership loss, ownership accuracy
@@ -20,13 +22,14 @@ All other metrics (policy loss, KL, grad_norm, selfplay stats, etc.) should stil
 
 | File | Description |
 |------|-------------|
-| **config_best.yaml** | **Up-to-date** full config: hardware, data encoding, network, training (optimizer, LR, batch, AMP, **score_loss_weight: 0.1**, **ownership_loss_weight: 0.15**, EMA), selfplay (MCTS, win-first, schedules), replay buffer, evaluation, **all iteration schedules** (LR, temperature, mcts, parallel_leaves, dirichlet, dynamic_score_utility, q_value_weight, cpuct, noise_weight, games, window_iterations). |
-| **training_metrics_per_iteration.csv** | **Iterations 0–70** (71 rows). One row per iteration. **Every metric:** **train_score_loss**, **train_ownership_loss**, **train_ownership_accuracy**, train_policy_loss, train_value_loss, train_total_loss, train_policy_accuracy, train_policy_top5_accuracy, train_value_mse, train_grad_norm, train_policy_entropy, train_kl_divergence, train_step_skip_rate; selfplay_* (num_games, num_positions, avg_game_length, p0_wins, p1_wins, generation_time, games_per_minute, avg_policy_entropy, avg_top1_prob, avg_num_legal, avg_redundancy, unique_positions, avg_root_q); eval_* (when present); applied_* (full flatten of selfplay/training/replay/adaptive_games); iteration_time_s, replay_buffer_*, accepted. |
-| **training_metadata_constants.csv** | Constants not per-iteration: **EMA decay** (0.999), **score_loss_weight** (0.1), **ownership_loss_weight** (0.15), **score_utility_scale** (30.0), **score_target_sigma** (1.5), max_grad_norm. Includes short notes on score/ownership stall. |
-| **CODE_CONTEXT.md** | **Code snippets and optimizations:** score/ownership loss and accuracy (model.get_loss, OwnershipHead), score target building (value_targets tanh, trainer make_gaussian_score_targets), D4 augmentation, FiLM, EMA, prefetch, win-first MCTS, AMP. File map for where to look. Use this to interpret metrics and suggest code-level fixes. |
-| **INPUT_CHANNELS_MARKOV.md** | **Fully Markov input channels in detail:** 56 spatial (32 encoder + 24 legalTL), channel-by-channel layout (occupancy, coords, frontier, valid_7x7, slot×orient shapes, legalTL 3×8), x_global (61), x_track (8×54), shop (33, 10). Source-of-truth constants and how the model uses them. |
+| **FULL_METRICS.md** | **Full metrics reference:** every train, val, iter, selfplay, and buffer metric; **beat-humans** (packing: empty_squares, empty_components, isolated_1x1_holes, p50/p90, abs_diff; search: root_legal_count, root_expanded_count, root_expanded_ratio, p90). Design note: no automated eval (manual evaluation). PW config summary. CSV/JSON layout. Use this for complete understanding. |
+| **config_best.yaml** | **Up-to-date** full config: hardware, data encoding, network, training (optimizer, LR, batch, AMP, **score_loss_weight: 0.1**, **ownership_loss_weight: 0.15**, EMA), selfplay (MCTS, **progressive_widening** enabled: k_root 64, k0 32, k_sqrt_coef 8, win-first, schedules), replay buffer, evaluation (games_vs_* = 0 by design), **all iteration schedules**. |
+| **training_metrics_per_iteration.csv** | One row per iteration. **Every metric** from iteration JSON: train_* (total_loss, policy_loss, value_loss, score_loss, ownership_loss, policy_accuracy, value_mse, grad_norm, policy_entropy, kl_divergence, step_skip_rate, ownership_accuracy, etc.); selfplay_* (num_games, num_positions, avg_game_length, p0_wins, p1_wins, generation_time, games_per_minute, avg_policy_entropy, avg_top1_prob, avg_num_legal, avg_redundancy, unique_positions, avg_root_q, **plus all beat-humans keys** when present: selfplay_avg_final_empty_squares_mean, selfplay_avg_final_empty_components_mean, selfplay_avg_final_isolated_1x1_holes_mean, p50/p90 variants, *_abs_diff, selfplay_avg_root_legal_count, selfplay_avg_root_expanded_count, selfplay_avg_root_expanded_ratio, selfplay_p90_root_*); eval_* (when present); applied_*; iteration_time_s, replay_buffer_*, accepted. **build_training_csv.py** picks up all keys in the JSON. |
+| **training_metadata_constants.csv** | Constants not per-iteration: EMA decay, score/ownership weights, score_utility_scale, score_target_sigma, max_grad_norm; **PW**: k_root, k0, k_sqrt_coef. Short notes on score/ownership stall. |
+| **CODE_CONTEXT.md** | **Code snippets and optimizations:** score/ownership loss and accuracy, score target building, D4, FiLM, EMA, prefetch, win-first MCTS, **progressive widening (PW)**, **beat-humans metrics** (packing_metrics.py, selfplay terminal, integration _compute_stats), **no automated evaluation**. File map. |
+| **INPUT_CHANNELS_MARKOV.md** | **Fully Markov input channels in detail:** 56 spatial (32 encoder + 24 legalTL), channel-by-channel layout, x_global (61), x_track (8×54), shop (33, 10). Source-of-truth constants and how the model uses them. |
 | **README_ANALYSIS_REQUEST.md** | This file. |
-| **build_training_csv.py** | Script to regenerate training_metrics_per_iteration.csv from committed `iteration_XXX.json` (no fixed iter limit). |
+| **build_training_csv.py** | Script to regenerate training_metrics_per_iteration.csv from committed `iteration_XXX.json` (no fixed iter limit; includes all keys in train_metrics and selfplay_stats, including beat-humans). |
 
 ---
 
@@ -51,6 +54,9 @@ All other metrics (policy loss, KL, grad_norm, selfplay stats, etc.) should stil
    Plot **train_score_loss**, **train_ownership_loss**, and **train_ownership_accuracy** over iterations. Do they plateau? Using **CODE_CONTEXT.md**, suggest possible causes (target construction, weights, head capacity, valid_mask, or data) and concrete changes.
 
 3. **Config and schedules:**  
-   Using **config_best.yaml**: Are the iteration schedules and training/selfplay/replay settings reasonable for AlphaZero-style training? Any risks or tweaks (including for score/ownership)?
+   Using **config_best.yaml**: Are the iteration schedules and training/selfplay/replay settings reasonable for AlphaZero-style training? Any risks or tweaks (including for score/ownership)? Note: **progressive widening (PW)** is enabled (k_root 64, k0 32, k_sqrt_coef 8); evaluation is **manual** (no automated eval games).
 
-Base all answers on the provided CSVs, config, and CODE_CONTEXT; do not assume external data. Prefer clear conclusions with short numeric evidence (e.g. loss/accuracy at iter X vs Y, or trend in score_loss / ownership_accuracy).
+4. **Beat-humans metrics (when present in CSV):**  
+   Using **FULL_METRICS.md**: Interpret trends in packing (empty_squares, empty_components, isolated_1x1_holes; p50/p90; abs_diff) and search health (root_legal_count, root_expanded_ratio, p90). Are fragmentation and isolated holes improving? Is expanded_ratio stable? Any asymmetry (abs_diff) spike?
+
+Base all answers on the provided CSVs, config, **FULL_METRICS.md**, and CODE_CONTEXT; do not assume external data. Prefer clear conclusions with short numeric evidence (e.g. loss/accuracy at iter X vs Y, or trend in score_loss / ownership_accuracy / beat-humans metrics).

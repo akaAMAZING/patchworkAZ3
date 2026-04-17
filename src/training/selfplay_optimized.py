@@ -51,20 +51,24 @@ from src.game.patchwork_engine import (
     NEUTRAL,
     BONUS_OWNER,
     P0_BUTTONS,
-    P0_OCC0, P0_OCC1, P0_OCC2,
+    P0_OCC0,
+    P0_OCC1,
+    P0_OCC2,
     P1_BUTTONS,
     P1_OCC0, P1_OCC1, P1_OCC2,
     TIE_PLAYER,
 )
 
 from src.mcts.alphazero_mcts_optimized import create_optimized_mcts, encode_legal_actions_fast, engine_action_to_flat_index
-from src.network.encoder import StateEncoder, ActionEncoder, get_slot_piece_id, encode_state_multimodal
+from src.network.encoder import StateEncoder, ActionEncoder, get_slot_piece_id, encode_state_multimodal, get_state_encoder_for_channels
 from src.network.model import create_network, load_model_checkpoint, get_state_dict_for_inference
 from src.mcts.gpu_eval_client import GPUEvalClient
 from src.network.d4_augmentation import (
     apply_d4_augment, apply_ownership_transform,
     get_d4_transform_tag, get_d4_transform_idx, D4_COUNT,
 )
+from src.utils.packing_metrics import fragmentation_from_occ_words
+from src.training.packer_opponent import PackerOpponent
 from src.training.value_targets import value_and_score_from_scores
 
 
@@ -208,12 +212,14 @@ class OptimizedSelfPlayWorker:
         self.worker_id = worker_id
         self.network_path = network_path
 
-        self.state_encoder = StateEncoder()
+        _in_ch = int((config.get("network", {}) or {}).get("input_channels", 56))
+        self.state_encoder = get_state_encoder_for_channels(_in_ch)
         self.action_encoder = ActionEncoder()
         self._use_multimodal = self._is_gold_v2_config(config)
 
         sp = (config.get("selfplay", {}) or {})
         mcfg = (sp.get("mcts", {}) or {})
+        self.use_patch_tiebreak = bool(sp.get("use_patch_tiebreak", False))
 
         if "augmentation" in sp:
             self.augmentation = str(sp["augmentation"])
@@ -254,6 +260,15 @@ class OptimizedSelfPlayWorker:
         self.pcr_probability = float(pcr.get("fast_probability", 0.25))  # probability of using fast sims
 
         self.base_simulations = int(mcfg.get("simulations", 800))
+
+        # Opponent mix: small fraction of games vs packer (greedy packing heuristic) for diversity
+        om = (sp.get("opponent_mix", {}) or {})
+        self._opponent_mix_enabled = bool(om.get("enabled", False))
+        self._vs_packer_prob = float(om.get("vs_packer_prob", 0.15))
+        self._alternate_sides = bool(om.get("alternate_sides", True))
+        self._store_only_nn_moves = bool(om.get("store_only_nn_moves", True))
+        self._ramp = om.get("ramp") or {}
+        self._packer_opponent = PackerOpponent() if self._opponent_mix_enabled else None
 
         self._rng = random.Random(int(config.get("seed", 42)) + self.worker_id * 1000)
         self.mcts = None
@@ -300,8 +315,8 @@ class OptimizedSelfPlayWorker:
     def _is_gold_v2_config(self, config: dict) -> bool:
         enc = str((config.get("data", {}) or {}).get("encoding_version", ""))
         if enc:
-            return enc.lower() in ("gold_v2_32ch", "gold_v2_multimodal")
-        return int((config.get("network", {}) or {}).get("input_channels", 56)) in (32, 56)
+            return enc.lower().startswith("gold_v2")
+        return int((config.get("network", {}) or {}).get("input_channels", 56)) in (32, 36, 56, 60)
 
     # ----------------------------
     # Utilities for augmentation
@@ -335,6 +350,21 @@ class OptimizedSelfPlayWorker:
 
         return items
 
+    def _get_ramped_vs_packer_prob(self, iteration: int) -> float:
+        """Return vs_packer probability for this iteration (ramp or constant)."""
+        if not self._ramp.get("enabled", False):
+            return self._vs_packer_prob
+        start_i = int(self._ramp.get("start_iter", 0))
+        end_i = int(self._ramp.get("end_iter", start_i + 10))
+        start_p = float(self._ramp.get("start_prob", 0.0))
+        end_p = float(self._ramp.get("end_prob", self._vs_packer_prob))
+        if iteration <= start_i:
+            return start_p
+        if iteration >= end_i:
+            return end_p
+        t = (iteration - start_i) / max(1, end_i - start_i)
+        return start_p + t * (end_p - start_p)
+
     # ----------------------------
     # Main game loop
     # ----------------------------
@@ -363,6 +393,15 @@ class OptimizedSelfPlayWorker:
         # CRITICAL FIX: Pass seed to new_game for deterministic piece circle shuffle
         st = new_game(seed=seed)
 
+        # Opponent mix: decide if this game is NN vs packer
+        is_vs_packer = False
+        packer_side = -1
+        if self._opponent_mix_enabled and self._packer_opponent is not None:
+            p = self._get_ramped_vs_packer_prob(iteration)
+            if self._rng.random() < p:
+                is_vs_packer = True
+                packer_side = (game_idx % 2) if self._alternate_sides else self._rng.randint(0, 1)
+
         states: List[np.ndarray] = []
         masks: List[np.ndarray] = []
         policies: List[np.ndarray] = []
@@ -384,6 +423,12 @@ class OptimizedSelfPlayWorker:
         # Root Q-values per move (for Q-value mixing in value targets)
         move_root_qs: List[float] = []
 
+        # Root search health (legal/expanded per MCTS move for TensorBoard)
+        move_root_legal_counts: List[int] = []
+        move_root_expanded_counts: List[int] = []
+        # Packing ordering: top-1 BUY packing score per move (for observability)
+        move_packing_scores_top1: List[float] = []
+
         # Position redundancy tracking (Oracle Part 2): hash board states
         seen_state_hashes: set = set()
 
@@ -395,8 +440,15 @@ class OptimizedSelfPlayWorker:
             if not legal:
                 break
 
+            # Vs packer: packer side plays greedy move; no MCTS, no store
+            if is_vs_packer and to_move == packer_side:
+                action = self._packer_opponent.get_move(st, seed_offset=move_count)
+                st = apply_action_unchecked(st, action)
+                move_count += 1
+                continue
+
             if self._use_multimodal:
-                x_spatial, x_global, x_track, shop_ids, shop_feats = encode_state_multimodal(st, to_move)
+                x_spatial, x_global, x_track, shop_ids, shop_feats = self.state_encoder.encode_state_multimodal(st, to_move)
                 enc = x_spatial.astype(np.float32, copy=False)
             else:
                 enc = self.state_encoder.encode_state(st, to_move).astype(np.float32, copy=False)
@@ -418,9 +470,19 @@ class OptimizedSelfPlayWorker:
 
                 visit_counts, _, root_q = self.mcts.search(state=st, to_move=to_move, move_number=move_count, add_noise=True, root_legal_actions=legal)
                 move_root_qs.append(root_q)
+                move_root_legal_counts.append(self.mcts.get_root_legal_count())
+                move_root_expanded_counts.append(self.mcts.get_root_expanded_count())
+                ps_top1 = self.mcts.get_root_packing_score_top1()
+                if ps_top1 is not None:
+                    move_packing_scores_top1.append(ps_top1)
                 # ACTION SELECTION: use temperature schedule (greedy after threshold)
                 action_temp = self.temperature if move_count < self.temperature_threshold else 0.0
-                action = self.mcts.select_action(visit_counts, temperature=action_temp, deterministic=(action_temp <= 0))
+                action = self.mcts.select_action(
+                    visit_counts,
+                    temperature=action_temp,
+                    deterministic=(action_temp <= 0),
+                    patch_tiebreak_override=(True if self.use_patch_tiebreak else None),
+                )
                 # POLICY TARGET: visits (normalized counts) or visits_temperature_shaped (legacy)
                 if self.policy_target_mode == "visits":
                     pi = self.action_encoder.create_target_policy(visit_counts, mode="visits")
@@ -599,6 +661,9 @@ class OptimizedSelfPlayWorker:
         _empty0 = empty_count_from_occ(int(st[P0_OCC0]), int(st[P0_OCC1]), int(st[P0_OCC2]))
         _empty1 = empty_count_from_occ(int(st[P1_OCC0]), int(st[P1_OCC1]), int(st[P1_OCC2]))
         _bonus_owner = int(st[BONUS_OWNER])
+        # Packing / quilt quality (beat-humans metrics; same definitions as ab_test tools)
+        comp0, iso0 = fragmentation_from_occ_words(int(st[P0_OCC0]), int(st[P0_OCC1]), int(st[P0_OCC2]))
+        comp1, iso1 = fragmentation_from_occ_words(int(st[P1_OCC0]), int(st[P1_OCC1]), int(st[P1_OCC2]))
         out_audit = {
             "final_buttons_p0": int(st[P0_BUTTONS]),
             "final_buttons_p1": int(st[P1_BUTTONS]),
@@ -639,7 +704,24 @@ class OptimizedSelfPlayWorker:
             "unique_positions": int(len(seen_state_hashes)),
             # Root Q stats
             "avg_root_q": float(np.mean(move_root_qs)) if move_root_qs else 0.0,
+            # Packing / quilt quality (beat-humans metrics)
+            "empty_squares_p0": int(_empty0),
+            "empty_squares_p1": int(_empty1),
+            "empty_components_p0": int(comp0),
+            "empty_components_p1": int(comp1),
+            "isolated_1x1_holes_p0": int(iso0),
+            "isolated_1x1_holes_p1": int(iso1),
+            # Root search health (per MCTS move)
+            "root_legal_counts": list(move_root_legal_counts),
+            "root_expanded_counts": list(move_root_expanded_counts),
+            # Packing ordering top-1 score (observability)
+            "packing_score_top1": float(np.mean(move_packing_scores_top1)) if move_packing_scores_top1 else 0.0,
+            # Opponent mix (vs packer)
+            "vs_packer": is_vs_packer,
         }
+        if is_vs_packer:
+            out["packer_side"] = packer_side
+            out["nn_won"] = int(terminal_winner) == (1 - packer_side)
         if self.store_canonical_only and stored_slot_piece_ids:
             out["slot_piece_ids"] = np.array(stored_slot_piece_ids, dtype=np.int16)  # (N, 3), -1 = empty
         if self._use_multimodal and stored_global_states:
@@ -744,8 +826,8 @@ def init_optimized_worker(
         # Async shard writer is safe: the pending queue is bounded to 8 entries
         # (see play_game_optimized), so peak memory is ~8 × ~7MB = ~56MB regardless
         # of channel count. The old "disable for 56ch" check incorrectly keyed on
-        # input_channels (model trunk = 56) while the actual stored spatial is only
-        # C_SPATIAL_ENC=32 channels, wasting time on synchronous disk I/O.
+        # input_channels (model trunk = 56/60) while the actual stored spatial is only
+        # C_SPATIAL_ENC channels (32 for 32ch encoding, 36 for 36ch encoding), wasting time on synchronous disk I/O.
         if _SHARD_WRITER is None:
             _SHARD_WRITER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="shard_writer")
 
@@ -789,7 +871,8 @@ def init_optimized_worker(
                     n_slots=None, worker_id=worker_id, create=False, name=shm_name,
                     expected_n_slots=expected_n_slots,
                 )
-                _WORKER.mcts._gold_v2_encoder = GoldV2StateEncoder()
+                _enc_ver = str((config.get("data", {}) or {}).get("encoding_version", "")) or None
+                _WORKER.mcts._gold_v2_encoder = GoldV2StateEncoder(_enc_ver)
             except Exception as _shm_err:
                 import logging as _log
                 _log.getLogger(__name__).warning("SHM attach failed for worker %d: %s", worker_id, _shm_err)
@@ -890,6 +973,22 @@ def play_game_optimized(args: Tuple[int, int, Optional[int]]) -> Optional[Dict]:
                 "redundancy": float(data.get("redundancy", 0.0)),
                 "unique_positions": int(data.get("unique_positions", 0)),
                 "avg_root_q": float(data.get("avg_root_q", 0.0)),
+                # Packing / quilt quality (beat-humans metrics)
+                "empty_squares_p0": int(data.get("empty_squares_p0", 0)),
+                "empty_squares_p1": int(data.get("empty_squares_p1", 0)),
+                "empty_components_p0": int(data.get("empty_components_p0", 0)),
+                "empty_components_p1": int(data.get("empty_components_p1", 0)),
+                "isolated_1x1_holes_p0": int(data.get("isolated_1x1_holes_p0", 0)),
+                "isolated_1x1_holes_p1": int(data.get("isolated_1x1_holes_p1", 0)),
+                # Root search health
+                "root_legal_counts": list(data.get("root_legal_counts", [])),
+                "root_expanded_counts": list(data.get("root_expanded_counts", [])),
+                # Packing ordering top-1 score
+                "packing_score_top1": float(data.get("packing_score_top1", 0.0)),
+                # Opponent mix (vs packer)
+                "vs_packer": bool(data.get("vs_packer", False)),
+                "packer_side": int(data.get("packer_side", -1)),
+                "nn_won": bool(data.get("nn_won", False)),
             }
 
         # Legacy: return full game data.

@@ -507,13 +507,12 @@ class PatchworkNetwork(nn.Module):
         self.film_track_use_conv = film_track_use_conv
         self.film_global_inject_dim = film_global_inject_dim
 
-        # GPU legality module: computes legalTL (channels 32-55) and num_legal
-        # (shop_feats[:,8:10]) on the GPU, replacing heavy CPU encoder loops.
-        # Encoder now outputs 32-ch states; _apply_gpu_legality auto-detects 32ch
-        # input (new data) and cats legalTL to produce the 56ch trunk input.
-        # Also works with legacy 56ch states (overwrites channels 32-55).
+        # GPU legality module: computes legalTL and num_legal on the GPU.
+        # Encoder outputs 36ch (gold_v2_36ch) or 32ch (gold_v2_32ch legacy) states.
+        # _apply_gpu_legality auto-detects new (32/36ch) vs legacy (56/60ch) states.
+        # New: 36ch + 24 legalTL → 60ch trunk. Legacy: overwrites last-24 channels.
         self.det_legality: Optional[DeterministicLegalityModule] = None
-        if use_gpu_legality and input_channels == 56:
+        if use_gpu_legality and input_channels in (56, 60):
             try:
                 masks_np, areas_np = _build_piece_masks_5x5()
                 self.det_legality = DeterministicLegalityModule(masks_np, areas_np)
@@ -714,19 +713,20 @@ class PatchworkNetwork(nn.Module):
         Run DeterministicLegalityModule to compute legalTL and update shop_feats.
 
         Accepts two state formats:
-          - (B, 32, 9, 9): new encoder output (channels 0-31 only).  Computes
-            legalTL_24 and concatenates → (B, 56, 9, 9) for the trunk.
-          - (B, 56, 9, 9): legacy / augmented states.  Overwrites channels 32-55
-            with correct GPU values (fixes latent D4 bug where legalTL was not
-            spatially transformed).
+          - (B, 36, 9, 9): gold_v2_36ch new encoder output (channels 0-35 only).
+            Concatenates legalTL_24 → (B, 60, 9, 9) for the trunk.
+          - (B, 32, 9, 9): gold_v2_32ch legacy encoder output.
+            Concatenates legalTL_24 → (B, 56, 9, 9) for the trunk.
+          - (B, 60, 9, 9) or (B, 56, 9, 9): already-full trunk states.
+            Overwrites the last 24 channels with fresh GPU values.
 
-        Returns: (state_56ch, shop_feats_with_num_legal)
+        Returns: (state_trunk_ch, shop_feats_with_num_legal)
         """
         if self.det_legality is None or shop_ids is None or shop_feats is None:
             return state, shop_feats
 
         B = state.shape[0]
-        n_ch = state.shape[1]  # 32 (new) or 56 (legacy)
+        n_ch = state.shape[1]  # 36 (new 36ch) / 32 (legacy 32ch) / 60 or 56 (full trunk)
 
         # board_free: 1 = empty cell, 0 = occupied.  Channel 0 = current player.
         cur_free = (1.0 - state[:, 0:1, :, :]).float()  # (B, 1, 9, 9)
@@ -738,17 +738,17 @@ class PatchworkNetwork(nn.Module):
         legal_cur = legal_both[:B]                            # (B, 264, 9, 9)
         legal_opp = legal_both[B:]                            # (B, 264, 9, 9)
 
-        # --- legalTL for visible slots → channels 32-55 ---
+        # --- legalTL for visible slots → appended as last 24 channels ---
         vis_ids = shop_ids[:, :3].long()          # (B, 3)
         afford_vis = shop_feats[:, :3, 6].float() # (B, 3) -- slot affordability flag
         legalTL_24 = self.det_legality.extract_vis_legalTL(legal_cur, vis_ids, afford_vis)
 
-        if n_ch == 32:
-            # New path: cat 32 encoded channels + 24 GPU channels → 56 for trunk
-            state = torch.cat([state, legalTL_24], dim=1)  # (B, 56, 9, 9)
+        if n_ch in (32, 36):
+            # New path: cat encoded channels + 24 GPU legalTL → full trunk
+            state = torch.cat([state, legalTL_24], dim=1)  # (B, 56 or 60, 9, 9)
         else:
-            # Legacy path: overwrite channels 32-55 (zero-alloc cat reuses first 32)
-            state = torch.cat([state[:, :32], legalTL_24], dim=1)  # (B, 56, 9, 9)
+            # Legacy path: state already has full trunk channels; overwrite legalTL portion
+            state = torch.cat([state[:, :n_ch - 24], legalTL_24], dim=1)  # (B, same n_ch)
 
         # --- num_legal for all 33 shop pieces (features 8 and 9) ---
         shop_ids_long = shop_ids.long()
@@ -774,7 +774,7 @@ class PatchworkNetwork(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass returning (policy_logits, value, score).
 
-        state: x_spatial (B,56,9,9) for gold_v2
+        state: x_spatial (B, C_SPATIAL_ENC, 9, 9) for gold_v2 (36ch new / 32ch legacy)
         x_global, x_track, shop_ids, shop_feats: optional multimodal inputs for FiLM
         """
         state, shop_feats = self._apply_gpu_legality(state, shop_ids, shop_feats)
@@ -825,6 +825,7 @@ class PatchworkNetwork(nn.Module):
         target_ownership: Optional[torch.Tensor] = None,
         ownership_weight: float = 0.0,
         ownership_valid_mask: Optional[torch.Tensor] = None,
+        ownership_pos_weight: float = 1.0,
         x_global: Optional[torch.Tensor] = None,
         x_track: Optional[torch.Tensor] = None,
         shop_ids: Optional[torch.Tensor] = None,
@@ -873,7 +874,8 @@ class PatchworkNetwork(nn.Module):
                 raise RuntimeError("policy_loss is NaN - check masks/logits/targets")
             policy_loss = torch.tensor(0.0, device=policy_loss.device)  # Inference: skip
 
-        # Value loss (MSE)
+        # Value loss (MSE on pure binary target: +1/-1/0)
+        # Value head predicts P(win) via tanh; score head independently handles margin.
         value_loss = F.mse_loss(value, target_value)
 
         # Score loss: distributional CE over 201 bins (soft target from replay score_margins).
@@ -889,6 +891,10 @@ class PatchworkNetwork(nn.Module):
                 pass
 
         # Ownership loss (auxiliary, KataGo-style adapted for dual-board)
+        # ownership_pos_weight > 1: upweights empty cells (target=0) to fix class imbalance.
+        # ~83% of cells are filled at game end; without weighting, the model learns to predict
+        # "all filled" (empty-cell recall ~30%). Formula: cell_weight = 1 + (w-1)*(1-target),
+        # so empty cells (target=0) get weight=w, filled cells (target=1) get weight=1.
         ownership_loss = torch.tensor(0.0, device=state.device)
         ownership_logits = None
         if (
@@ -902,14 +908,28 @@ class PatchworkNetwork(nn.Module):
                 valid_logits = ownership_logits[ownership_valid_mask]
                 valid_targets = target_ownership[ownership_valid_mask]
                 if valid_logits.shape[0] > 0:
-                    ownership_loss = F.binary_cross_entropy_with_logits(
-                        valid_logits, valid_targets
-                    )
+                    if ownership_pos_weight != 1.0:
+                        per_cell = F.binary_cross_entropy_with_logits(
+                            valid_logits, valid_targets, reduction='none'
+                        )
+                        cell_w = 1.0 + (ownership_pos_weight - 1.0) * (1.0 - valid_targets)
+                        ownership_loss = (per_cell * cell_w).mean()
+                    else:
+                        ownership_loss = F.binary_cross_entropy_with_logits(
+                            valid_logits, valid_targets
+                        )
             else:
                 # All samples valid (or no mask) — standard path
-                ownership_loss = F.binary_cross_entropy_with_logits(
-                    ownership_logits, target_ownership
-                )
+                if ownership_pos_weight != 1.0:
+                    per_cell = F.binary_cross_entropy_with_logits(
+                        ownership_logits, target_ownership, reduction='none'
+                    )
+                    cell_w = 1.0 + (ownership_pos_weight - 1.0) * (1.0 - target_ownership)
+                    ownership_loss = (per_cell * cell_w).mean()
+                else:
+                    ownership_loss = F.binary_cross_entropy_with_logits(
+                        ownership_logits, target_ownership
+                    )
 
         total_loss = (
             policy_weight * policy_loss
@@ -1106,7 +1126,7 @@ def load_model_checkpoint(
         old_in = old_w.shape[1]
         new_in = new_w.shape[1]
         if old_in != new_in:
-            if old_in in (14, 16) and new_in in (56, 61):
+            if old_in in (14, 16) and new_in in (56, 60, 61):
                 widened = torch.zeros(new_w.shape, dtype=old_w.dtype, device=old_w.device)
                 widened[:, :old_in, :, :] = old_w
                 state_dict["conv_input.weight"] = widened

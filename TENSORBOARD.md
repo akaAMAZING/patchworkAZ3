@@ -832,10 +832,219 @@ Usually selfplay: `avg_redundancy` up + `unique_positions` down, followed closel
 `iter/kl_divergence`, `iter/policy_entropy`, `iter/target_entropy`, `iter/policy_cross_entropy`, `iter/value_mse`, `iter/step_skip_rate`, `iter/approx_identity_check`
 
 **Selfplay:**  
-`selfplay/games_per_min`, `selfplay/num_positions`, `selfplay/num_games`, `selfplay/avg_game_length`, `selfplay/unique_positions`, `selfplay/avg_redundancy`, `selfplay/avg_policy_entropy`, `selfplay/avg_top1_prob`, `selfplay/avg_num_legal`, `selfplay/avg_root_q`, `selfplay/generation_time`
+`selfplay/games_per_min`, `selfplay/num_positions`, `selfplay/num_games`, `selfplay/avg_game_length`, `selfplay/unique_positions`, `selfplay/avg_redundancy`, `selfplay/avg_policy_entropy`, `selfplay/avg_top1_prob`, `selfplay/avg_num_legal`, `selfplay/avg_root_q`, `selfplay/generation_time`, plus beat-humans metrics below (`selfplay/selfplay_avg_final_*`, `selfplay/selfplay_p50_*`, `selfplay/selfplay_avg_final_*_abs_diff`, `selfplay/selfplay_avg_root_*`, `selfplay/selfplay_p90_root_*`)
 
 **Buffer:**  
 `buffer/total_positions`, `buffer/num_iterations`
+
+---
+
+# 9) BEAT-HUMANS METRICS (selfplay)
+
+Low-noise observability that correlates with **human strength**: packing quality (terminal quilts) and search health (PW tractability). Computed at game end for both players; definitions match `tools/ab_test_*` and `src/utils/packing_metrics.py`. Logged under `selfplay/<key>` each iteration; also in committed iteration JSON and `metadata.jsonl`. No per-player P0/P1 series—aggregates and asymmetry only.
+
+---
+
+## `selfplay/selfplay_avg_final_empty_components_mean`
+
+**Definition:** Average number of separate empty regions (connected components of empty cells, 4-neighbor BFS) over all players and games at terminal state.
+
+**Represents:** Fragmentation of final quilts; humans punish fragmentation more than raw empties.
+
+**Target behavior / ranges:**
+
+- Downward trend over iterations (even if slowly).
+- Plateaus are okay if isolated holes are still dropping.
+
+**Red flags:**
+
+- It rises while win rate vs self stays fine → drifting back into "button meta."
+
+**Actions:**
+
+- Tighten PW slightly (reduce expanded ratio), or increase sims for play/eval, or add/strengthen packer-style opponents later.
+
+**Cross-check:** If components rise, check `selfplay_avg_final_isolated_1x1_holes_mean` and `selfplay_avg_final_empty_squares_mean`; focus on components/isolated over raw empties.
+
+---
+
+## `selfplay/selfplay_p50_final_empty_components_mean`
+
+**Definition:** Median (50th percentile) of per-game mean empty components (mean across the two players in each game).
+
+**Represents:** Typical-game fragmentation level.
+
+**Target behavior:** Should trend down with the mean; gap between p50 and p90 is a tail-risk indicator.
+
+---
+
+## `selfplay/selfplay_p90_final_empty_components_mean`
+
+**Definition:** 90th percentile of per-game mean empty components ("worst 10% games" fragmentation).
+
+**Represents:** Tail risk—those games that lose to humans with messy quilts.
+
+**Target behavior:**
+
+- Should drop more clearly than the mean over time.
+- Ideally the gap between p90 and mean shrinks.
+
+**Red flags:**
+
+- Mean improves but p90 doesn't → still producing occasional catastrophic quilts.
+
+**Actions:** Don't change DSU; adjust PW (looser/tighter) or later add a stronger human proxy.
+
+---
+
+## `selfplay/selfplay_avg_final_isolated_1x1_holes_mean`
+
+**Definition:** Average count of 1×1 empty cavities with **zero** empty neighbors (4-neighbor) at terminal state, over all players and games.
+
+**Represents:** Dead squares that are almost always unfillable late game; strong signal of packing mistakes.
+
+**Target behavior:**
+
+- Downward trend; one of the fastest indicators that packing is becoming human-like.
+
+**Red flags:**
+
+- Stays high even when empties drop → improving fill but still creating "traps."
+
+**Actions:** Later, feasibility-aware ordering helps; first see what training does with PW.
+
+---
+
+## `selfplay/selfplay_p50_final_isolated_1x1_holes_mean`
+
+**Definition:** Median of per-game mean isolated 1×1 holes.
+
+**Represents:** Typical-game isolated-hole count.
+
+---
+
+## `selfplay/selfplay_p90_final_isolated_1x1_holes_mean`
+
+**Definition:** 90th percentile of per-game mean isolated 1×1 holes.
+
+**Represents:** "Catastrophe rate" gauge—worst 10% tail of isolated holes.
+
+**Target behavior:** Strong downtrend.
+
+**Red flags:**
+
+- Flat p90 while mean improves → occasional blow-ups still exist.
+
+**Actions:** Aim for stability; let PW-trained policy mature without adding new knobs.
+
+---
+
+## `selfplay/selfplay_avg_final_empty_squares_mean`
+
+**Definition:** Average number of empty squares at terminal state over all players and games.
+
+**Represents:** Sanity check; correlates with score but not as strongly with human losses as fragmentation.
+
+**Target behavior:** Gentle downtrend. If this drops but components/isolated don't, you may be filling but still badly fragmented.
+
+**Red flags:**
+
+- Empties improve but fragmentation worsens → "filled more, but packed worse."
+
+**Actions:** Focus on components/isolated; empties alone can be misleading.
+
+---
+
+## `selfplay/selfplay_p50_final_empty_squares_mean` / `selfplay/selfplay_p90_final_empty_squares_mean`
+
+**Definition:** Median and 90th percentile of per-game mean empty squares.
+
+**Represents:** Distribution and tail of raw empty count; p90 is tail risk.
+
+**Target behavior:** Same interpretation as other p50/p90 metrics—p90 should improve to reduce catastrophe rate.
+
+---
+
+## `selfplay/selfplay_avg_final_empty_squares_abs_diff` / `selfplay/selfplay_avg_final_empty_components_abs_diff` / `selfplay/selfplay_avg_final_isolated_1x1_holes_abs_diff`
+
+**Definition:** Mean over games of |P0 − P1| for that metric (empties, components, isolated holes).
+
+**Represents:** Asymmetry—detects systematic bias (one side consistently packs worse). Can indicate exploitable bias, first-player advantage, or consistent planning failure.
+
+**Target behavior:** Generally flat or decreasing.
+
+**Red flags:**
+
+- Sudden increase → policy/search may be skewing one side's packing decisions.
+
+**Actions:** Check whether one player (P0/P1) is consistently worse; if yes, log per-player temporarily to diagnose.
+
+---
+
+## `selfplay/selfplay_avg_root_expanded_ratio`
+
+**Definition:** Mean of (expanded_children / max(legal_actions, 1)) per model move when MCTS runs. PW limits how many root children are expanded.
+
+**Represents:** Search depth vs breadth dial—how much of the legal action space is actually considered at root.
+
+**Target behavior:**
+
+- Stable ratio after PW is introduced.
+- If legal rises over time, expanded shouldn't rise proportionally; PW should keep ratio bounded.
+
+**Red flags:**
+
+- **Too high:** Ratio creeping upward → drifting toward "old wide search," shallow again.
+- **Too low:** Extremely low ratio → over-pruning, risk of missing tactics (could hurt win rate).
+
+**Actions:**
+
+- If too high → reduce k_root or k_sqrt_coef.
+- If too low and win rate drops → increase k_root a bit.
+
+**Cross-check:** Rule of thumb—enough breadth that win rate doesn't drop, tight enough to deepen search and reduce fragmentation.
+
+---
+
+## `selfplay/selfplay_avg_root_legal_count`
+
+**Definition:** Average number of legal actions at root, over all model moves in selfplay.
+
+**Represents:** Context for expanded ratio; reflects board/shop state distribution (you don't control it directly).
+
+**Target behavior:** Stable or decreasing as packing improves (tighter quilts → fewer placements). If it trends upward a lot, positions are more open / more empty space → consistent with button meta.
+
+**Cross-check:** If legal↑ and fragmentation↑, you're not packing tight.
+
+---
+
+## `selfplay/selfplay_avg_root_expanded_count`
+
+**Definition:** Average number of root children expanded (PW-limited) per model move.
+
+**Represents:** Raw breadth of search; use with legal count to interpret ratio.
+
+---
+
+## `selfplay/selfplay_p90_root_legal_count` / `selfplay/selfplay_p90_root_expanded_ratio`
+
+**Definition:** 90th percentile of root legal count and of expanded ratio across all model moves.
+
+**Represents:** Tail positions where legal count or expansion ratio is highest; watch for spikes that indicate very wide or very narrow search in some positions.
+
+---
+
+### Healthy training picture (beat-humans)
+
+Over ~5–20 iterations with PW you want:
+
+- `selfplay_avg_final_empty_components_mean` slowly ↓  
+- `selfplay_p90_final_empty_components_mean` ↓ more noticeably  
+- `selfplay_avg_final_isolated_1x1_holes_mean` ↓  
+- `selfplay_p90_final_isolated_1x1_holes_mean` ↓ (catastrophe killer)  
+- `selfplay_avg_final_empty_squares_mean` ↓ slightly (or flat early, then ↓)  
+- `selfplay_avg_root_expanded_ratio` stable  
+- `selfplay_avg_root_legal_count` stable or ↓ (often decreases if packing improves)
 
 ---
 

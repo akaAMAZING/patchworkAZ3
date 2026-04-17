@@ -122,8 +122,8 @@ def test_legalTL_matches_action_mask_buy():
         xs, _, _, shop_ids, shop_feats = encode_state_multimodal(st, to_move)
         _, mask = encode_legal_actions_fast(legal)
 
-        # Encoder produces 32ch; legalTL (was channels 32-55) is now computed exclusively on GPU.
-        assert xs.shape == (C_SPATIAL_ENC, 9, 9), "encoder must output 32ch (gold_v2_32ch)"
+        # Encoder produces C_SPATIAL_ENC ch (36 for gold_v2_36ch); legalTL is computed exclusively on GPU.
+        assert xs.shape == (C_SPATIAL_ENC, 9, 9), f"encoder must output {C_SPATIAL_ENC}ch (gold_v2_36ch)"
 
         # GPU module: current player's free cells -> legalTL for all 264 (pid, orient) pairs.
         board_free = torch.from_numpy((1.0 - xs[0:1]).astype(np.float32)).unsqueeze(0)  # (1,1,9,9)
