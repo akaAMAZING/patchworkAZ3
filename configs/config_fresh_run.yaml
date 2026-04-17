@@ -1,11 +1,14 @@
-# PATCHWORK ALPHAZERO — FRESH RUN v2 (gold_v2_36ch, fallback safer version)
+# PATCHWORK ALPHAZERO — FRESH RUN v2 (gold_v2_36ch, KataGo-aligned architecture)
 # ============================================================================
 # Hardware: RTX 3080 (10GB) / Ryzen 5900X (12 cores / 24 threads) / 16GB RAM
 # Goal: Maximum playing strength — dominating, packing-aware, conversion-strong
 # Strategy:
 #   - gold_v2_36ch encoding: adds isolated-hole and constrained-empty planes (ch 32-35)
 #     for both players, directly exposing packing quality to the network
-#   - blended value target: 0.70*binary + 0.30*tanh(margin/30) — teaches dominance
+#   - clean value/score separation: value head → pure binary P(win), score head → margin
+#     (no blended target — each head has one job, combination in search only)
+#   - hierarchical policy: type(3)→slot(3)→orient(8)→position(81) factorization
+#     (each level is a small softmax — faster convergence than flat 2026-way)
 #   - stronger score head (weight 0.25) and DSU (peak 0.25) for margin optimization
 #   - ownership pos_weight=6.0 fixes empty-cell recall (~30% → target >60%)
 #   - k_sqrt_coef=3 (was 8): PW now meaningfully prunes root BUY at ~320 sims
@@ -47,7 +50,8 @@ network:
   channels: 128
   policy_channels: 48
   policy_hidden: 512
-  use_factorized_policy_head: true
+  use_factorized_policy_head: true    # ignored when use_hierarchical_policy is true
+  use_hierarchical_policy: true       # factored type→slot→orient→pos decomposition
   value_channels: 48
   value_hidden: 512
   max_actions: 2026
@@ -85,7 +89,7 @@ training:
   amp_dtype: bfloat16
   policy_loss_weight: 1.0
   value_loss_weight: 1.0
-  score_loss_weight: 0.25       # raised from 0.20: stronger gradient toward margin/score learning
+  score_loss_weight: 0.30       # sole margin signal now (value head is pure P(win), no blended margin)
   ownership_loss_weight: 0.15
   ownership_pos_weight: 6.0     # raised from 4.0: upweights empty cells 6× to fix recall (~30% → target >60%)
   epochs_per_iteration: 2       # NOTE: raise to 3 at iter 300
@@ -359,13 +363,13 @@ iteration:
   - iteration: 10
     dynamic_score_utility_weight: 0.05
   - iteration: 25
-    dynamic_score_utility_weight: 0.10
+    dynamic_score_utility_weight: 0.12
   - iteration: 40
-    dynamic_score_utility_weight: 0.15
+    dynamic_score_utility_weight: 0.20
   - iteration: 60
-    dynamic_score_utility_weight: 0.25  # peak: pushes search to maximize margin when winning
+    dynamic_score_utility_weight: 0.35  # sole margin signal in search (value head is pure P(win))
   - iteration: 500
-    dynamic_score_utility_weight: 0.25
+    dynamic_score_utility_weight: 0.35
 
   q_value_weight_schedule:
   - iteration: 0

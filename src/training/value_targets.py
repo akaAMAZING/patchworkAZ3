@@ -2,8 +2,9 @@
 Shared terminal value utilities for self-play and MCTS.
 
 KataGo Clean Dual-Head Architecture:
-  Value head:  pure binary outcome: +1.0 / -1.0 / 0.0
+  Value head:  pure binary outcome: +1.0 / -1.0
                Predicts P(win) — one job, no objective conflict.
+               No draws in Patchwork (tied scores resolved by TIE_PLAYER).
   Score head:  tanh-normalised margin  tanh(margin / 30.0)  in (-1, 1)
                Predicts score margin — independently, via 201-bin distribution.
 
@@ -35,15 +36,18 @@ def terminal_value_from_scores(
     """Binary terminal value from ``to_move``'s perspective.
 
     Returns:
-        +1.0 if to_move won, -1.0 if to_move lost, 0.0 on exact tie.
+        +1.0 if to_move won, -1.0 if to_move lost.
+
+    Patchwork has NO draws: tied scores are resolved by the TIE_PLAYER
+    tiebreaker (the player who most recently reached or passed the opponent
+    on the time track).  The ``winner`` argument is already resolved by
+    the game engine, so we use it directly.
 
     CRITICAL: This function must be called identically in:
       - selfplay_optimized.py  (labeling training data via value_and_score_from_scores)
       - alphazero_mcts_optimized.py  (MCTS terminal backup)
     Any divergence will cause the value head to learn inconsistent targets.
     """
-    if int(score0) == int(score1):
-        return 0.0
     return 1.0 if int(winner) == int(to_move) else -1.0
 
 
@@ -58,9 +62,10 @@ def value_and_score_from_scores(
 ) -> tuple[float, float]:
     """Return ``(value, score_margin)`` for a terminal state.
 
-    value:         pure binary outcome: +1.0 / -1.0 / 0.0
+    value:         pure binary outcome: +1.0 / -1.0
                    The value head's sole job is predicting P(win).
                    No blending with margin — that's the score head's job.
+                   No 0.0 — Patchwork always has a winner (tiebreak on equal scores).
     score_margin:  tanh-normalised margin, tanh((to_move_score - opp_score) / 30.0)
                    in the range (-1, 1).
 

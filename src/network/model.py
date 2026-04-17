@@ -316,6 +316,146 @@ class StructuredConvPolicyHead(nn.Module):
         return logits
 
 
+class HierarchicalPolicyHead(nn.Module):
+    """Hierarchical factored policy head for Patchwork.
+
+    Decomposes the flat 2026-action space into a probability hierarchy:
+      Level 1: Type       — P(PASS), P(PATCH), P(BUY)           (3-way softmax)
+      Level 2a: Patch pos — P(pos | PATCH)                      (81-way spatial)
+      Level 2b: Buy slot  — P(slot | BUY)                       (3-way)
+      Level 3: Buy orient — P(orient | slot, BUY)               (8-way per slot)
+      Level 4: Buy pos    — P(pos | slot, orient, BUY)          (81-way spatial)
+
+    Joint: P(buy, s, o, p) = P(BUY) × P(s|BUY) × P(o|s) × P(p|s,o)
+
+    Returns (B, 2026) log-probabilities.  Since log_softmax is idempotent on
+    already-normalized log-probs, downstream code that applies log_softmax()
+    or softmax() produces correct results without any interface change.
+
+    Key benefit: each softmax operates over a small set (3/8/81-way) instead
+    of one 2026-way.  Learning "slot 0 is best" adjusts 1 logit in a 3-way
+    softmax rather than pushing 648 logits in a 2026-way softmax.
+    """
+
+    def __init__(
+        self,
+        input_channels: int,
+        policy_hidden: int = 48,
+        use_batch_norm: bool = True,
+        global_inject_dim: int = 0,
+    ):
+        super().__init__()
+        # Shared spatial backbone
+        self.p_conv = nn.Conv2d(input_channels, policy_hidden, 1, bias=not use_batch_norm)
+        self.p_bn = nn.BatchNorm2d(policy_hidden) if use_batch_norm else nn.Identity()
+
+        self.global_inject_dim = global_inject_dim
+        g_dim = policy_hidden + global_inject_dim
+
+        # Level 1: type selection (PASS / PATCH / BUY)
+        self.type_linear = nn.Linear(g_dim, 3)
+
+        # Level 2a: patch position (81-way spatial)
+        self.patch_conv = nn.Conv2d(policy_hidden, 1, 1)
+
+        # Level 2b: buy slot (3-way from scalar features)
+        self.slot_linear = nn.Linear(g_dim, NUM_SLOTS)
+
+        # Level 3: buy orient per slot (3 × 8 = 24 outputs)
+        self.orient_linear = nn.Linear(g_dim, NUM_SLOTS * NUM_ORIENTS)
+
+        # Level 4: buy position per (slot, orient) — 24 spatial maps
+        self.pos_conv = nn.Conv2d(policy_hidden, NUM_SLOTS * NUM_ORIENTS, 1)
+
+        # Global biases (same role as StructuredConvPolicyHead)
+        self.g_to_pos_bias: Optional[nn.Linear] = None
+        self.g_to_patch_bias: Optional[nn.Linear] = None
+        if global_inject_dim > 0:
+            self.g_to_pos_bias = nn.Linear(global_inject_dim, NUM_SLOTS * NUM_ORIENTS)
+            self.g_to_patch_bias = nn.Linear(global_inject_dim, 1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+        g: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Returns (B, 2026) log-probabilities with level-wise masking."""
+        B = x.shape[0]
+
+        # --- Shared features ---
+        p = F.relu(self.p_bn(self.p_conv(x)), inplace=True)  # (B, H, 9, 9)
+        p_mean = p.mean(dim=(2, 3))  # (B, H)
+        if g is not None and self.global_inject_dim > 0:
+            scalar_in = torch.cat([p_mean, g], dim=1)
+        else:
+            scalar_in = p_mean
+
+        # --- Derive level-wise masks from flat action mask ---
+        if action_mask is not None:
+            patch_mask = action_mask[:, PATCH_START:PATCH_START + PATCH_SIZE]        # (B, 81)
+            buy_mask = action_mask[:, BUY_START:BUY_START + BUY_SIZE]               # (B, 1944)
+            buy_4d = buy_mask.view(B, NUM_SLOTS, NUM_ORIENTS, PATCH_SIZE)           # (B, 3, 8, 81)
+            type_mask = torch.stack([
+                action_mask[:, PASS_INDEX] > 0,
+                patch_mask.any(dim=-1),
+                buy_mask.any(dim=-1),
+            ], dim=-1)                                                               # (B, 3) bool
+            slot_mask = buy_4d.any(dim=-1).any(dim=-1)                               # (B, 3)
+            orient_mask = buy_4d.any(dim=-1)                                         # (B, 3, 8)
+            pos_mask = buy_4d                                                        # (B, 3, 8, 81)
+        else:
+            type_mask = slot_mask = orient_mask = pos_mask = patch_mask = None
+
+        _NEG = -1e9  # mask fill value (finite to avoid NaN in log_softmax)
+
+        # === Level 1: Type ===
+        type_logits = self.type_linear(scalar_in)                       # (B, 3)
+        if type_mask is not None:
+            type_logits = type_logits.masked_fill(~type_mask, _NEG)
+        type_lp = F.log_softmax(type_logits, dim=-1).clamp(min=-100.0) # (B, 3)
+
+        # === Level 2a: Patch position ===
+        patch_logits = self.patch_conv(p).view(B, PATCH_SIZE)           # (B, 81)
+        if g is not None and self.g_to_patch_bias is not None:
+            patch_logits = patch_logits + self.g_to_patch_bias(g)
+        if patch_mask is not None:
+            patch_logits = patch_logits.masked_fill(patch_mask < 0.5, _NEG)
+        patch_lp = F.log_softmax(patch_logits, dim=-1).clamp(min=-100.0)  # (B, 81)
+
+        # === Level 2b: Buy slot ===
+        slot_logits = self.slot_linear(scalar_in)                       # (B, 3)
+        if slot_mask is not None:
+            slot_logits = slot_logits.masked_fill(~slot_mask, _NEG)
+        slot_lp = F.log_softmax(slot_logits, dim=-1).clamp(min=-100.0) # (B, 3)
+
+        # === Level 3: Buy orient (per slot) ===
+        orient_logits = self.orient_linear(scalar_in).view(B, NUM_SLOTS, NUM_ORIENTS)
+        if orient_mask is not None:
+            orient_logits = orient_logits.masked_fill(~orient_mask, _NEG)
+        orient_lp = F.log_softmax(orient_logits, dim=-1).clamp(min=-100.0)  # (B, 3, 8)
+
+        # === Level 4: Buy position (spatial per slot×orient) ===
+        pos_logits = self.pos_conv(p).view(B, NUM_SLOTS, NUM_ORIENTS, PATCH_SIZE)
+        if g is not None and self.g_to_pos_bias is not None:
+            pos_logits = pos_logits + self.g_to_pos_bias(g).view(B, NUM_SLOTS, NUM_ORIENTS, 1)
+        if pos_mask is not None:
+            pos_logits = pos_logits.masked_fill(pos_mask < 0.5, _NEG)
+        pos_lp = F.log_softmax(pos_logits, dim=-1).clamp(min=-100.0)  # (B, 3, 8, 81)
+
+        # === Compose joint log-probabilities ===
+        pass_lp = type_lp[:, 0:1]                                      # (B, 1)
+        patch_joint = type_lp[:, 1:2] + patch_lp                       # (B, 81)
+        buy_joint = (
+            type_lp[:, 2:3].unsqueeze(-1).unsqueeze(-1)                # (B, 1, 1, 1)
+            + slot_lp.unsqueeze(-1).unsqueeze(-1)                      # (B, 3, 1, 1)
+            + orient_lp.unsqueeze(-1)                                  # (B, 3, 8, 1)
+            + pos_lp                                                   # (B, 3, 8, 81)
+        ).reshape(B, BUY_SIZE)                                         # (B, 1944)
+
+        return torch.cat([pass_lp, patch_joint, buy_joint], dim=1)     # (B, 2026)
+
+
 class PolicyHead(nn.Module):
     """Legacy policy head: single fc or factorized fc1+fc2.
 
@@ -491,6 +631,7 @@ class PatchworkNetwork(nn.Module):
         use_gpu_legality: bool = True,
         film_track_use_conv: bool = False,
         film_global_inject_dim: int = 0,
+        use_hierarchical_policy: bool = False,
     ):
         super().__init__()
         self.input_channels = input_channels
@@ -577,7 +718,13 @@ class PatchworkNetwork(nn.Module):
                 raise ValueError("use_film=true requires film_global_dim>0 or film_input_plane_indices")
 
         self._use_structured_policy_head = use_factorized_policy_head
-        if use_factorized_policy_head:
+        self._use_hierarchical_policy = use_hierarchical_policy
+        if use_hierarchical_policy:
+            self.policy_head = HierarchicalPolicyHead(
+                channels, policy_hidden=48, use_batch_norm=use_batch_norm,
+                global_inject_dim=film_global_inject_dim,
+            )
+        elif use_factorized_policy_head:
             self.policy_head = StructuredConvPolicyHead(
                 channels, policy_hidden=48, use_batch_norm=use_batch_norm,
                 global_inject_dim=film_global_inject_dim,
@@ -619,8 +766,21 @@ class PatchworkNetwork(nn.Module):
         if self.value_head.score_head is not None:
             nn.init.zeros_(self.value_head.score_head.weight)
             nn.init.zeros_(self.value_head.score_head.bias)
-        # Policy head: zero-init output layers
-        if self._use_structured_policy_head:
+        # Policy head: zero-init output layers so network starts near-uniform policy
+        if self._use_hierarchical_policy:
+            nn.init.zeros_(self.policy_head.type_linear.weight)
+            nn.init.zeros_(self.policy_head.type_linear.bias)
+            nn.init.zeros_(self.policy_head.patch_conv.weight)
+            if self.policy_head.patch_conv.bias is not None:
+                nn.init.zeros_(self.policy_head.patch_conv.bias)
+            nn.init.zeros_(self.policy_head.slot_linear.weight)
+            nn.init.zeros_(self.policy_head.slot_linear.bias)
+            nn.init.zeros_(self.policy_head.orient_linear.weight)
+            nn.init.zeros_(self.policy_head.orient_linear.bias)
+            nn.init.zeros_(self.policy_head.pos_conv.weight)
+            if self.policy_head.pos_conv.bias is not None:
+                nn.init.zeros_(self.policy_head.pos_conv.bias)
+        elif self._use_structured_policy_head:
             nn.init.zeros_(self.policy_head.buy_conv.weight)
             if self.policy_head.buy_conv.bias is not None:
                 nn.init.zeros_(self.policy_head.buy_conv.bias)
@@ -639,8 +799,15 @@ class PatchworkNetwork(nn.Module):
         if self.film_mlp is not None:
             nn.init.zeros_(self.film_mlp[-1].weight)
             nn.init.zeros_(self.film_mlp[-1].bias)
-        # Global bias layers for buy/patch: zero-init so they start neutral (no distortion at init)
-        if self._use_structured_policy_head:
+        # Global bias layers: zero-init so they start neutral (no distortion at init)
+        if self._use_hierarchical_policy:
+            if self.policy_head.g_to_pos_bias is not None:
+                nn.init.zeros_(self.policy_head.g_to_pos_bias.weight)
+                nn.init.zeros_(self.policy_head.g_to_pos_bias.bias)
+            if self.policy_head.g_to_patch_bias is not None:
+                nn.init.zeros_(self.policy_head.g_to_patch_bias.weight)
+                nn.init.zeros_(self.policy_head.g_to_patch_bias.bias)
+        elif self._use_structured_policy_head:
             if self.policy_head.g_to_buy_bias is not None:
                 nn.init.zeros_(self.policy_head.g_to_buy_bias.weight)
                 nn.init.zeros_(self.policy_head.g_to_buy_bias.bias)
@@ -785,9 +952,15 @@ class PatchworkNetwork(nn.Module):
             if self.trunk_to_heads is not None:
                 # Add trunk spatial pooling: mean over 9×9 → projected to same dim → additive residual
                 g_heads = g_heads + self.trunk_to_heads(trunk.mean(dim=(2, 3)))
-        policy_logits = self.policy_head(trunk, g=g_heads)
-        if action_mask is not None:
-            policy_logits = policy_logits.masked_fill(action_mask == 0, float("-inf"))
+        if self._use_hierarchical_policy:
+            # Hierarchical head returns log-probabilities; masking is internal.
+            # softmax(log_probs) = probs and log_softmax(log_probs) = log_probs,
+            # so downstream code works unchanged.
+            policy_logits = self.policy_head(trunk, action_mask=action_mask, g=g_heads)
+        else:
+            policy_logits = self.policy_head(trunk, g=g_heads)
+            if action_mask is not None:
+                policy_logits = policy_logits.masked_fill(action_mask == 0, float("-inf"))
         value_out = self.value_head(trunk, g=g_heads)
         if isinstance(value_out, tuple):
             value, score_logits = value_out[0], value_out[1]
@@ -852,9 +1025,12 @@ class PatchworkNetwork(nn.Module):
             if self.trunk_to_heads is not None:
                 # Add trunk spatial pooling: mean over 9×9 → projected to same dim → additive residual
                 g_heads = g_heads + self.trunk_to_heads(trunk.mean(dim=(2, 3)))
-        policy_logits = self.policy_head(trunk, g=g_heads)
-        if action_mask is not None:
-            policy_logits = policy_logits.masked_fill(action_mask == 0, float("-inf"))
+        if self._use_hierarchical_policy:
+            policy_logits = self.policy_head(trunk, action_mask=action_mask, g=g_heads)
+        else:
+            policy_logits = self.policy_head(trunk, g=g_heads)
+            if action_mask is not None:
+                policy_logits = policy_logits.masked_fill(action_mask == 0, float("-inf"))
         value_out = self.value_head(trunk, g=g_heads)
         if isinstance(value_out, tuple):
             value, score_logits = value_out[0], value_out[1]
@@ -1106,6 +1282,7 @@ def create_network(config: dict) -> PatchworkNetwork:
         use_gpu_legality=bool(net_config.get("use_gpu_legality", True)),
         film_track_use_conv=bool(net_config.get("film_track_use_conv", False)),
         film_global_inject_dim=int(net_config.get("film_global_inject_dim", 0)),
+        use_hierarchical_policy=bool(net_config.get("use_hierarchical_policy", False)),
     )
 
 
@@ -1167,10 +1344,14 @@ def load_model_checkpoint(
 
     ckpt_has_legacy = "policy_head.fc.weight" in ckpt_keys and "policy_head.fc1.weight" not in ckpt_keys
     ckpt_has_factorized = "policy_head.fc1.weight" in ckpt_keys
-    ckpt_has_structured = "policy_head.p_conv.weight" in ckpt_keys
+    ckpt_has_structured = "policy_head.p_conv.weight" in ckpt_keys and "policy_head.type_linear.weight" not in ckpt_keys
+    ckpt_has_hierarchical = "policy_head.type_linear.weight" in ckpt_keys
 
     policy_structured_missing = {k for k in missing if any(
-        p in k for p in ("policy_head.p_", "policy_head.buy_", "policy_head.patch_", "policy_head.pass_")
+        p in k for p in ("policy_head.p_", "policy_head.buy_", "policy_head.patch_", "policy_head.pass_",
+                         "policy_head.type_", "policy_head.slot_", "policy_head.orient_",
+                         "policy_head.pos_", "policy_head.g_to_pos_", "policy_head.g_to_patch_",
+                         "policy_head.g_to_buy_")
     )}
     policy_fc_factorized_missing = {
         k for k in missing if k.startswith("policy_head.fc1") or k.startswith("policy_head.fc2")
@@ -1204,9 +1385,13 @@ def load_model_checkpoint(
     if {k for k in missing if "ownership_head" in k}:
         msgs.append("ownership head — init from scratch")
     if policy_structured_missing and (ckpt_has_legacy or ckpt_has_factorized):
-        msgs.append("policy head (ckpt has legacy/factorized) — structured head init from scratch")
-    if (policy_fc_factorized_missing or policy_fc_legacy_missing or policy_legacy_conv) and ckpt_has_structured:
-        msgs.append("policy head (ckpt has structured) — legacy head init from scratch")
+        msgs.append("policy head (ckpt has legacy/factorized) — structured/hierarchical head init from scratch")
+    if policy_structured_missing and ckpt_has_structured:
+        msgs.append("policy head (ckpt has structured) — hierarchical head init from scratch")
+    if policy_structured_missing and ckpt_has_hierarchical:
+        msgs.append("policy head (ckpt has hierarchical) — structured head init from scratch")
+    if (policy_fc_factorized_missing or policy_fc_legacy_missing or policy_legacy_conv) and (ckpt_has_structured or ckpt_has_hierarchical):
+        msgs.append("policy head (ckpt has structured/hierarchical) — legacy head init from scratch")
     if policy_fc_factorized_missing and ckpt_has_legacy:
         msgs.append("policy head (ckpt has legacy fc) — factorized head init from scratch")
     if policy_fc_legacy_missing and ckpt_has_factorized:
