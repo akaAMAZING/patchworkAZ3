@@ -9,11 +9,11 @@
 #     (no blended target — each head has one job, combination in search only)
 #   - hierarchical policy: type(3)→slot(3)→orient(8)→position(81) factorization
 #     (each level is a small softmax — faster convergence than flat 2026-way)
-#   - stronger score head (weight 0.25) and DSU (peak 0.25) for margin optimization
+#   - stronger score head (weight 0.30) and DSU (peak 0.35) for margin optimization
 #   - ownership pos_weight=6.0 fixes empty-cell recall (~30% → target >60%)
 #   - k_sqrt_coef=3 (was 8): PW now meaningfully prunes root BUY at ~320 sims
-#   - packing alpha=0.70 (was 0.25): ordering actually competes with log-prior spread
-#   - area_bonus=0.15: mild preference for larger pieces in ordering
+#   - packing alpha=0.70→0.04 (scheduled taper): heuristic bridges early horizon gap, fades as value head matures
+#   - area_bonus=0.0: NN decides piece-size preference via ch32-35
 #   - gate_dsu_enabled=true: DSU only engages when winning (win_start=0.45)
 #   - value_delta_max=0.10 (was 0.06): wider candidate set for score tiebreak
 #   - patch tiebreak enabled in training (hole-filling preference)
@@ -356,6 +356,18 @@ iteration:
     alpha: 0.05
   - iteration: 500
     alpha: 0.04
+
+  packing_alpha_schedule:
+  - iteration: 0
+    alpha: 0.70   # early: bridge search-horizon gap before value head learns hole costs
+  - iteration: 40
+    alpha: 0.30   # LR drop → trust NN more; ch32-35 signal accumulating
+  - iteration: 100
+    alpha: 0.15   # second LR phase; value head should associate holes with loss
+  - iteration: 150
+    alpha: 0.08   # mostly NN-driven packing from here
+  - iteration: 200
+    alpha: 0.04   # trace heuristic only; NN owns packing strategy
 
   dynamic_score_utility_weight_schedule:
   - iteration: 0

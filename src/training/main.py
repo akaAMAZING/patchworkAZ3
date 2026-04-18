@@ -182,14 +182,15 @@ def _print_iter_header(
     """Print the colorized iteration header directly to stdout (bypasses logger timestamps)."""
     sp = applied_settings.get("selfplay", {})
     tr = applied_settings.get("training", {})
-    sims  = int(sp.get("simulations", 0))
-    temp  = float(sp.get("temperature", 1.0))
-    alpha = float(sp.get("dirichlet_alpha", 0.0))
-    eps   = float(sp.get("noise_weight", 0.0))
-    cpuct = float(sp.get("cpuct", 1.5))
-    q_wt  = float(sp.get("q_value_weight", 0.0))
-    dsuw  = float(sp.get("dynamic_score_utility_weight", 0.3))
-    pl    = int(sp.get("parallel_leaves", 32))
+    sims         = int(sp.get("simulations", 0))
+    temp         = float(sp.get("temperature", 1.0))
+    alpha        = float(sp.get("dirichlet_alpha", 0.0))
+    eps          = float(sp.get("noise_weight", 0.0))
+    cpuct        = float(sp.get("cpuct", 1.5))
+    q_wt         = float(sp.get("q_value_weight", 0.0))
+    dsuw         = float(sp.get("dynamic_score_utility_weight", 0.3))
+    pack_alpha   = sp.get("packing_alpha")  # None when packing_ordering disabled
+    pl           = int(sp.get("parallel_leaves", 32))
     # Use last step LR from previous iteration when available (closer to actual current LR than phase peak)
     lr    = last_lr_from_previous_iter if last_lr_from_previous_iter is not None else float(tr.get("lr", 0.0))
     games = int(sp.get("games", 0))
@@ -201,6 +202,10 @@ def _print_iter_header(
         f"  ·  {_CLR_DIM}buf={_CLR_RST}{_CLR_VAL}{_fmt_k(buf_positions)} pos{_CLR_RST}"
         f"  ·  {_CLR_DIM}rejects={_CLR_RST}{_CLR_VAL}{rejections}{_CLR_RST}"
     )
+    pack_alpha_str = (
+        f"  {_CLR_DIM}pack_α={_CLR_RST}{_CLR_VAL}{pack_alpha:.2f}{_CLR_RST}"
+        if pack_alpha is not None else ""
+    )
     params = (
         f"  {_CLR_DIM}sims={_CLR_RST}{_CLR_VAL}{sims}{_CLR_RST}"
         f"  {_CLR_DIM}temp={_CLR_RST}{_CLR_VAL}{temp:.2f}{_CLR_RST}"
@@ -211,6 +216,7 @@ def _print_iter_header(
         f"  {_CLR_DIM}LR={_CLR_RST}{_CLR_VAL}{f'{lr:.10f}'.rstrip('0').rstrip('.')}{_CLR_RST}"
         f"  {_CLR_DIM}games={_CLR_RST}{_CLR_VAL}{games}{_CLR_RST}"
         f"  {_CLR_DIM}dsuw={_CLR_RST}{_CLR_VAL}{dsuw:.2f}{_CLR_RST}"
+        + pack_alpha_str +
         f"  {_CLR_DIM}pl={_CLR_RST}{_CLR_VAL}{pl}{_CLR_RST}"
     )
     print(f"\n{bar}\n{hdr}\n{params}\n{bar}", flush=True)
@@ -760,6 +766,18 @@ def _apply_q_value_weight_and_cpuct_schedules(config: dict, iteration: int) -> t
     dsuw = max(0.0, min(1.0, dsuw))
     config["selfplay"]["mcts"]["dynamic_score_utility_weight"] = dsuw
 
+    # Packing ordering alpha schedule: taper heuristic influence as the value head
+    # learns to associate isolated holes with lower win probability via ch32-35.
+    # High alpha early bridges the search horizon gap (holes cost 2pts at endgame,
+    # beyond short MCTS lookahead); taper as value head internalises this signal.
+    po_cfg = mcts.get("packing_ordering") or {}
+    if po_cfg.get("enabled", False):
+        alpha_base = float(po_cfg.get("alpha", 0.15))
+        alpha_sched = iter_cfg.get("packing_alpha_schedule", [])
+        alpha = float(_step_schedule_lookup(alpha_sched, iteration, "alpha", alpha_base))
+        alpha = max(0.0, min(2.0, alpha))
+        config["selfplay"]["mcts"]["packing_ordering"]["alpha"] = alpha
+
     return qvw, cpuct
 
 
@@ -961,6 +979,8 @@ class AlphaZeroTrainer:
                 "q_value_weight": float(sp.get("q_value_weight", 0.0)),
                 "static_score_utility_weight": float(mcts.get("static_score_utility_weight", 0.0)),
                 "dynamic_score_utility_weight": float(mcts.get("dynamic_score_utility_weight", 0.3)),  # schedule-applied
+                "packing_alpha": float((mcts.get("packing_ordering") or {}).get("alpha", 0.0))
+                    if (mcts.get("packing_ordering") or {}).get("enabled", False) else None,
                 "parallel_leaves": int(mcts.get("parallel_leaves", 32)),
             },
             "training": {
