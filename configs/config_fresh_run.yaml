@@ -199,7 +199,7 @@ replay_buffer:
   min_size: 4000
   window_iterations: 8
   newest_fraction: 0.25
-  recency_weight_lambda: 0.95   # geometric decay: w_i = lambda^(max_iter-i) * n_i; 1.0 = uniform
+  recency_weight_lambda: 1.0    # geometric decay: w_i = lambda^(max_iter-i) * n_i; 1.0 = uniform
   prioritized: false
   storage_format: hdf5
   compression: lzf
@@ -304,9 +304,9 @@ iteration:
   lr_schedule:
   - iteration: 0
     lr: 0.0016
-  - iteration: 35
+  - iteration: 30
     lr: 0.0016
-  - iteration: 45
+  - iteration: 40
     lr: 0.0012
   - iteration: 90
     lr: 0.0012
@@ -384,7 +384,7 @@ iteration:
   packing_alpha_schedule:
   - iteration: 0
     alpha: 0.70   # early: bridge search-horizon gap before value head learns hole costs
-  - iteration: 45
+  - iteration: 40
     alpha: 0.30   # LR drop → trust NN more; ch32-35 signal accumulating
   - iteration: 100
     alpha: 0.15   # second LR phase; value head should associate holes with loss
@@ -408,7 +408,7 @@ iteration:
     dynamic_score_utility_weight: 0.05
   - iteration: 25
     dynamic_score_utility_weight: 0.12
-  - iteration: 45
+  - iteration: 40
     dynamic_score_utility_weight: 0.20
   - iteration: 60
     dynamic_score_utility_weight: 0.35  # sole margin signal in search (value head is pure P(win))

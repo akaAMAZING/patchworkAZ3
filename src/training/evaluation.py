@@ -21,6 +21,8 @@ SPRT Implementation (Stockfish/KataGo-style):
 import logging
 import math
 import random
+import sys
+import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -48,6 +50,49 @@ from src.game.patchwork_engine import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _sprt_gauge(
+    llr: float,
+    lower: float,
+    upper: float,
+    games: int,
+    wins: int,
+    wr: float,
+    elapsed: float,
+) -> None:
+    """Print a live SPRT LLR gauge directly to stdout (bypasses logging)."""
+    span = upper - lower
+    pos = max(0.0, min(1.0, (llr - lower) / span)) if span > 0 else 0.5
+    WIDTH = 36
+    filled = int(pos * WIDTH)
+    empty  = WIDTH - filled
+    pct    = int(pos * 100)
+    gps    = games / elapsed if elapsed > 0.001 else 0.0
+
+    # Color the filled bar: salmon (leaning reject) → gold (neutral) → mint (leaning accept)
+    if pos < 0.40:
+        fill_c = "\033[38;5;210m"   # salmon
+    elif pos > 0.60:
+        fill_c = "\033[38;5;120m"   # mint
+    else:
+        fill_c = "\033[38;5;222m"   # gold
+
+    DIM  = "\033[38;5;244m"
+    RST  = "\033[0m"
+    EVAL = "\033[1;38;5;220m"
+
+    bar    = fill_c + "█" * filled + DIM + "░" * empty + RST
+    losses = games - wins
+    line   = (
+        f"  {EVAL}▸ SPRT{RST}  "
+        f"{DIM}g={RST}{games}  {DIM}W={RST}{wins}  {DIM}L={RST}{losses}  "
+        f"{DIM}WR={RST}{wr:.3f}  {DIM}g/s={RST}{gps:.1f}  "
+        f"{DIM}LLR={RST}{llr:+.3f}\n"
+        f"    {DIM}REJECT{RST}  {bar}  {fill_c}{pct}%{RST}  {DIM}ACCEPT{RST}"
+    )
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
 
 
 # =========================================================================
@@ -468,6 +513,7 @@ class Evaluator:
         _llr = 0.0
         _sprt_done = False
         _sprt_decision = "inconclusive" if _sprt_active else None
+        _eval_start = time.time()
 
         # ── Game loop ──────────────────────────────────────────────────────
         results: List[Dict] = []
@@ -502,6 +548,14 @@ class Evaluator:
 
                 if _sprt_active:
                     _llr += sprt_llr_update(result["model_won"], _p0, _p1)
+                    # Progress gauge every 10 games (file log suppressed from terminal via [SPRT_PROGRESS])
+                    if n_done % 10 == 0:
+                        logger.info(
+                            "[SPRT_PROGRESS] SPRT  g=%d  W=%d  WR=%.3f  LLR=%.3f",
+                            n_done, _wins_cnt, wr, _llr,
+                        )
+                        _sprt_gauge(_llr, _sprt_lower, _sprt_upper, n_done, _wins_cnt, wr,
+                                    time.time() - _eval_start)
                     if n_done >= _sprt_min:
                         remaining = max(0, num_games - n_done)
                         best_llr  = _llr + remaining * _win_inc
@@ -635,6 +689,7 @@ class Evaluator:
         sprt_result = SPRTResult()
         sprt_result.lower_bound = lower
         sprt_result.upper_bound = upper
+        _sprt_start = time.time()
 
         # Hoist loop-invariant SPRT constants
         _win_inc  = sprt_llr_update(True,  p0, p1)
@@ -660,12 +715,14 @@ class Evaluator:
                     games_so_far = len(results)
                     wr = _wins_cnt / games_so_far if games_so_far > 0 else 0.0
 
-                    # Log progress every 10 games
+                    # Log progress every 10 games (file only) + visual gauge to terminal
                     if games_so_far % 10 == 0:
                         logger.info(
-                            "SPRT  g=%d  W=%d  WR=%.3f  LLR=%.3f",
+                            "[SPRT_PROGRESS] SPRT  g=%d  W=%d  WR=%.3f  LLR=%.3f",
                             games_so_far, _wins_cnt, wr, llr,
                         )
+                        _sprt_gauge(llr, lower, upper, games_so_far, _wins_cnt, wr,
+                                    time.time() - _sprt_start)
 
                     # Check stopping conditions (only after min_games)
                     if games_so_far >= min_games:

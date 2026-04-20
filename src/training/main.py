@@ -143,23 +143,45 @@ import torch
 import yaml
 from torch.utils.tensorboard import SummaryWriter
 
-# ── Pastel 256-color terminal palette (graceful fallback if colorama not installed) ────
+# ── Terminal output: rich (preferred) with ANSI/colorama fallback ────────────
 try:
-    from colorama import init as _colorama_init
-    _colorama_init(autoreset=True)   # Enable VT processing on Windows
-    _CLR_BAR   = "\033[38;5;99m"     # Slate blue  — separator bars
-    _CLR_HDR   = "\033[1;38;5;189m"  # Lavender bold — ITER label
-    _CLR_VAL   = "\033[38;5;222m"    # Soft gold   — parameter values
-    _CLR_OK    = "\033[1;38;5;120m"  # Mint bold   — ACCEPTED
-    _CLR_FAIL  = "\033[1;38;5;210m"  # Salmon bold — REJECTED
-    _CLR_SECT  = "\033[38;5;153m"    # Sky blue    — section headers
-    _CLR_EVAL  = "\033[1;38;5;220m"  # Amber bold  — EVALUATION header
-    _CLR_DIM   = "\033[38;5;244m"    # Warm gray   — labels / dim text
-    _CLR_RST   = "\033[0m"           # Reset
-except ImportError:
-    _CLR_BAR = _CLR_HDR = _CLR_VAL = _CLR_OK = _CLR_FAIL = _CLR_SECT = _CLR_EVAL = _CLR_DIM = _CLR_RST = ""
+    from rich.console import Console as _RichConsole
+    from rich.logging import RichHandler as _RichHandler
+    from rich.markup import escape as _re
+    from rich.theme import Theme as _RichTheme
+    _rich_console = _RichConsole(
+        highlight=False,
+        force_terminal=True,   # render colors even when stdout isn't a detected TTY
+        theme=_RichTheme({
+            "log.time":   "color(244)",
+            "log.level":  "",
+            "logging.level.warning": "color(222)",
+            "logging.level.error":   "bold color(210)",
+        }),
+    )
+    _RICH = True  # only set after successful Console creation
+except Exception:  # catches ImportError AND any Console init failure
+    _RICH = False
+    _rich_console = None  # type: ignore[assignment]
+    _re = None            # type: ignore[assignment]
+    try:
+        from colorama import init as _colorama_init
+        _colorama_init(autoreset=True)
+    except ImportError:
+        pass
 
-_HBAR = "━" * 100
+# ANSI palette — used when _RICH=False
+_CLR_BAR  = "" if _RICH else "\033[38;5;99m"
+_CLR_HDR  = "" if _RICH else "\033[1;38;5;189m"
+_CLR_VAL  = "" if _RICH else "\033[38;5;222m"
+_CLR_OK   = "" if _RICH else "\033[1;38;5;120m"
+_CLR_FAIL = "" if _RICH else "\033[1;38;5;210m"
+_CLR_SECT = "" if _RICH else "\033[38;5;153m"
+_CLR_EVAL = "" if _RICH else "\033[1;38;5;220m"
+_CLR_DIM  = "" if _RICH else "\033[38;5;244m"
+_CLR_RST  = "" if _RICH else "\033[0m"
+
+_HBAR = "━" * 100  # used for ANSI fallback
 
 
 def _fmt_k(n: int) -> str:
@@ -190,37 +212,61 @@ def _print_iter_header(
     cpuct      = float(sp.get("cpuct", 1.5))
     q_wt       = float(sp.get("q_value_weight", 0.0))
     dsuw       = float(sp.get("dynamic_score_utility_weight", 0.3))
-    pack_alpha = sp.get("packing_alpha")  # None when packing_ordering disabled
+    pack_alpha = sp.get("packing_alpha")
     pl         = int(sp.get("parallel_leaves", 32))
-    # Use last step LR from previous iteration when available (closer to actual current LR than phase peak)
     lr    = last_lr_from_previous_iter if last_lr_from_previous_iter is not None else float(tr.get("lr", 0.0))
     games = int(sp.get("games", 0))
+    lr_str = f'{lr:.10f}'.rstrip('0').rstrip('.')
 
-    bar = _CLR_BAR + _HBAR + _CLR_RST
-    D, V, R = _CLR_DIM, _CLR_VAL, _CLR_RST  # shorthands
-
-    hdr = (
-        f"  {_CLR_HDR}ITER {iteration:03d}{R}{D}/{total_iterations}{R}"
-        f"  ·  {D}best{R} {V}{best_label}{R}"
-        f"  ·  {D}buf{R} {V}{_fmt_k(buf_positions)}{R}"
-        f"  ·  {D}rejects{R} {V}{rejections}{R}"
-    )
-    pack_str = f"  {D}pack_α{R} {V}{pack_alpha:.2f}{R}" if pack_alpha is not None else ""
-    mcts_row = (
-        f"  {D}sims{R} {V}{sims}{R}"
-        f"  {D}temp{R} {V}{temp:.2f}{R}"
-        f"  {D}α{R} {V}{alpha:.2f}{R}"
-        f"  {D}ε{R} {V}{eps:.2f}{R}"
-        f"  {D}cpuct{R} {V}{cpuct:.2f}{R}"
-        f"  {D}q{R} {V}{q_wt:.2f}{R}"
-        f"  {D}dsuw{R} {V}{dsuw:.2f}{R}"
-        f"  {D}pl{R} {V}{pl}{R}"
-        + pack_str
-        + f"  {D}│{R}"
-        + f"  {D}LR{R} {V}{f'{lr:.10f}'.rstrip('0').rstrip('.')}{R}"
-        + f"  {D}games{R} {V}{games}{R}"
-    )
-    print(f"\n{bar}\n{hdr}\n{mcts_row}\n{bar}", flush=True)
+    if _RICH:
+        _rich_console.print()
+        _rich_console.rule(style="color(99)")
+        _rich_console.print(
+            f"  [bold color(189)]ITER {iteration:03d}[/][color(244)]/{total_iterations}[/]"
+            f"  [color(244)]·[/]  [color(244)]best[/] [color(222)]{_re(best_label)}[/]"  # type: ignore[misc]
+            f"  [color(244)]·[/]  [color(244)]buf[/] [color(222)]{_fmt_k(buf_positions)}[/]"
+            f"  [color(244)]·[/]  [color(244)]rejects[/] [color(222)]{rejections}[/]"
+        )
+        pack_part = f"  [color(244)]pack_α[/] [color(222)]{pack_alpha:.2f}[/]" if pack_alpha is not None else ""
+        _rich_console.print(
+            f"  [color(244)]sims[/] [color(222)]{sims}[/]"
+            f"  [color(244)]temp[/] [color(222)]{temp:.2f}[/]"
+            f"  [color(244)]α[/] [color(222)]{alpha:.2f}[/]"
+            f"  [color(244)]ε[/] [color(222)]{eps:.2f}[/]"
+            f"  [color(244)]cpuct[/] [color(222)]{cpuct:.2f}[/]"
+            f"  [color(244)]q[/] [color(222)]{q_wt:.2f}[/]"
+            f"  [color(244)]dsuw[/] [color(222)]{dsuw:.2f}[/]"
+            f"  [color(244)]pl[/] [color(222)]{pl}[/]"
+            + pack_part
+            + f"  [color(244)]│[/]  [color(244)]LR[/] [color(222)]{lr_str}[/]"
+            + f"  [color(244)]games[/] [color(222)]{games}[/]"
+        )
+        _rich_console.rule(style="color(99)")
+    else:
+        bar = _CLR_BAR + _HBAR + _CLR_RST
+        D, V, R = _CLR_DIM, _CLR_VAL, _CLR_RST
+        hdr = (
+            f"  {_CLR_HDR}ITER {iteration:03d}{R}{D}/{total_iterations}{R}"
+            f"  ·  {D}best{R} {V}{best_label}{R}"
+            f"  ·  {D}buf{R} {V}{_fmt_k(buf_positions)}{R}"
+            f"  ·  {D}rejects{R} {V}{rejections}{R}"
+        )
+        pack_str = f"  {D}pack_α{R} {V}{pack_alpha:.2f}{R}" if pack_alpha is not None else ""
+        mcts_row = (
+            f"  {D}sims{R} {V}{sims}{R}"
+            f"  {D}temp{R} {V}{temp:.2f}{R}"
+            f"  {D}α{R} {V}{alpha:.2f}{R}"
+            f"  {D}ε{R} {V}{eps:.2f}{R}"
+            f"  {D}cpuct{R} {V}{cpuct:.2f}{R}"
+            f"  {D}q{R} {V}{q_wt:.2f}{R}"
+            f"  {D}dsuw{R} {V}{dsuw:.2f}{R}"
+            f"  {D}pl{R} {V}{pl}{R}"
+            + pack_str
+            + f"  {D}│{R}"
+            + f"  {D}LR{R} {V}{lr_str}{R}"
+            + f"  {D}games{R} {V}{games}{R}"
+        )
+        print(f"\n{bar}\n{hdr}\n{mcts_row}\n{bar}", flush=True)
 
 
 def _print_auto_resume(
@@ -233,57 +279,100 @@ def _print_auto_resume(
     elo_count: int,
 ) -> None:
     """Print the colorized auto-resume banner directly to stdout."""
-    bar = _CLR_BAR + _HBAR + _CLR_RST
-    D, V, R = _CLR_DIM, _CLR_VAL, _CLR_RST
-    hdr = (
-        f"  {_CLR_HDR}AUTO-RESUME{R}"
-        f"  ·  {D}iter{last_comm:03d}{R}  {D}→{R}  {V}iter{next_iter:03d}{R}"
-        f"  ·  {D}step{R} {V}{global_step:,}{R}"
-    )
-    lines = [
-        f"  {D}last committed  {R}{V}iter{last_comm:03d}{R}",
-        f"  {D}next iteration  {R}{V}iter{next_iter:03d}{R}",
-        f"  {D}best model      {R}{V}{best_label}{R}  {D}({best_model_path}){R}",
-        f"  {D}global step     {R}{V}{global_step:,}{R}",
-        f"  {D}rejections      {R}{V}{rejections}{R}",
-        f"  {D}elo ratings     {R}{V}{elo_count}{R}{D} players restored{R}",
-        f"  {D}replay buffer   {R}{D}will be restored from state file{R}",
-    ]
-    print(f"\n{bar}\n{hdr}\n" + "\n".join(lines) + f"\n{bar}\n", flush=True)
+    if _RICH:
+        _rich_console.print()
+        _rich_console.rule(style="color(99)")
+        _rich_console.print(
+            f"  [bold color(189)]AUTO-RESUME[/]"
+            f"  [color(244)]·[/]  [color(244)]iter{last_comm:03d}[/]  [color(244)]→[/]  [color(222)]iter{next_iter:03d}[/]"
+            f"  [color(244)]·[/]  [color(244)]step[/] [color(222)]{global_step:,}[/]"
+        )
+        _rich_console.print(f"  [color(244)]last committed[/]   [color(222)]iter{last_comm:03d}[/]")
+        _rich_console.print(f"  [color(244)]next iteration[/]   [color(222)]iter{next_iter:03d}[/]")
+        _rich_console.print(
+            f"  [color(244)]best model[/]       [color(222)]{_re(best_label)}[/]  "  # type: ignore[misc]
+            f"[color(244)]({_re(best_model_path)})[/]"  # type: ignore[misc]
+        )
+        _rich_console.print(f"  [color(244)]global step[/]      [color(222)]{global_step:,}[/]")
+        _rich_console.print(f"  [color(244)]rejections[/]       [color(222)]{rejections}[/]")
+        _rich_console.print(f"  [color(244)]elo ratings[/]      [color(222)]{elo_count}[/] [color(244)]players restored[/]")
+        _rich_console.print(f"  [color(244)]replay buffer[/]    [color(244)]will be restored from state file[/]")
+        _rich_console.rule(style="color(99)")
+        _rich_console.print()
+    else:
+        bar = _CLR_BAR + _HBAR + _CLR_RST
+        D, V, R = _CLR_DIM, _CLR_VAL, _CLR_RST
+        hdr = (
+            f"  {_CLR_HDR}AUTO-RESUME{R}"
+            f"  ·  {D}iter{last_comm:03d}{R}  {D}→{R}  {V}iter{next_iter:03d}{R}"
+            f"  ·  {D}step{R} {V}{global_step:,}{R}"
+        )
+        lines = [
+            f"  {D}last committed  {R}{V}iter{last_comm:03d}{R}",
+            f"  {D}next iteration  {R}{V}iter{next_iter:03d}{R}",
+            f"  {D}best model      {R}{V}{best_label}{R}  {D}({best_model_path}){R}",
+            f"  {D}global step     {R}{V}{global_step:,}{R}",
+            f"  {D}rejections      {R}{V}{rejections}{R}",
+            f"  {D}elo ratings     {R}{V}{elo_count}{R}{D} players restored{R}",
+            f"  {D}replay buffer   {R}{D}will be restored from state file{R}",
+        ]
+        print(f"\n{bar}\n{hdr}\n" + "\n".join(lines) + f"\n{bar}\n", flush=True)
 
 
 def _print_section(label: str) -> None:
     """Print a colorized section header directly to stdout (generic fallback)."""
-    print(f"\n  {_CLR_SECT}▸ {label}{_CLR_RST}", flush=True)
+    if _RICH:
+        _rich_console.print(f"\n  [color(153)]▸ {_re(label)}[/]")  # type: ignore[misc]
+    else:
+        print(f"\n  {_CLR_SECT}▸ {label}{_CLR_RST}", flush=True)
 
 
 def _print_selfplay_section(label: str) -> None:
     """Print self-play section header."""
-    print(
-        f"\n  {_CLR_SECT}▸ SELF-PLAY{_CLR_RST}"
-        f"  {_CLR_DIM}using{_CLR_RST}  {_CLR_VAL}{label}{_CLR_RST}",
-        flush=True,
-    )
+    if _RICH:
+        _rich_console.print(
+            f"\n  [color(153)]▸ SELF-PLAY[/]  [color(244)]using[/]  [color(222)]{_re(label)}[/]"  # type: ignore[misc]
+        )
+    else:
+        print(
+            f"\n  {_CLR_SECT}▸ SELF-PLAY{_CLR_RST}"
+            f"  {_CLR_DIM}using{_CLR_RST}  {_CLR_VAL}{label}{_CLR_RST}",
+            flush=True,
+        )
 
 
 def _print_training_section(label: str) -> None:
     """Print training section header."""
-    print(
-        f"\n  {_CLR_SECT}▸ TRAINING{_CLR_RST}"
-        f"  {_CLR_DIM}warm-start{_CLR_RST}  {_CLR_VAL}{label}{_CLR_RST}",
-        flush=True,
-    )
+    if _RICH:
+        _rich_console.print(
+            f"\n  [color(153)]▸ TRAINING[/]  [color(244)]warm-start[/]  [color(222)]{_re(label)}[/]"  # type: ignore[misc]
+        )
+    else:
+        print(
+            f"\n  {_CLR_SECT}▸ TRAINING{_CLR_RST}"
+            f"  {_CLR_DIM}warm-start{_CLR_RST}  {_CLR_VAL}{label}{_CLR_RST}",
+            flush=True,
+        )
 
 
 def _print_eval_section(iteration: int) -> None:
     """Print special evaluation section header (runs once every N iterations)."""
-    dashes = "╌" * 62
-    print(
-        f"\n  {_CLR_EVAL}◆  E V A L U A T I O N{_CLR_RST}"
-        f"  {_CLR_DIM}iter{iteration:03d}{_CLR_RST}"
-        f"\n  {_CLR_EVAL}{dashes}{_CLR_RST}",
-        flush=True,
-    )
+    if _RICH:
+        _rich_console.print()
+        _rich_console.rule(
+            f"[bold color(220)]◆  E V A L U A T I O N  iter{iteration:03d}[/]",
+            style="color(220)",
+            characters="╌",
+        )
+        _rich_console.print()
+    else:
+        dashes = "╌" * 62
+        print(
+            f"\n  {_CLR_EVAL}◆  E V A L U A T I O N{_CLR_RST}"
+            f"  {_CLR_DIM}iter{iteration:03d}{_CLR_RST}"
+            f"\n  {_CLR_EVAL}{dashes}{_CLR_RST}",
+            flush=True,
+        )
 
 
 def _print_iter_summary(
@@ -296,11 +385,8 @@ def _print_iter_summary(
     train_metrics: dict,
 ) -> None:
     """Print the colorized iteration summary directly to stdout."""
-    status_clr = _CLR_OK if accepted else _CLR_FAIL
-    status_str = "✓  ACCEPTED" if accepted else "✗  REJECTED"
     loss = train_metrics.get("total_loss", 0)
     pol  = train_metrics.get("policy_accuracy", 0) * 100
-    # Human-readable elapsed time
     mins, secs = divmod(int(iter_time), 60)
     hrs, mins = divmod(mins, 60)
     if hrs > 0:
@@ -309,17 +395,36 @@ def _print_iter_summary(
         time_str = f"{mins}m{secs:02d}s"
     else:
         time_str = f"{secs}s"
-    bar = _CLR_BAR + _HBAR + _CLR_RST
-    D, V, R = _CLR_DIM, _CLR_VAL, _CLR_RST
-    summary = (
-        f"  {_CLR_HDR}ITER {iteration:03d}{R}  {status_clr}{status_str}{R}  {D}{time_str}{R}"
-        f"  {D}│{R}"
-        f"  {D}WR(best){R} {V}{wr_best_str}{R}  {D}margin{R} {V}{margin_best:+.1f}pts{R}"
-        f"  {D}WR(mcts){R} {V}{wr_mcts_str}{R}"
-        f"  {D}│{R}"
-        f"  {D}loss{R} {V}{loss:.4f}{R}  {D}pol_acc{R} {V}{pol:.1f}%{R}"
-    )
-    print(f"\n{bar}\n{summary}\n{bar}", flush=True)
+
+    if _RICH:
+        status_style = "bold color(120)" if accepted else "bold color(210)"
+        status_str   = "✓  ACCEPTED"    if accepted else "✗  REJECTED"
+        _rich_console.print()
+        _rich_console.rule(style="color(99)")
+        _rich_console.print(
+            f"  [bold color(189)]ITER {iteration:03d}[/]  [{status_style}]{status_str}[/]  [color(244)]{time_str}[/]"
+            f"  [color(244)]│[/]"
+            f"  [color(244)]WR(best)[/] [color(222)]{_re(wr_best_str)}[/]  "  # type: ignore[misc]
+            f"[color(244)]margin[/] [color(222)]{margin_best:+.1f}pts[/]"
+            f"  [color(244)]WR(mcts)[/] [color(222)]{_re(wr_mcts_str)}[/]"  # type: ignore[misc]
+            f"  [color(244)]│[/]"
+            f"  [color(244)]loss[/] [color(222)]{loss:.4f}[/]  [color(244)]pol_acc[/] [color(222)]{pol:.1f}%[/]"
+        )
+        _rich_console.rule(style="color(99)")
+    else:
+        status_clr = _CLR_OK if accepted else _CLR_FAIL
+        status_str = "✓  ACCEPTED" if accepted else "✗  REJECTED"
+        bar = _CLR_BAR + _HBAR + _CLR_RST
+        D, V, R = _CLR_DIM, _CLR_VAL, _CLR_RST
+        summary = (
+            f"  {_CLR_HDR}ITER {iteration:03d}{R}  {status_clr}{status_str}{R}  {D}{time_str}{R}"
+            f"  {D}│{R}"
+            f"  {D}WR(best){R} {V}{wr_best_str}{R}  {D}margin{R} {V}{margin_best:+.1f}pts{R}"
+            f"  {D}WR(mcts){R} {V}{wr_mcts_str}{R}"
+            f"  {D}│{R}"
+            f"  {D}loss{R} {V}{loss:.4f}{R}  {D}pol_acc{R} {V}{pol:.1f}%{R}"
+        )
+        print(f"\n{bar}\n{summary}\n{bar}", flush=True)
 
 from src.training.evaluation import Evaluator, EloTracker, LadderEloTracker
 from src.training.league import LeagueManager, LeagueConfig, GateResult
@@ -400,44 +505,79 @@ _TIDY_FMT = _TidyFormatter(
 
 
 class _TerminalFormatter(logging.Formatter):
-    """Clean terminal formatter: no timestamp, pastel-colored tag, message only.
-    Timestamps are written to log files only (via _TIDY_FMT on file handlers).
-    """
+    """ANSI fallback formatter (used when rich is unavailable)."""
     _TAG_CLR = {
-        "MAIN":     "\033[38;5;153m",   # sky blue
-        "SELFPLAY": "\033[38;5;183m",   # lavender
-        "TRAIN":    "\033[38;5;183m",   # lavender
-        "EVAL":     "\033[38;5;220m",   # amber
-        "BUFFER":   "\033[38;5;244m",   # gray
-        "COMMIT":   "\033[38;5;120m",   # mint
-        "LEAGUE":   "\033[38;5;222m",   # gold
-        "GPU":      "\033[38;5;244m",   # gray
-        "MODEL":    "\033[38;5;244m",   # gray
-        "MCTS":     "\033[38;5;244m",   # gray
+        "MAIN":     "\033[38;5;153m",
+        "SELFPLAY": "\033[38;5;183m",
+        "TRAIN":    "\033[38;5;183m",
+        "EVAL":     "\033[38;5;220m",
+        "BUFFER":   "\033[38;5;244m",
+        "COMMIT":   "\033[38;5;120m",
+        "LEAGUE":   "\033[38;5;222m",
+        "GPU":      "\033[38;5;244m",
+        "MODEL":    "\033[38;5;244m",
+        "MCTS":     "\033[38;5;244m",
     }
 
     def format(self, record: logging.LogRecord) -> str:
         tag = _LOG_TAGS.get(record.name, record.name.rsplit(".", 1)[-1].upper()[:12])
         tag_clr = self._TAG_CLR.get(tag, "\033[38;5;244m")
         msg = record.getMessage()
+        ts = self.formatTime(record, "%Y-%m-%d %H:%M:%S")
         if record.levelno >= logging.ERROR:
-            return f"  {tag_clr}[{tag}]{_CLR_RST}  \033[1;38;5;210m{msg}{_CLR_RST}"
+            return f"  \033[38;5;244m{ts}\033[0m  {tag_clr}[{tag}]\033[0m  \033[1;38;5;210m{msg}\033[0m"
         elif record.levelno >= logging.WARNING:
-            return f"  {tag_clr}[{tag}]{_CLR_RST}  \033[38;5;222m{msg}{_CLR_RST}"
-        return f"  {tag_clr}[{tag}]{_CLR_RST}  {msg}"
+            return f"  \033[38;5;244m{ts}\033[0m  {tag_clr}[{tag}]\033[0m  \033[38;5;222m{msg}\033[0m"
+        return f"  \033[38;5;244m{ts}\033[0m  {tag_clr}[{tag}]\033[0m  {msg}"
+
+
+class _RichTerminalFormatter(logging.Formatter):
+    """Rich markup formatter — message column only; RichHandler adds the timestamp column."""
+    _TAG_STYLE = {
+        "MAIN":     "color(153)",
+        "SELFPLAY": "color(183)",
+        "TRAIN":    "color(183)",
+        "EVAL":     "color(220)",
+        "BUFFER":   "color(244)",
+        "COMMIT":   "color(120)",
+        "LEAGUE":   "color(222)",
+        "GPU":      "color(244)",
+        "MODEL":    "color(244)",
+        "MCTS":     "color(244)",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        tag = _LOG_TAGS.get(record.name, record.name.rsplit(".", 1)[-1].upper()[:12])
+        style = self._TAG_STYLE.get(tag, "color(244)")
+        msg = _re(record.getMessage())  # type: ignore[misc]
+        if record.levelno >= logging.ERROR:
+            return f"[{style}]\\[{tag}][/]  [bold color(210)]{msg}[/]"
+        elif record.levelno >= logging.WARNING:
+            return f"[{style}]\\[{tag}][/]  [color(222)]{msg}[/]"
+        return f"[{style}]\\[{tag}][/]  {msg}"
 
 
 class _ConsoleFilter(logging.Filter):
     """Suppress diagnostic-only messages from terminal (they still go to training.log)."""
-    _SUPPRESS = ("[LIFECYCLE]", "[ADAPTIVE_GAMES]")
+    _SUPPRESS = ("[LIFECYCLE]", "[ADAPTIVE_GAMES]", "[SPRT_PROGRESS]")
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
         return not any(tag in msg for tag in self._SUPPRESS)
 
 
-_console_handler = logging.StreamHandler(_safe_stdout)
-_console_handler.setFormatter(_TerminalFormatter())
+if _RICH:
+    _console_handler: logging.Handler = _RichHandler(  # type: ignore[assignment]
+        console=_rich_console,
+        show_path=False,
+        show_level=False,
+        markup=True,
+        log_time_format="%Y-%m-%d %H:%M:%S",
+    )
+    _console_handler.setFormatter(_RichTerminalFormatter())
+else:
+    _console_handler = logging.StreamHandler(_safe_stdout)
+    _console_handler.setFormatter(_TerminalFormatter())
 _console_handler.setLevel(logging.INFO)
 _console_handler.addFilter(_ConsoleFilter())
 _root_logger = logging.getLogger()
@@ -1651,11 +1791,17 @@ class AlphaZeroTrainer:
 
                 # Only print EVALUATION section header when actual evaluation games will run
                 _eval_cfg_now = self.config.get("evaluation", {}) or {}
-                _eval_ngm = int(_eval_cfg_now.get("games_per_eval") or _eval_cfg_now.get("games_vs_pure_mcts", 0))
-                _eval_ngb = int(_eval_cfg_now.get("games_vs_best") or _eval_ngm)
-                _sprt_on  = bool((_eval_cfg_now.get("sprt", {}) or {}).get("enabled", False))
-                _micro_on = bool((_eval_cfg_now.get("micro_gate", {}) or {}).get("enabled", True))
-                _eval_active = _eval_ngm > 0 or (iteration > 0 and (_eval_ngb > 0 or _sprt_on or _micro_on))
+                _eval_ngm    = int(_eval_cfg_now.get("games_per_eval") or _eval_cfg_now.get("games_vs_pure_mcts", 0))
+                _eval_ngb    = int(_eval_cfg_now.get("games_vs_best") or _eval_ngm)
+                _sprt_on     = bool((_eval_cfg_now.get("sprt", {}) or {}).get("enabled", False))
+                _micro_on    = bool((_eval_cfg_now.get("micro_gate", {}) or {}).get("enabled", True))
+                _ladder_cfg_chk = (_eval_cfg_now.get("ladder_eval") or {})
+                _ladder_due  = (
+                    _ladder_cfg_chk.get("enabled", False)
+                    and iteration >= int(_ladder_cfg_chk.get("lookback", 5))
+                    and iteration % int(_ladder_cfg_chk.get("interval", 5)) == 0
+                )
+                _eval_active = _eval_ngm > 0 or _ladder_due or (iteration > 0 and (_eval_ngb > 0 or _sprt_on or _micro_on))
                 if _eval_active:
                     _print_eval_section(iteration)
                 eval_results = self._evaluate_model(iteration, checkpoint_path)
