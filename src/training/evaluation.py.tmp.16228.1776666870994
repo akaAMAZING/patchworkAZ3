@@ -660,10 +660,10 @@ class Evaluator:
                     games_so_far = len(results)
                     wr = _wins_cnt / games_so_far if games_so_far > 0 else 0.0
 
-                    # Log progress every 10 games
-                    if games_so_far % 10 == 0:
+                    # Log progress every 25 games
+                    if games_so_far % 25 == 0:
                         logger.info(
-                            "SPRT  g=%d  W=%d  WR=%.3f  LLR=%.3f",
+                            "SPRT  games=%d  wins=%d  WR=%.3f  LLR=%.3f",
                             games_so_far, _wins_cnt, wr, llr,
                         )
 
@@ -671,15 +671,15 @@ class Evaluator:
                     if games_so_far >= min_games:
                         if llr >= upper:
                             logger.info(
-                                "SPRT ACCEPT  game=%d  WR=%.3f  LLR=%.3f",
-                                games_so_far, wr, llr,
+                                f"SPRT ACCEPT at game {games_so_far}: LLR={llr:.3f} >= {upper:.3f}  "
+                                f"WR={wr:.3f}  (model is stronger)"
                             )
                             sprt_result.accept = True
                             break
                         if llr <= lower:
                             logger.info(
-                                "SPRT REJECT  game=%d  WR=%.3f  LLR=%.3f",
-                                games_so_far, wr, llr,
+                                f"SPRT REJECT at game {games_so_far}: LLR={llr:.3f} <= {lower:.3f}  "
+                                f"WR={wr:.3f}  (model is not stronger)"
                             )
                             sprt_result.reject = True
                             break
@@ -697,22 +697,24 @@ class Evaluator:
                             if best_possible_llr < upper and worst_possible_llr > lower:
                                 # Neither bound reachable → guaranteed inconclusive
                                 logger.info(
-                                    "SPRT EARLY STOP  game=%d  WR=%.3f  LLR=%.3f  (neither bound reachable)",
-                                    games_so_far, wr, llr,
+                                    f"SPRT EARLY STOP at game {games_so_far}: neither bound reachable  "
+                                    f"LLR={llr:.3f}  possible=[{worst_possible_llr:.3f}, {best_possible_llr:.3f}]  "
+                                    f"bounds=[{lower:.3f}, {upper:.3f}]  WR={wr:.3f}"
                                 )
                                 break  # Leave as inconclusive → WR threshold decides
 
                             elif best_possible_llr < upper:
                                 # Cannot reach ACCEPT even if all remaining games are wins
                                 logger.info(
-                                    "SPRT EARLY REJECT  game=%d  WR=%.3f  LLR=%.3f  (futility — cannot reach ACCEPT)",
-                                    games_so_far, wr, llr,
+                                    f"SPRT EARLY REJECT (futility) at game {games_so_far}: "
+                                    f"LLR={llr:.3f}  best_possible={best_possible_llr:.3f} < {upper:.3f}  "
+                                    f"WR={wr:.3f}  (cannot reach ACCEPT)"
                                 )
                                 sprt_result.reject = True
                                 break
 
                 except Exception as e:
-                    logger.error("Error in SPRT game %d: %s", game_idx, e)
+                    logger.error(f"Error in SPRT game {game_idx}: {e}")
                     continue
 
         # If we exhausted max_games without a decision
@@ -720,8 +722,8 @@ class Evaluator:
             sprt_result.inconclusive = True
             wr = _wins_cnt / max(1, len(results))
             logger.info(
-                "SPRT INCONCLUSIVE  games=%d  WR=%.3f  LLR=%.3f",
-                len(results), wr, llr,
+                f"SPRT INCONCLUSIVE after {len(results)} games: LLR={llr:.3f}  "
+                f"WR={wr:.3f}  (defaulting to win-rate threshold)"
             )
 
         sprt_result.llr = llr

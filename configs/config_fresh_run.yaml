@@ -69,6 +69,7 @@ network:
   film_per_block: true
   film_track_use_conv: true
   film_global_inject_dim: 64
+  aux_channels: 32               # auxiliary heads: 7x7 bonus pred + opp threat (32-ch bottleneck)
 
 training:
   optimizer: adamw
@@ -92,6 +93,10 @@ training:
   score_loss_weight: 0.30       # sole margin signal now (value head is pure P(win), no blended margin)
   ownership_loss_weight: 0.15
   ownership_pos_weight: 6.0     # raised from 4.0: upweights empty cells 6× to fix recall (~30% → target >60%)
+  bonus7x7_loss_weight: 0.10    # 7x7 bonus prediction head (binary BCE, 2 outputs: my/opp)
+  opp_threat_loss_weight: 0.05  # opponent board threat head (regression MSE, scalar in [0,1])
+  policy_entropy_bonus_weight: 0.003  # resist late-training policy collapse; -coef*H(pi) in loss
+  value_label_smoothing: 0.02   # clamp value targets to [-0.98, +0.98]; prevents logit saturation
   epochs_per_iteration: 2       # NOTE: raise to 3 at iter 300
   val_split: 0.08
   val_frequency: 1000
@@ -194,6 +199,7 @@ replay_buffer:
   min_size: 4000
   window_iterations: 8
   newest_fraction: 0.25
+  recency_weight_lambda: 0.95   # geometric decay: w_i = lambda^(max_iter-i) * n_i; 1.0 = uniform
   prioritized: false
   storage_format: hdf5
   compression: lzf
@@ -203,7 +209,7 @@ evaluation:
   lock_eval_cpuct_to_selfplay: true
   games_vs_best: 0
   games_vs_pure_mcts: 0           # disabled: pure MCTS is too weak (beaten from iter 1)
-  games_vs_anchor: 20             # play 20 games vs iter192 every iteration for real Elo signal
+  games_vs_anchor: 0              # disabled: run manually via scripts/run_ladder_eval.py when needed
   eval_progress_interval: 0
   paired_eval: false
   skip_pure_mcts_after_iter: 0
@@ -214,6 +220,24 @@ evaluation:
   anchor_checkpoint:
     path: "C:/Users/Shanks/Desktop/Codes/patchworkaz - Copy - v2 - Copy/runs/patchwork_production/committed/iter_192/iteration_192.pt"
     config: "configs/config_best.yaml"
+
+  # Ladder eval: every `interval` iters, play `games` games vs iter N-lookback.
+  # Primary LR-readiness signal. WR→implied Elo gap: 55%→+35, 57%→+50, 53%→+18, 50%→0.
+  # Decision rule: if step gap < 15 Elo for 2 consecutive steps, LR has done its work.
+
+  ladder_eval:
+    enabled: true
+    interval: 5       # run every 5 iters (iter 5, 10, 15, 20, 25, 30, ...)
+    lookback: 5       # compare iter N vs iter N-5
+    games: 200        # max games per match; SPRT will stop early when confident
+    sprt:
+      enabled: true
+      p0: 0.50        # H0: win rate ≤ this  (no improvement)
+      p1: 0.55        # H1: win rate ≥ this  (standard Stockfish/KataGo threshold)
+      alpha: 0.05     # false-positive rate  (standard: 1-in-20 max)
+      beta:  0.05     # false-negative rate  (standard: 1-in-20 max)
+      min_games: 60   # always play at least this many regardless of LLR
+                      # typical savings: ~40-60% fewer games on clearly stronger models
 
   eval_baselines:
   - type: pure_mcts
@@ -280,9 +304,9 @@ iteration:
   lr_schedule:
   - iteration: 0
     lr: 0.0016
-  - iteration: 30
+  - iteration: 35
     lr: 0.0016
-  - iteration: 40
+  - iteration: 45
     lr: 0.0012
   - iteration: 90
     lr: 0.0012
@@ -360,7 +384,7 @@ iteration:
   packing_alpha_schedule:
   - iteration: 0
     alpha: 0.70   # early: bridge search-horizon gap before value head learns hole costs
-  - iteration: 40
+  - iteration: 45
     alpha: 0.30   # LR drop → trust NN more; ch32-35 signal accumulating
   - iteration: 100
     alpha: 0.15   # second LR phase; value head should associate holes with loss
@@ -369,6 +393,14 @@ iteration:
   - iteration: 200
     alpha: 0.04   # trace heuristic only; NN owns packing strategy
 
+  score_sigma_schedule:
+  - iteration: 0
+    sigma: 2.5    # early: wide Gaussian over noisy game outcomes
+  - iteration: 100
+    sigma: 1.5    # mid: current default — converging value head
+  - iteration: 200
+    sigma: 1.0    # late: sharp target, score head mature
+
   dynamic_score_utility_weight_schedule:
   - iteration: 0
     dynamic_score_utility_weight: 0.00
@@ -376,7 +408,7 @@ iteration:
     dynamic_score_utility_weight: 0.05
   - iteration: 25
     dynamic_score_utility_weight: 0.12
-  - iteration: 40
+  - iteration: 45
     dynamic_score_utility_weight: 0.20
   - iteration: 60
     dynamic_score_utility_weight: 0.35  # sole margin signal in search (value head is pure P(win))

@@ -40,11 +40,14 @@ logger = logging.getLogger(__name__)
 
 
 def _breadcrumb(msg: str, log_path: Optional[str] = None) -> None:
-    """Emit a startup breadcrumb for Windows CUDA crash diagnosis. Flushes stdout."""
-    line = f"[GPU Server] BREADCRUMB: {msg}\n"
-    sys.stdout.write(line)
-    sys.stdout.flush()
+    """Write a startup breadcrumb for Windows CUDA crash diagnosis.
+
+    Writes only to log_path (if set via GPU_SERVER_BREADCRUMB_LOG env var) — not to stdout,
+    so the terminal stays clean. Set GPU_SERVER_BREADCRUMB_LOG to a file path to capture
+    breadcrumbs for crash diagnosis.
+    """
     if log_path:
+        line = f"[GPU Server] BREADCRUMB: {msg}\n"
         try:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(line)

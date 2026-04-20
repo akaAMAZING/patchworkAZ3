@@ -602,6 +602,34 @@ class OwnershipHead(nn.Module):
         return self.conv_out(x)  # (B, 2, 9, 9) logits
 
 
+class AuxScalarHead(nn.Module):
+    """Lightweight auxiliary head for scalar/binary game-end predictions.
+
+    Conv1×1 → BN → ReLU → flatten → linear → n_outputs raw logits.
+    Use BCE-with-logits for binary targets, sigmoid+MSE for bounded regression.
+
+    Two heads are instantiated when aux_channels > 0:
+      bonus_head  (n_outputs=2): [P(me gets 7×7 bonus), P(opp gets 7×7 bonus)]
+      threat_head (n_outputs=1): opponent's final empty-square fraction [0, 1]
+    """
+
+    def __init__(
+        self,
+        input_channels: int,
+        aux_channels: int,
+        n_outputs: int,
+        use_batch_norm: bool = True,
+    ):
+        super().__init__()
+        self.conv = nn.Conv2d(input_channels, aux_channels, 1, bias=not use_batch_norm)
+        self.bn = nn.BatchNorm2d(aux_channels) if use_batch_norm else nn.Identity()
+        self.fc = nn.Linear(aux_channels * 9 * 9, n_outputs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.bn(self.conv(x)), inplace=True)
+        return self.fc(x.flatten(start_dim=1))  # (B, n_outputs) raw logits
+
+
 class PatchworkNetwork(nn.Module):
     """Complete AlphaZero network for Patchwork."""
 
@@ -620,6 +648,7 @@ class PatchworkNetwork(nn.Module):
         se_ratio: float = 0.0,
         dropout: float = 0.0,
         ownership_channels: int = 0,
+        aux_channels: int = 0,
         use_film: bool = False,
         film_hidden: int = 256,
         film_input_plane_indices: Optional[List[int]] = None,
@@ -743,6 +772,15 @@ class PatchworkNetwork(nn.Module):
         self.ownership_head: Optional[OwnershipHead] = None
         if ownership_channels > 0:
             self.ownership_head = OwnershipHead(channels, ownership_channels, use_batch_norm)
+
+        # Auxiliary scalar heads — optional (enabled when aux_channels > 0)
+        # bonus_head:  2 outputs — [P(me gets 7×7 bonus), P(opp gets 7×7 bonus)]  (BCE)
+        # threat_head: 1 output  — opponent final empty-square fraction [0,1]       (sigmoid+MSE)
+        self.bonus_head: Optional[AuxScalarHead] = None
+        self.threat_head: Optional[AuxScalarHead] = None
+        if aux_channels > 0:
+            self.bonus_head = AuxScalarHead(channels, aux_channels, n_outputs=2, use_batch_norm=use_batch_norm)
+            self.threat_head = AuxScalarHead(channels, aux_channels, n_outputs=1, use_batch_norm=use_batch_norm)
 
         self._initialize_weights()
 
@@ -999,6 +1037,12 @@ class PatchworkNetwork(nn.Module):
         ownership_weight: float = 0.0,
         ownership_valid_mask: Optional[torch.Tensor] = None,
         ownership_pos_weight: float = 1.0,
+        target_bonus: Optional[torch.Tensor] = None,
+        bonus_weight: float = 0.0,
+        target_threat: Optional[torch.Tensor] = None,
+        threat_weight: float = 0.0,
+        policy_entropy_bonus_weight: float = 0.0,
+        value_label_smoothing: float = 0.0,
         x_global: Optional[torch.Tensor] = None,
         x_track: Optional[torch.Tensor] = None,
         shop_ids: Optional[torch.Tensor] = None,
@@ -1050,8 +1094,18 @@ class PatchworkNetwork(nn.Module):
                 raise RuntimeError("policy_loss is NaN - check masks/logits/targets")
             policy_loss = torch.tensor(0.0, device=policy_loss.device)  # Inference: skip
 
+        # Policy entropy (in-graph so entropy regularisation receives gradients).
+        # Reuses log_probs already computed above — no extra forward pass.
+        policy_entropy_live = -(log_probs.exp() * log_probs).sum(dim=-1).mean()
+
         # Value loss (MSE on pure binary target: +1/-1/0)
         # Value head predicts P(win) via tanh; score head independently handles margin.
+        # Label smoothing: clamp targets away from ±1 to prevent infinite-logit pressure.
+        # Targets are in {-1, 0, +1}; smoothed range becomes [-(1-ε), +(1-ε)].
+        if value_label_smoothing > 0.0:
+            target_value = target_value.clamp(
+                -(1.0 - value_label_smoothing), 1.0 - value_label_smoothing
+            )
         value_loss = F.mse_loss(value, target_value)
 
         # Score loss: distributional CE over 201 bins (soft target from replay score_margins).
@@ -1107,11 +1161,30 @@ class PatchworkNetwork(nn.Module):
                         ownership_logits, target_ownership
                     )
 
+        # 7×7 bonus prediction (binary BCE with logits, two outputs: me / opponent)
+        # target_bonus: (B, 2) float32 — [1.0 if current player got bonus else 0.0,
+        #                                  1.0 if opponent got bonus else 0.0]
+        bonus_loss = torch.tensor(0.0, device=state.device)
+        if self.bonus_head is not None and target_bonus is not None and bonus_weight > 0:
+            bonus_logits = self.bonus_head(trunk)  # (B, 2) raw logits
+            bonus_loss = F.binary_cross_entropy_with_logits(bonus_logits, target_bonus.float())
+
+        # Opponent board threat (sigmoid MSE regression on normalized empty fraction)
+        # target_threat: (B,) float32 — opponent's final empty squares / 81  ∈ [0, 1]
+        threat_loss = torch.tensor(0.0, device=state.device)
+        if self.threat_head is not None and target_threat is not None and threat_weight > 0:
+            threat_logits = self.threat_head(trunk).squeeze(-1)  # (B,)
+            threat_pred = torch.sigmoid(threat_logits)           # bound to [0, 1]
+            threat_loss = F.mse_loss(threat_pred, target_threat.float())
+
         total_loss = (
             policy_weight * policy_loss
             + value_weight * value_loss
             + score_loss_weight * score_loss
             + ownership_weight * ownership_loss
+            + bonus_weight * bonus_loss
+            + threat_weight * threat_loss
+            - policy_entropy_bonus_weight * policy_entropy_live
         )
 
         # Guard against NaN in any loss component (not just policy)
@@ -1119,7 +1192,8 @@ class PatchworkNetwork(nn.Module):
             if self.training:
                 raise RuntimeError(
                     f"total_loss is NaN — policy={policy_loss.item()}, "
-                    f"value={value_loss.item()}, ownership={ownership_loss.item()}. "
+                    f"value={value_loss.item()}, ownership={ownership_loss.item()}, "
+                    f"bonus={bonus_loss.item()}, threat={threat_loss.item()}. "
                     f"Check inputs for corruption."
                 )
             total_loss = torch.tensor(0.0, device=total_loss.device)
@@ -1131,9 +1205,8 @@ class PatchworkNetwork(nn.Module):
             _, top5_pred = policy_logits.topk(5, dim=-1)
             policy_top5_accuracy = (top5_pred == target_actions.unsqueeze(1)).any(dim=1).float().mean()
 
-            # Training diagnostics: policy entropy, target entropy, and KL divergence
-            policy_probs = log_probs.exp()
-            policy_entropy = -(policy_probs * log_probs).sum(dim=-1).mean()
+            # Training diagnostics: policy entropy (reuse in-graph tensor — already computed above)
+            policy_entropy = policy_entropy_live
 
             target_log = target_policy_norm.clamp(min=1e-8).log()
             target_entropy = -(target_policy_norm * target_log).sum(dim=-1).mean()
@@ -1242,6 +1315,8 @@ class PatchworkNetwork(nn.Module):
             "ownership_empty_precision": float(ownership_empty_precision),
             "ownership_balanced_accuracy": float(ownership_balanced_accuracy),
             "ownership_mae_empty_count": float(ownership_mae_empty_count),
+            "bonus_loss": float(bonus_loss.item()),
+            "threat_loss": float(threat_loss.item()),
         }
         return total_loss, metrics
 
@@ -1271,6 +1346,7 @@ def create_network(config: dict) -> PatchworkNetwork:
         se_ratio=float(net_config["se_ratio"]),
         dropout=float(net_config["dropout"]),
         ownership_channels=int(net_config.get("ownership_channels", 0)),
+        aux_channels=int(net_config.get("aux_channels", 0)),
         use_film=bool(net_config.get("use_film", False)),
         film_hidden=int(net_config.get("film_hidden", 256)),
         film_input_plane_indices=film_indices,
@@ -1364,6 +1440,8 @@ def load_model_checkpoint(
         | {k for k in missing if "score_head" in k}
         | {k for k in missing if "film_mlp" in k}
         | {k for k in missing if "det_legality" in k}  # new non-trainable module
+        | {k for k in missing if "bonus_head" in k}    # aux head — absent in pre-aux checkpoints
+        | {k for k in missing if "threat_head" in k}   # aux head — absent in pre-aux checkpoints
         | policy_structured_missing
         | policy_fc_factorized_missing
         | policy_fc_legacy_missing

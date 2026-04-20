@@ -468,10 +468,7 @@ class SelfPlayGenerator:
                     if done % 50 == 0:
                         elapsed = time.time() - batch_start
                         gpm = (done / elapsed) * 60.0 if elapsed > 0 else 0
-                        logger.info(
-                            "    Batch progress: %d/%d games (%.1f games/min)",
-                            done, num_games, gpm,
-                        )
+                        logger.info("%d/%d  ·  %.1f g/min", done, num_games, gpm)
             pool.close()
         except KeyboardInterrupt:
             logger.warning("Batch interrupted after %d/%d games", len(summaries), num_games)
@@ -534,7 +531,8 @@ class SelfPlayGenerator:
                         elapsed = time.time() - selfplay_start_time
                         games_per_min = (len(summaries) / elapsed) * 60.0 if elapsed > 0 else 0
                         logger.info(
-                            f"{len(summaries)}/{num_games} ({games_per_min:.1f} games/min)"
+                            "%d/%d  ·  %.1f g/min",
+                            len(summaries), num_games, games_per_min,
                         )
             pool.close()
         except TimeoutError as e:
@@ -710,6 +708,8 @@ class SelfPlayGenerator:
                 compression_opts=compression_opts,
             )
             slot_piece_ids_ds = None
+            bonus7x7_ds = None
+            opp_threat_ds = None
             canonical_mode = None
             scores_mode = None
 
@@ -800,6 +800,34 @@ class SelfPlayGenerator:
                             )
                         slot_piece_ids_ds.resize(new_size, axis=0)
                         slot_piece_ids_ds[total_pos:new_size] = shard["slot_piece_ids"]
+
+                    if "bonus7x7" in shard:
+                        if bonus7x7_ds is None:
+                            bonus7x7_ds = out.create_dataset(
+                                "bonus7x7",
+                                shape=(0, 2),
+                                maxshape=(None, 2),
+                                dtype=np.float32,
+                                chunks=(512, 2),
+                                compression=compression,
+                                compression_opts=compression_opts,
+                            )
+                        bonus7x7_ds.resize(new_size, axis=0)
+                        bonus7x7_ds[total_pos:new_size] = shard["bonus7x7"]
+
+                    if "opp_threat" in shard:
+                        if opp_threat_ds is None:
+                            opp_threat_ds = out.create_dataset(
+                                "opp_threat",
+                                shape=(0,),
+                                maxshape=(None,),
+                                dtype=np.float32,
+                                chunks=(512,),
+                                compression=compression,
+                                compression_opts=compression_opts,
+                            )
+                        opp_threat_ds.resize(new_size, axis=0)
+                        opp_threat_ds[total_pos:new_size] = shard["opp_threat"]
 
                     total_pos = new_size
 

@@ -670,12 +670,13 @@ class OptimizedAlphaZeroMCTS:
         self.use_amp = bool(inf.get("use_amp", True))
         self.amp_dtype = str(inf.get("amp_dtype", "float16")).lower()
         self.allow_tf32 = bool(inf.get("allow_tf32", True))
+        self.eval_mode = bool(inf.get("eval_mode", False))
 
         if self.device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = self.allow_tf32
             torch.backends.cudnn.allow_tf32 = self.allow_tf32
             deterministic = bool(inf.get("deterministic", True))
-            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.benchmark = bool(inf.get("cudnn_benchmark", False))
             torch.backends.cudnn.deterministic = deterministic
             # NOTE: torch.use_deterministic_algorithms(True) disabled - CUBLAS compatibility
             # if deterministic:
@@ -726,9 +727,14 @@ class OptimizedAlphaZeroMCTS:
             config.score_min, config.score_max + 1,
             device=self.device, dtype=torch.float32,
         )
+        self._score_utility_scale = float(config.score_utility_scale)
+        # Precomputed sat(bins/scale) — constant for all searches; avoids recomputing
+        # 201-element atan on every forward batch call.
+        self._sat_static_t = (2.0 / math.pi) * torch.atan(
+            self._score_bins_t / self._score_utility_scale
+        )
         # WIN_FIRST validation: log root selection once when debug_log_one_game is True
         self._win_first_debug_logged = False
-        self._score_utility_scale = float(config.score_utility_scale)
 
     def set_noise_seed(self, seed: int) -> None:
         """Reset the Dirichlet noise RNG. Call before each game for reproducibility."""
@@ -866,8 +872,9 @@ class OptimizedAlphaZeroMCTS:
         self._expand_and_evaluate(root, precomputed_legal=root_legal_actions)
         if add_noise and root.legal_actions and len(root.legal_actions) > 0:
             self._add_dirichlet_noise(root)
-        # Apply progressive widening order at root AFTER noise (so top-K BUY uses noisy priors in self-play)
-        if self.config.progressive_widening.enabled and root.legal_actions:
+        # Apply progressive widening order at root AFTER noise (so top-K BUY uses noisy priors in self-play).
+        # Skipped in eval_mode: root PW is a self-play exploration heuristic, not needed for clean eval.
+        if self.config.progressive_widening.enabled and root.legal_actions and not self.eval_mode:
             _apply_progressive_widening_order(
                 root, self.config.progressive_widening,
                 is_root=True,
@@ -1345,7 +1352,7 @@ class OptimizedAlphaZeroMCTS:
             elif self._use_multimodal:
                 x_spatial, x_global, x_track, shop_ids, shop_feats = self.state_encoder.encode_state_multimodal(node.state, node.to_move)
                 states_np.append(x_spatial.astype(np.float32, copy=False))
-                mm_extras.append((x_global.astype(np.float32), x_track.astype(np.float32), shop_ids, shop_feats.astype(np.float32)))
+                mm_extras.append((x_global.astype(np.float32, copy=False), x_track.astype(np.float32, copy=False), shop_ids, shop_feats.astype(np.float32, copy=False)))
             else:
                 state_np = self.state_encoder.encode_state(node.state, node.to_move).astype(np.float32, copy=False)
                 states_np.append(state_np)
@@ -1445,10 +1452,10 @@ class OptimizedAlphaZeroMCTS:
         x_global_t = x_track_t = shop_ids_t = shop_feats_t = None
         if self._use_multimodal and mm_extras:
             xg_list, xt_list, si_list, sf_list = zip(*mm_extras)
-            x_global_t = torch.from_numpy(np.stack(xg_list, axis=0).astype(np.float32)).to(self.device, non_blocking=non_block)
-            x_track_t = torch.from_numpy(np.stack(xt_list, axis=0).astype(np.float32)).to(self.device, non_blocking=non_block)
+            x_global_t = torch.from_numpy(np.stack(xg_list, axis=0).astype(np.float32, copy=False)).to(self.device, non_blocking=non_block)
+            x_track_t = torch.from_numpy(np.stack(xt_list, axis=0).astype(np.float32, copy=False)).to(self.device, non_blocking=non_block)
             shop_ids_t = torch.from_numpy(np.stack(si_list, axis=0).astype(np.int64)).to(self.device, non_blocking=non_block)
-            shop_feats_t = torch.from_numpy(np.stack(sf_list, axis=0).astype(np.float32)).to(self.device, non_blocking=non_block)
+            shop_feats_t = torch.from_numpy(np.stack(sf_list, axis=0).astype(np.float32, copy=False)).to(self.device, non_blocking=non_block)
 
         with torch.inference_mode():
             if self.device.type == "cuda" and self.use_amp:
@@ -1484,15 +1491,23 @@ class OptimizedAlphaZeroMCTS:
             [self._search_root_score if is_r else -self._search_root_score for is_r in is_root_flags],
             device=self.device, dtype=torch.float32,
         )
-        scale = self._score_utility_scale
-        sat = lambda x: (2.0 / math.pi) * torch.atan(x)
-        static_util_t = (p * sat(bins.unsqueeze(0) / scale)).sum(dim=-1)
-        dynamic_util_t = (p * sat((bins.unsqueeze(0) - centers_t.unsqueeze(1)) / scale)).sum(dim=-1)
+        # Use precomputed sat(bins/scale) — avoids recomputing 201-element atan every batch.
+        static_util_t = (p * self._sat_static_t.unsqueeze(0)).sum(dim=-1)
+        dynamic_util_t = (p * (2.0 / math.pi) * torch.atan(
+            (bins.unsqueeze(0) - centers_t.unsqueeze(1)) / self._score_utility_scale
+        )).sum(dim=-1)
         score_utility_t = self._search_effective_static_w * static_util_t + self._search_effective_dynamic_w * dynamic_util_t
+
+        # Batch policy post-processing: one masked_fill + softmax + single GPU→CPU transfer
+        # instead of B separate (index_select + softmax + .cpu()) round-trips.
+        priors_full = torch.softmax(
+            policy_logits.float().masked_fill(am < 0.5, float('-inf')), dim=-1
+        )  # (B, 2026): legal positions have valid probs, illegal=0 after softmax
 
         value_cpu = value_t.float().cpu().numpy()
         mean_points_cpu = mean_points_t.float().cpu().numpy()
         score_utility_cpu = score_utility_t.float().cpu().numpy()
+        priors_cpu_all = priors_full.cpu().numpy()  # single (B, 2026) transfer
 
         result_local: List[Tuple[float, float, float]] = [None] * len(nodes)  # type: ignore[list-item]
         for i in range(len(nodes)):
@@ -1503,11 +1518,8 @@ class OptimizedAlphaZeroMCTS:
             if terminal_out[i] is not None:
                 continue
             legal_idxs = legal_indices_list[nonterm_idx]
-            idx_t = torch.from_numpy(legal_idxs).to(self.device)
-            legal_logits = policy_logits[nonterm_idx].index_select(0, idx_t)
-            priors = torch.softmax(legal_logits, dim=0)
-            priors_cpu = priors.float().cpu().numpy()
-            node._prior[:] = priors_cpu[:len(node.legal_actions)]
+            # Numpy fancy-index: extract priors for legal actions — no per-node GPU round-trip.
+            node._prior[:len(node.legal_actions)] = priors_cpu_all[nonterm_idx, legal_idxs]
             if self.config.progressive_widening.enabled:
                 _apply_progressive_widening_order(
                     node, self.config.progressive_widening,
@@ -1519,8 +1531,7 @@ class OptimizedAlphaZeroMCTS:
             s_points = float(mean_points_cpu[nonterm_idx])
             su = float(score_utility_cpu[nonterm_idx])
             node.score_estimate = s_points
-            u = v + su
-            result_local[i] = (v, s_points, u)
+            result_local[i] = (v, s_points, v + su)
             nonterm_idx += 1
         return result_local
 
@@ -1709,8 +1720,14 @@ def create_optimized_mcts(
     eval_client=None,
     *,
     enable_tree_reuse: Optional[bool] = None,
+    eval_mode: bool = False,
 ) -> OptimizedAlphaZeroMCTS:
-    """Factory function to create MCTS from config."""
+    """Factory function to create MCTS from config.
+
+    eval_mode=True disables packing_ordering and patch_tiebreak (pure overhead in
+    eval — these are search-quality heuristics for self-play, not needed for clean
+    measurement) and enables cudnn.benchmark (fixed input shapes during eval).
+    """
     mcts_cfg = config.get("selfplay", {}).get("mcts", {}) or {}
     win_first = _parse_and_validate_win_first(mcts_cfg.get("win_first"))
     progressive_widening = _parse_progressive_widening(mcts_cfg.get("progressive_widening"))
@@ -1750,6 +1767,22 @@ def create_optimized_mcts(
         if mcts_config.parallel_leaves > max_leaves:
             mcts_config.parallel_leaves = max_leaves
 
+    if eval_mode:
+        # Disable search-quality heuristics that add CPU overhead without improving
+        # eval measurement quality.  packing_ordering and patch_tiebreak are self-play
+        # exploration aids; in eval (temperature=0, deterministic) they add ~3-4s/game
+        # of Python overhead (sort + C extension per leaf expansion) for no benefit.
+        mcts_config.packing_ordering.enabled = False
+        mcts_config.patch_tiebreak.enabled = False
+
+    inf_settings = dict(config.get("inference", {}) or {})
+    if eval_mode:
+        # Allow cuDNN to auto-tune for the fixed input shapes used in eval
+        # (batch ≤ parallel_leaves, fixed 60ch × 9×9 board).  This is set once
+        # per eval session; the warm-up cost is ~1-2 games then it stays fast.
+        inf_settings["cudnn_benchmark"] = True
+        inf_settings["eval_mode"] = True
+
     return OptimizedAlphaZeroMCTS(
         network,
         mcts_config,
@@ -1757,6 +1790,6 @@ def create_optimized_mcts(
         state_encoder,
         action_encoder,
         eval_client=eval_client,
-        inference_settings=(config.get("inference", {}) or {}),
+        inference_settings=inf_settings,
         full_config=config,
     )

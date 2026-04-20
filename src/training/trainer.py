@@ -283,6 +283,9 @@ class PatchworkDataset(Dataset):
                     )
             else:
                 self._slot_piece_ids = None
+            # Auxiliary scalar targets (optional — absent in legacy data, fine to skip)
+            self._bonus7x7 = np.array(f["bonus7x7"], dtype=np.float32) if "bonus7x7" in f else None
+            self._opp_threat = np.array(f["opp_threat"], dtype=np.float32) if "opp_threat" in f else None
 
         # Ensure values are (N, 1)
         if self._values.ndim == 1:
@@ -377,12 +380,17 @@ class PatchworkDataset(Dataset):
                     states, masks, policies, ownerships, slot_ids
                 )
 
+        bonus7x7 = self._bonus7x7[idxs] if self._bonus7x7 is not None else None
+        opp_threat = self._opp_threat[idxs] if self._opp_threat is not None else None
+
         states = torch.from_numpy(states)
         action_masks = torch.from_numpy(masks)
         policies = torch.from_numpy(policies)
         values = torch.from_numpy(values)
         ownerships = torch.from_numpy(ownerships)
         score_margins = torch.from_numpy(score_margins)
+        bonus7x7_t = torch.from_numpy(bonus7x7) if bonus7x7 is not None else None
+        opp_threat_t = torch.from_numpy(opp_threat) if opp_threat is not None else None
         if self._multimodal and global_s is not None:
             global_states = torch.from_numpy(global_s)
             track_states = torch.from_numpy(track_s)
@@ -398,6 +406,10 @@ class PatchworkDataset(Dataset):
             values = values.squeeze(0)
             ownerships = ownerships.squeeze(0)
             score_margins = score_margins.squeeze(0)
+            if bonus7x7_t is not None:
+                bonus7x7_t = bonus7x7_t.squeeze(0)
+            if opp_threat_t is not None:
+                opp_threat_t = opp_threat_t.squeeze(0)
             if self._multimodal:
                 global_states = global_states.squeeze(0)
                 track_states = track_states.squeeze(0)
@@ -416,6 +428,8 @@ class PatchworkDataset(Dataset):
             "shop_ids": shop_ids_t,
             "shop_feats": shop_feats_t,
             "slot_piece_ids": slot_piece_ids_out,
+            "bonus7x7": bonus7x7_t,
+            "opp_threat": opp_threat_t,
         }
 
 
@@ -534,6 +548,21 @@ class Trainer:
         self._score_bin_vals: Optional[torch.Tensor] = None
         self.ownership_weight = float(train_config.get("ownership_loss_weight", 0.0))
         self.ownership_pos_weight = float(train_config.get("ownership_pos_weight", 1.0))
+        self.bonus_weight = float(train_config.get("bonus7x7_loss_weight", 0.0))
+        self.threat_weight = float(train_config.get("opp_threat_loss_weight", 0.0))
+        self.policy_entropy_bonus = float(train_config.get("policy_entropy_bonus_weight", 0.0))
+        self.value_label_smoothing = float(train_config.get("value_label_smoothing", 0.0))
+
+        # Score target sigma schedule: taper from wide (noisy early games) to sharp (late training).
+        # Inline lookup — mirrors _step_schedule_lookup in main.py without the import dependency.
+        sigma_sched = (config.get("iteration", {}) or {}).get("score_sigma_schedule", []) or []
+        if sigma_sched:
+            scheduled_sigma = self.score_target_sigma  # fallback = value already read from config
+            for entry in sorted(sigma_sched, key=lambda e: e["iteration"]):
+                if current_iteration >= entry["iteration"]:
+                    scheduled_sigma = float(entry["sigma"])
+            self.score_target_sigma = scheduled_sigma
+
         self.max_grad_norm = train_config["max_grad_norm"]
 
         # Optional CE/entropy decomposition debug: log a few step-level samples.
@@ -772,7 +801,7 @@ class Trainer:
             ckpt_step = int(ckpt.get("global_step", self.global_step))
             self.global_step = max(self.global_step, ckpt_step)
         train_base = model_source if model_source is not None else checkpoint_path
-        logger.info(
+        logger.debug(
             "[OPT_RESUME] source=%s train_base=%s (must match)  enabled=opt:%s sched:%s scaler:%s ema:%s  loaded=opt:%s sched:%s scaler:%s ema:%s",
             checkpoint_path,
             train_base,
@@ -887,6 +916,8 @@ class Trainer:
             "value_loss": 0.0,
             "score_loss": 0.0,
             "ownership_loss": 0.0,
+            "bonus_loss": 0.0,
+            "threat_loss": 0.0,
             "total_loss": 0.0,
             "policy_accuracy": 0.0,
             "policy_top5_accuracy": 0.0,
@@ -971,6 +1002,12 @@ class Trainer:
                     # Pass validity mask to get_loss for per-sample masking
                     own_valid_mask = valid_mask.to(self.device)
 
+            # Auxiliary targets (optional — None when absent in legacy data)
+            raw_bonus = batch.get("bonus7x7")
+            raw_threat = batch.get("opp_threat")
+            target_bonus = raw_bonus.to(self.device, non_blocking=True) if raw_bonus is not None else None
+            target_threat = raw_threat.to(self.device, non_blocking=True) if raw_threat is not None else None
+
             self.optimizer.zero_grad(set_to_none=True)
 
             x_global = batch["x_global"]
@@ -1006,6 +1043,10 @@ class Trainer:
                         ownership_valid_mask=own_valid_mask,
                         ownership_pos_weight=self.ownership_pos_weight,
                         x_global=xg, x_track=xt, shop_ids=si, shop_feats=sf,
+                        target_bonus=target_bonus, bonus_weight=self.bonus_weight,
+                        target_threat=target_threat, threat_weight=self.threat_weight,
+                        policy_entropy_bonus_weight=self.policy_entropy_bonus,
+                        value_label_smoothing=self.value_label_smoothing,
                     )
             else:
                 loss, metrics = self.network.get_loss(
@@ -1018,6 +1059,10 @@ class Trainer:
                         ownership_valid_mask=own_valid_mask,
                         ownership_pos_weight=self.ownership_pos_weight,
                         x_global=xg, x_track=xt, shop_ids=si, shop_feats=sf,
+                        target_bonus=target_bonus, bonus_weight=self.bonus_weight,
+                        target_threat=target_threat, threat_weight=self.threat_weight,
+                        policy_entropy_bonus_weight=self.policy_entropy_bonus,
+                        value_label_smoothing=self.value_label_smoothing,
                     )
             _t3 = time.perf_counter() if _t0 is not None else None
 
@@ -1099,7 +1144,7 @@ class Trainer:
 
             if _t0 is not None and _t1 is not None and _t2 is not None and _t3 is not None and _t4 is not None and _t5 is not None:
                 total_ms = (time.perf_counter() - _t0) * 1000
-                logger.info(
+                logger.debug(
                     "[PERF] step %d: h2d=%.0fms d4=%.0fms fwd=%.0fms bwd=%.0fms ema=%.0fms other=%.0fms total=%.0fms",
                     self.global_step,
                     (_t1 - _t0) * 1000,
@@ -1120,6 +1165,10 @@ class Trainer:
                 self.writer.add_scalar("train/grad_norm", grad_norm.item(), self.global_step)
                 self.writer.add_scalar("train/policy_entropy", metrics["policy_entropy"], self.global_step)
                 self.writer.add_scalar("train/policy_accuracy", metrics["policy_accuracy"], self.global_step)
+                if metrics.get("bonus_loss", 0.0) > 0:
+                    self.writer.add_scalar("train/bonus_loss", metrics["bonus_loss"], self.global_step)
+                if metrics.get("threat_loss", 0.0) > 0:
+                    self.writer.add_scalar("train/threat_loss", metrics["threat_loss"], self.global_step)
 
             if val_loader is not None and self.global_step % self.config["training"]["val_frequency"] == 0:
                 val_metrics = self.validate(val_loader)
@@ -1130,6 +1179,10 @@ class Trainer:
                 self.writer.add_scalar("val/value_loss", val_metrics["value_loss"], self.global_step)
                 self.writer.add_scalar("val/policy_entropy", val_metrics["policy_entropy"], self.global_step)
                 self.writer.add_scalar("val/policy_accuracy", val_metrics["policy_accuracy"], self.global_step)
+                if val_metrics.get("bonus_loss", 0.0) > 0:
+                    self.writer.add_scalar("val/bonus_loss", val_metrics["bonus_loss"], self.global_step)
+                if val_metrics.get("threat_loss", 0.0) > 0:
+                    self.writer.add_scalar("val/threat_loss", val_metrics["threat_loss"], self.global_step)
 
                 logger.debug(f"Step {self.global_step}: Val loss = {val_metrics['total_loss']:.4f}")
 
@@ -1163,6 +1216,8 @@ class Trainer:
             "value_loss": 0.0,
             "score_loss": 0.0,
             "ownership_loss": 0.0,
+            "bonus_loss": 0.0,
+            "threat_loss": 0.0,
             "total_loss": 0.0,
             "policy_accuracy": 0.0,
             "policy_top5_accuracy": 0.0,
@@ -1201,6 +1256,10 @@ class Trainer:
                 xt = x_track.to(self.device, non_blocking=True) if x_track is not None else None
                 si = shop_ids.to(self.device, non_blocking=True) if shop_ids is not None else None
                 sf = shop_feats.to(self.device, non_blocking=True) if shop_feats is not None else None
+                raw_bonus = batch.get("bonus7x7")
+                raw_threat = batch.get("opp_threat")
+                val_target_bonus = raw_bonus.to(self.device, non_blocking=True) if raw_bonus is not None else None
+                val_target_threat = raw_threat.to(self.device, non_blocking=True) if raw_threat is not None else None
                 target_score_dist = None
                 if self.score_loss_weight > 0:
                     if self._score_bin_vals is None or self._score_bin_vals.device != score_margins.device:
@@ -1225,6 +1284,10 @@ class Trainer:
                             ownership_valid_mask=own_valid_mask,
                             ownership_pos_weight=self.ownership_pos_weight,
                             x_global=xg, x_track=xt, shop_ids=si, shop_feats=sf,
+                            target_bonus=val_target_bonus, bonus_weight=self.bonus_weight,
+                            target_threat=val_target_threat, threat_weight=self.threat_weight,
+                            policy_entropy_bonus_weight=self.policy_entropy_bonus,
+                            value_label_smoothing=self.value_label_smoothing,
                         )
                 else:
                     _, metrics = self.network.get_loss(
@@ -1237,6 +1300,10 @@ class Trainer:
                         ownership_valid_mask=own_valid_mask,
                         ownership_pos_weight=self.ownership_pos_weight,
                         x_global=xg, x_track=xt, shop_ids=si, shop_feats=sf,
+                        target_bonus=val_target_bonus, bonus_weight=self.bonus_weight,
+                        target_threat=val_target_threat, threat_weight=self.threat_weight,
+                        policy_entropy_bonus_weight=self.policy_entropy_bonus,
+                        value_label_smoothing=self.value_label_smoothing,
                     )
 
                 for k, v in metrics.items():
@@ -1559,13 +1626,13 @@ def train_iteration(
             current_lr = trainer.scheduler.get_last_lr()[0]
             own_str = ""
             if metrics.get("ownership_loss", 0.0) > 0:
-                own_str = f"  own_loss={metrics['ownership_loss']:.4f}  own_acc={metrics.get('ownership_accuracy', 0.0):.1%}"
+                own_str = f"  own={metrics['ownership_loss']:.4f}  own_acc={metrics.get('ownership_accuracy', 0.0):.1%}"
             skip_str = f"  skip={metrics.get('step_skip_rate', 0):.1%}" if metrics.get("step_skip_rate", 0) > 0 else ""
             logger.info(
-                f"  Epoch {epoch+1} done in {epoch_time:.1f}s | "
-                f"loss={metrics['total_loss']:.4f}  pol_loss={metrics['policy_loss']:.4f}  val_loss={metrics['value_loss']:.4f}{own_str} | "
-                f"pol_acc={metrics['policy_accuracy']:.1%}  top5={metrics['policy_top5_accuracy']:.1%} | "
-                f"val_mse={metrics['value_mse']:.4f}  grad={metrics['grad_norm']:.3f}{skip_str} | "
+                f"E{epoch+1}  {epoch_time:.1f}s  "
+                f"loss={metrics['total_loss']:.4f}  pol={metrics['policy_loss']:.4f}  val={metrics['value_loss']:.4f}{own_str}  "
+                f"pol_acc={metrics['policy_accuracy']:.1%}  top5={metrics['policy_top5_accuracy']:.1%}  "
+                f"mse={metrics['value_mse']:.4f}  grad={metrics['grad_norm']:.3f}{skip_str}  "
                 f"LR={current_lr:.2e}"
             )
             all_metrics.append(metrics)

@@ -14,6 +14,7 @@ Transactional design:
 
 import json
 import logging
+import math
 import os
 import shutil
 from pathlib import Path
@@ -55,6 +56,64 @@ def _validate_score_margins(
         )
 
 
+def _bounded_hamilton(weights: List[float], caps: List[int], total: int) -> List[int]:
+    """
+    Allocate ``total`` integers proportionally to ``weights``, capped per entry.
+
+    Uses binary search (water-filling) to find the continuous-quota multiplier
+    alpha, then a single Hamilton rounding pass.  No early rounding or iterative
+    redistribute loop — the result is always exactly ``total`` (summed).
+
+    Args:
+        weights: Non-negative float weight for each entry.
+        caps:    Maximum integers that can be taken from each entry.
+        total:   Target total to allocate (clamped to [0, sum(caps)]).
+
+    Returns:
+        List of integer takes, one per entry, summing to ``total``.
+    """
+    n = len(weights)
+    assert len(caps) == n
+    total = max(0, min(total, sum(caps)))
+    if n == 0 or total == 0:
+        return [0] * n
+
+    # Entries eligible for allocation (positive weight and positive cap)
+    pos = [i for i, (w, c) in enumerate(zip(weights, caps)) if w > 0 and c > 0]
+    if not pos:
+        # Fallback: allocate cap-proportionally when all weights are zero
+        weights = [float(c) for c in caps]
+        pos = [i for i, c in enumerate(caps) if c > 0]
+
+    # Binary search for alpha such that sum(min(cap_i, alpha * w_i)) == total
+    lo = 0.0
+    hi = max(caps[i] / weights[i] for i in pos)
+    for _ in range(64):
+        mid = (lo + hi) / 2.0
+        if sum(min(caps[i], mid * weights[i]) for i in pos) >= total:
+            hi = mid
+        else:
+            lo = mid
+
+    alpha = hi
+    quotas = [0.0] * n
+    for i in pos:
+        quotas[i] = min(caps[i], alpha * weights[i])
+
+    # Floor each quota, then distribute remainder via largest-fraction (Hamilton) rule.
+    # Tie-break by index (higher = newer, since _entries is sorted oldest-first).
+    takes = [min(caps[i], math.floor(quotas[i])) for i in range(n)]
+    rem = total - sum(takes)
+    order = sorted(
+        [i for i in range(n) if takes[i] < caps[i]],
+        key=lambda i: (quotas[i] - takes[i], i),  # higher i = newer; reverse=True below
+        reverse=True,
+    )
+    for i in order[:rem]:
+        takes[i] += 1
+    return takes
+
+
 class ReplayBuffer:
     """
     Sliding-window replay buffer backed by HDF5 files.
@@ -92,6 +151,12 @@ class ReplayBuffer:
                 self._recency_window = 0.0
         else:
             self._recency_window = 0.0
+
+        self.recency_weight_lambda = float(rb_config.get("recency_weight_lambda", 1.0))
+        if not (0.0 < self.recency_weight_lambda <= 1.0):
+            raise ValueError(
+                f"recency_weight_lambda must be in (0, 1], got {self.recency_weight_lambda}"
+            )
 
         self.buffer_dir = Path(config["paths"].get("data_dir", "data")) / "replay_buffer"
         self._state_path = Path(state_path) if state_path else self.buffer_dir / "replay_state.json"
@@ -290,19 +355,62 @@ class ReplayBuffer:
         total = sum(n for _, _, n in self._entries)
         logger.debug(f"Replay buffer merge: {total} total positions from {len(self._entries)} iterations")
 
-        # Decide per-file sample counts
+        # Decide per-file sample counts.
+        #
+        # Three paths (priority order):
+        #   1. recency_weight_lambda < 1.0 AND league disabled: proportional oversampling.
+        #      Newer iters contribute > their raw share (sampled with replacement if needed),
+        #      older iters contribute < their share.  Total = exactly target_total.
+        #      Active regardless of buffer fill level — does not require overflow.
+        #   2. use_newest_bias (league enabled + overflow): newest_fraction split.
+        #   3. Uniform: use-all when fits, proportional trim when overflow.
+        #
         target_total = min(total, self.max_size)
         rng = np.random.default_rng(seed)
         per_file: List[Tuple[int, str, int, int]] = []
-        if total <= self.max_size:
+
+        # League path requires an explicit recency window; without it newest_fraction is a no-op.
+        use_newest_bias = (
+            self.newest_fraction > 0
+            and len(self._entries) > 1
+            and getattr(self, "_recency_window", 0.0) > 0
+        )
+
+        if self.recency_weight_lambda < 1.0 and not use_newest_bias:
+            # Proportional recency oversampling — always active when lambda < 1.0.
+            # w_i = lambda^age * n_i.  Each iter's share = w_i / sum(w_j) * target_total.
+            # Newer iters (high weight) receive MORE than their raw n_i → oversampled
+            #   with replacement (some positions appear twice in the merged file).
+            # Older iters receive LESS → subsampled without replacement as usual.
+            max_iter = max(it for it, _, _ in self._entries)
+            weights = [
+                (self.recency_weight_lambda ** (max_iter - it)) * n
+                for it, _, n in self._entries
+            ]
+            total_weight = sum(weights)
+            raw = [w / total_weight * target_total for w in weights]
+            takes = [math.floor(r) for r in raw]
+            rem = target_total - sum(takes)
+            # Hamilton rounding: largest fractional remainder first; higher index = newer wins ties.
+            order = sorted(range(len(raw)), key=lambda i: (raw[i] - takes[i], i), reverse=True)
+            for i in order[:rem]:
+                takes[i] += 1
+            for i, (it, p, n) in enumerate(self._entries):
+                per_file.append((it, p, n, takes[i]))
+            scale = target_total / total_weight if total_weight > 0 else 1.0
+            logger.debug(
+                "Replay buffer: recency oversampling %d -> %d positions "
+                "(lambda=%.2f, scale=%.3fx, takes=%s)",
+                total, target_total, self.recency_weight_lambda, scale, takes,
+            )
+        elif total <= self.max_size:
+            # Buffer fits entirely: use all positions uniformly.
             for it, p, n in self._entries:
                 per_file.append((it, p, n, n))
         else:
-            use_newest_bias = self.newest_fraction > 0 and len(self._entries) > 1
             if use_newest_bias:
-                # Recency-biased sampling: newest_fraction of samples come from
+                # League recency-biased sampling: newest_fraction of samples come from
                 # the newest _recency_window fraction of the buffer (by position count).
-                # This generalizes the old "newest iteration only" approach.
                 recency_window = getattr(self, '_recency_window', 0.0)
                 if recency_window > 0 and len(self._entries) > 1:
                     # Identify "newest" entries: those in the top recency_window of positions
@@ -367,7 +475,7 @@ class ReplayBuffer:
                     f"(newest={newest_take}, rest={rest_take}, newest_frac={self.newest_fraction:.0%})"
                 )
             else:
-                # Uniform proportional allocation
+                # Uniform proportional overflow (lambda == 1.0, league disabled)
                 raw = [n * target_total / total for _, _, n in self._entries]
                 base = [int(x) for x in raw]
                 rem = target_total - sum(base)
@@ -454,8 +562,9 @@ class ReplayBuffer:
                                 "so all self-play data uses the new schema."
                             )
                         idx = np.arange(n, dtype=np.int64)
-                        if take < n:
-                            idx = rng.choice(idx, size=take, replace=False)
+                        if take != n:
+                            # replace=True when take > n (oversampling newer iterations).
+                            idx = rng.choice(idx, size=take, replace=take > n)
                             idx.sort()
                         # batched gather for locality
                         file_multimodal = "spatial_states" in f
@@ -466,10 +575,21 @@ class ReplayBuffer:
                             )
                         for s0 in range(0, len(idx), read_chunk):
                             sl = idx[s0:s0 + read_chunk]
-                            if merge_multimodal:
-                                st_raw = np.asarray(f["spatial_states"][sl], dtype=np.float32)
+                            # h5py requires strictly increasing (no duplicate) indices.
+                            # When oversampling (take > n), sl may contain duplicates.
+                            # Deduplicate for h5py, then expand back via inverse mapping.
+                            if take > n:
+                                sl_h5, sl_inv = np.unique(sl, return_inverse=True)
                             else:
-                                st_raw = np.asarray(f["states"][sl], dtype=np.float32)
+                                sl_h5, sl_inv = sl, None
+                            if merge_multimodal:
+                                st_raw = np.asarray(f["spatial_states"][sl_h5], dtype=np.float32)
+                                if sl_inv is not None:
+                                    st_raw = st_raw[sl_inv]
+                            else:
+                                st_raw = np.asarray(f["states"][sl_h5], dtype=np.float32)
+                                if sl_inv is not None:
+                                    st_raw = st_raw[sl_inv]
                             file_ch = st_raw.shape[1]
                             if file_ch != expected_channels:
                                 allow_legacy = bool(
@@ -492,23 +612,33 @@ class ReplayBuffer:
                                     )
                             else:
                                 st = st_raw
-                            am = np.asarray(f["action_masks"][sl], dtype=np.float32)
-                            pi = np.asarray(f["policies"][sl], dtype=np.float32)
-                            va = np.asarray(f["values"][sl], dtype=np.float32)
+                            am = np.asarray(f["action_masks"][sl_h5], dtype=np.float32)
+                            pi = np.asarray(f["policies"][sl_h5], dtype=np.float32)
+                            va = np.asarray(f["values"][sl_h5], dtype=np.float32)
+                            if sl_inv is not None:
+                                am = am[sl_inv]
+                                pi = pi[sl_inv]
+                                va = va[sl_inv]
                             if file_has_scores:
-                                sc = np.asarray(f["score_margins"][sl], dtype=np.float32)
+                                sc = np.asarray(f["score_margins"][sl_h5], dtype=np.float32)
+                                if sl_inv is not None:
+                                    sc = sc[sl_inv]
                                 _validate_score_margins(sc, max_abs=score_margin_max_abs, source=h5_path)
                             else:
                                 sc = np.zeros(st.shape[0], dtype=np.float32)
                             if file_has_ownership:
-                                ow = np.asarray(f["ownerships"][sl], dtype=np.float32)
+                                ow = np.asarray(f["ownerships"][sl_h5], dtype=np.float32)
+                                if sl_inv is not None:
+                                    ow = ow[sl_inv]
                             else:
                                 # Fill with -1 sentinel for old data without ownership
                                 ow = np.full((st.shape[0], *own_shape), -1.0, dtype=np.float32)
 
                             file_has_slot_ids = "slot_piece_ids" in f
                             if file_has_slot_ids:
-                                sid = np.asarray(f["slot_piece_ids"][sl], dtype=np.int16)
+                                sid = np.asarray(f["slot_piece_ids"][sl_h5], dtype=np.int16)
+                                if sl_inv is not None:
+                                    sid = sid[sl_inv]
                             else:
                                 sid = np.full((st.shape[0], 3), -1, dtype=np.int16)
 
@@ -536,10 +666,16 @@ class ReplayBuffer:
 
                             out_states[cur:new] = st
                             if merge_multimodal:
-                                out_global[cur:new] = f["global_states"][sl].astype(np.float16)
-                                out_track[cur:new] = f["track_states"][sl].astype(np.float16)
-                                out_shop_ids[cur:new] = f["shop_ids"][sl]
-                                out_shop_feats[cur:new] = f["shop_feats"][sl].astype(np.float16)
+                                g = np.asarray(f["global_states"][sl_h5], dtype=np.float16)
+                                tr = np.asarray(f["track_states"][sl_h5], dtype=np.float16)
+                                si = np.asarray(f["shop_ids"][sl_h5])
+                                sf = np.asarray(f["shop_feats"][sl_h5], dtype=np.float16)
+                                if sl_inv is not None:
+                                    g, tr, si, sf = g[sl_inv], tr[sl_inv], si[sl_inv], sf[sl_inv]
+                                out_global[cur:new] = g
+                                out_track[cur:new] = tr
+                                out_shop_ids[cur:new] = si
+                                out_shop_feats[cur:new] = sf
                             out_masks[cur:new] = am
                             out_pols[cur:new] = pi
                             out_vals[cur:new] = va

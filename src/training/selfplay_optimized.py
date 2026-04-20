@@ -657,6 +657,23 @@ class OptimizedSelfPlayWorker:
 
         winner = terminal_winner
 
+        # Auxiliary scalar targets
+        # bonus7x7: per position (2,) float32 — [my_bonus, opp_bonus]  (1.0 if player got the 7×7 bonus)
+        # opp_threat: per position scalar float32 — opponent's final empty squares / 81
+        bonus7x7_targets: List[np.ndarray] = []
+        opp_threat_targets: List[float] = []
+        for p in stored_players:
+            pl = int(p)
+            my_bonus = 1.0 if int(st[BONUS_OWNER]) == pl else 0.0
+            opp_bonus = 1.0 if int(st[BONUS_OWNER]) == (1 - pl) else 0.0
+            bonus7x7_targets.append(np.array([my_bonus, opp_bonus], dtype=np.float32))
+            opp_empty = int(empty_count_from_occ(
+                int(st[P1_OCC0]), int(st[P1_OCC1]), int(st[P1_OCC2])
+            )) if pl == 0 else int(empty_count_from_occ(
+                int(st[P0_OCC0]), int(st[P0_OCC1]), int(st[P0_OCC2])
+            ))
+            opp_threat_targets.append(float(opp_empty) / 81.0)
+
         # Audit: raw components for scoring verification (buttons, empty, bonus, true scores)
         _empty0 = empty_count_from_occ(int(st[P0_OCC0]), int(st[P0_OCC1]), int(st[P0_OCC2]))
         _empty1 = empty_count_from_occ(int(st[P1_OCC0]), int(st[P1_OCC1]), int(st[P1_OCC2]))
@@ -691,6 +708,8 @@ class OptimizedSelfPlayWorker:
             "values": values,
             "score_margins": score_margins,
             "ownerships": ownerships,
+            "bonus7x7": bonus7x7_targets,
+            "opp_threat": opp_threat_targets,
             "game_length": int(move_count),
             "winner": int(winner),
             "final_score_diff": float(final_score_diff),
@@ -768,6 +787,8 @@ def _write_shard_async(
     track_states: Optional[np.ndarray] = None,
     shop_ids_arr: Optional[np.ndarray] = None,
     shop_feats: Optional[np.ndarray] = None,
+    bonus7x7: Optional[np.ndarray] = None,
+    opp_threat: Optional[np.ndarray] = None,
 ) -> None:
     """Write NPZ shard to disk (runs in background thread)."""
     kwargs = {
@@ -782,6 +803,10 @@ def _write_shard_async(
         kwargs["track_states"] = track_states
         kwargs["shop_ids"] = shop_ids_arr
         kwargs["shop_feats"] = shop_feats
+    if bonus7x7 is not None:
+        kwargs["bonus7x7"] = bonus7x7
+    if opp_threat is not None:
+        kwargs["opp_threat"] = opp_threat
     np.savez(shard_path, **kwargs)
 
 
@@ -912,6 +937,8 @@ def play_game_optimized(args: Tuple[int, int, Optional[int]]) -> Optional[Dict]:
             track_s = data.get("track_states")
             shop_i = data.get("shop_ids")
             shop_f = data.get("shop_feats")
+            bonus7x7_arr = np.asarray(data["bonus7x7"], dtype=np.float32) if "bonus7x7" in data else None
+            opp_threat_arr = np.asarray(data["opp_threat"], dtype=np.float32) if "opp_threat" in data else None
 
             import os
             pid = os.getpid()
@@ -928,11 +955,13 @@ def play_game_optimized(args: Tuple[int, int, Optional[int]]) -> Optional[Dict]:
                 tr_cp = track_s.copy() if track_s is not None else None
                 si_cp = shop_i.copy() if shop_i is not None else None
                 sf_cp = shop_f.copy() if shop_f is not None else None
+                b7_cp = bonus7x7_arr.copy() if bonus7x7_arr is not None else None
+                ot_cp = opp_threat_arr.copy() if opp_threat_arr is not None else None
                 fut = _SHARD_WRITER.submit(
                     _write_shard_async, shard_path,
                     states.copy(), masks.copy(), policies.copy(), values.copy(),
                     ownerships.copy(), score_margins_arr.copy(), slot_cp,
-                    sp_cp, gb_cp, tr_cp, si_cp, sf_cp,
+                    sp_cp, gb_cp, tr_cp, si_cp, sf_cp, b7_cp, ot_cp,
                 )
                 with _SHARD_WRITE_LOCK:
                     # Prune completed futures to avoid unbounded growth
@@ -957,6 +986,10 @@ def play_game_optimized(args: Tuple[int, int, Optional[int]]) -> Optional[Dict]:
                     kwargs["track_states"] = track_s
                     kwargs["shop_ids"] = shop_i
                     kwargs["shop_feats"] = shop_f
+                if bonus7x7_arr is not None:
+                    kwargs["bonus7x7"] = bonus7x7_arr
+                if opp_threat_arr is not None:
+                    kwargs["opp_threat"] = opp_threat_arr
                 np.savez(shard_path, **kwargs)
 
             return {
