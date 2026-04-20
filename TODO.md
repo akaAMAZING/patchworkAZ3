@@ -11,15 +11,41 @@
   - If trend 15-30 Elo/step (matches iter29 single data point): leave as-is
   - Always shift packing_alpha and dynamic_score_utility_weight by same amount as LR phase
 
-- [ ] **iter ~80** — Run T1 round-robin tournament
-  - `python scripts/run_tournament.py` (build script around iter70)
-  - Sample: every 10 iters → [iter10, 20, 30, 40, 50, 60, 70, 80] = 28 pairs × 40 games ≈ 1.5 hrs
-  - Purpose: validate ladder Elo accuracy, get payoff matrix for league seeding
+- [ ] **iter ~60-70** — Run T1 round-robin tournament
+  - `python scripts/run_tournament.py`
+  - Sample every 10 iters: [iter10, 20, 30, 40, 50, 60, 70]
+  - 40-60 games per pair
+  - Purpose:
+    - validate ladder ranking vs full payoff matrix
+    - detect non-transitivity / matchup pockets
+    - check for forgetting against older checkpoints before enabling league
 
-- [ ] **iter ~90-100** — League activation (deferred from iter79 — wait for T1 data)
-  - Use T1 payoff matrix to pick opponent pool (want opponents at 35-48% WR vs current)
-  - Config keys: `league.enabled: true`
-  - Enable exploiter at iter 150 (after epochs raise), not iter 120
+- [ ] **T1 decision gate** — Only enable league if tournament data justifies it
+  - Turn league on only if one or more are true:
+    - ladder ordering disagrees materially with tournament ordering
+    - current checkpoint has bad matchup pockets vs older checkpoints
+    - evidence of forgetting / regression appears
+    - payoff matrix is clearly non-transitive enough that pure ladder is missing signal
+  - If T1 looks mostly transitive and ladder agrees, keep league off for now
+
+- [ ] **iter ~100-120** — Optional league activation only if T1 supports it
+  - Keep this evidence-gated, not calendar-gated
+  - If enabled, start small:
+    - no exploiter yet
+    - use past-checkpoint / PFSP exposure conservatively
+  - Goal opponent pool: roughly 35-48% WR vs current
+
+- [ ] **iter ~140-160** — Run T2 tournament if league is still under consideration
+  - Re-check:
+    - ladder accuracy
+    - matchup non-transitivity
+    - regression/forgetting
+    - whether league is actually likely to add value
+
+- [ ] **iter ~150+** — Enable exploiter only if league is already on and showing value
+  - Do not enable exploiter by default
+  - Use only after core training is clearly stable
+  - Prefer after q_value_weight has reached its mid/late setting and the run is past the early high-plasticity phase
 
 - [ ] **iter ~150** — Raise `epochs_per_iteration` from 2 → 3
   - Also flip `league.exploiter_enabled: true` at this point

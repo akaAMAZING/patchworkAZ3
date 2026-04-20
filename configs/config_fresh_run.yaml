@@ -9,7 +9,7 @@
 #     (no blended target — each head has one job, combination in search only)
 #   - hierarchical policy: type(3)→slot(3)→orient(8)→position(81) factorization
 #     (each level is a small softmax — faster convergence than flat 2026-way)
-#   - stronger score head (weight 0.30) and DSU (peak 0.35) for margin optimization
+#   - score head weight 0.08 (reduced from 0.30): 7% gradient share; ramp DSU to 0.35 by iter 60
 #   - ownership pos_weight=6.0 fixes empty-cell recall (~30% → target >60%)
 #   - k_sqrt_coef=3 (was 8): PW now meaningfully prunes root BUY at ~320 sims
 #   - packing alpha=0.70→0.04 (scheduled taper): heuristic bridges early horizon gap, fades as value head matures
@@ -90,12 +90,12 @@ training:
   amp_dtype: bfloat16
   policy_loss_weight: 1.0
   value_loss_weight: 1.0
-  score_loss_weight: 0.30       # sole margin signal now (value head is pure P(win), no blended margin)
+  score_loss_weight: 0.08       # reduced from 0.30: 201-bin CE at 0.30 consumed 22% of gradient while score utility was near-zero in search; 0.08 gives ~7% share which is sufficient to learn without crowding policy
   ownership_loss_weight: 0.15
   ownership_pos_weight: 6.0     # raised from 4.0: upweights empty cells 6× to fix recall (~30% → target >60%)
   bonus7x7_loss_weight: 0.10    # 7x7 bonus prediction head (binary BCE, 2 outputs: my/opp)
   opp_threat_loss_weight: 0.05  # opponent board threat head (regression MSE, scalar in [0,1])
-  policy_entropy_bonus_weight: 0.003  # resist late-training policy collapse; -coef*H(pi) in loss
+  policy_entropy_bonus_weight: 0.0    # removed: was inflating network entropy faster than MCTS targets, causing KL to grow 0.19→0.67 over 10 iters; re-enable at iter 150+ if policy collapse observed
   value_label_smoothing: 0.02   # clamp value targets to [-0.98, +0.98]; prevents logit saturation
   epochs_per_iteration: 2       # NOTE: raise to 3 at iter 300
   val_split: 0.08
@@ -130,7 +130,7 @@ selfplay:
   augmentation: d4
   mcts:
     simulations: 192
-    parallel_leaves: 64
+    parallel_leaves: 32
     static_score_utility_weight: 0.0
     dynamic_score_utility_weight: 0.00   # overridden by schedule below
     score_utility_scale: 30.0
@@ -152,7 +152,7 @@ selfplay:
         iso_hole_penalty: 6.0
         frontier_penalty: 0.0
         area_bonus: 0.0            # NN decides piece-size preference; area is not a reliable proxy for packing quality
-    cpuct: 1.45
+    cpuct: 1.5
     temperature: 1.0
     temperature_threshold: 15
     root_dirichlet_alpha: 0.10
@@ -337,49 +337,31 @@ iteration:
 
   mcts_schedule:
   - iteration: 0
-    simulations: 192
-  - iteration: 45
     simulations: 224
-  - iteration: 80
+  - iteration: 45
     simulations: 256
-  - iteration: 180
+  - iteration: 80
     simulations: 288
-  - iteration: 250
+  - iteration: 180
     simulations: 320
-  - iteration: 350
+  - iteration: 250
     simulations: 352
-  - iteration: 430
+  - iteration: 350
     simulations: 384
-  - iteration: 470
+  - iteration: 430
     simulations: 416
-  - iteration: 500
+  - iteration: 470
     simulations: 448
+  - iteration: 500
+    simulations: 480
 
   parallel_leaves_schedule:
   - iteration: 0
-    parallel_leaves: 64
-  - iteration: 45
-    parallel_leaves: 56
-  - iteration: 180
-    parallel_leaves: 48
-  - iteration: 300
-    parallel_leaves: 40
-  - iteration: 420
     parallel_leaves: 32
-  - iteration: 470
-    parallel_leaves: 24
 
   dirichlet_alpha_schedule:
   - iteration: 0
     alpha: 0.10
-  - iteration: 120
-    alpha: 0.08
-  - iteration: 300
-    alpha: 0.06
-  - iteration: 420
-    alpha: 0.05
-  - iteration: 500
-    alpha: 0.04
 
   packing_alpha_schedule:
   - iteration: 0
@@ -412,54 +394,28 @@ iteration:
     dynamic_score_utility_weight: 0.20
   - iteration: 60
     dynamic_score_utility_weight: 0.35  # sole margin signal in search (value head is pure P(win))
-  - iteration: 500
-    dynamic_score_utility_weight: 0.35
 
   q_value_weight_schedule:
   - iteration: 0
     q_value_weight: 0.15
-  - iteration: 30
+  - iteration: 100
     q_value_weight: 0.20
-  - iteration: 80
+  - iteration: 300
     q_value_weight: 0.25
-  - iteration: 150
-    q_value_weight: 0.30
-  - iteration: 250
-    q_value_weight: 0.35
-  - iteration: 350
-    q_value_weight: 0.40
-  - iteration: 430
-    q_value_weight: 0.45
-  - iteration: 500
-    q_value_weight: 0.48
 
   cpuct_schedule:
   - iteration: 0
-    cpuct: 1.45
-  - iteration: 80
-    cpuct: 1.52
-  - iteration: 180
+    cpuct: 1.50
+  - iteration: 160
+    cpuct: 1.55
+  - iteration: 250
     cpuct: 1.60
-  - iteration: 300
-    cpuct: 1.68
-  - iteration: 400
-    cpuct: 1.75
-  - iteration: 470
-    cpuct: 1.80
+  - iteration: 450
+    cpuct: 1.65
 
   noise_weight_schedule:
   - iteration: 0
     weight: 0.25
-  - iteration: 140
-    weight: 0.22
-  - iteration: 260
-    weight: 0.20
-  - iteration: 360
-    weight: 0.17
-  - iteration: 430
-    weight: 0.13
-  - iteration: 470
-    weight: 0.11
 
   games_schedule:
   - iteration: 0
