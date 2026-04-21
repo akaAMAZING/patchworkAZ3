@@ -1,5 +1,5 @@
 {
-  "timestamp_utc": "2026-04-21T07:28:46.169986Z",
+  "timestamp_utc": "2026-04-21T07:49:16.957208Z",
   "python": "3.10.11 (tags/v3.10.11:7d4cc5a, Apr  5 2023, 00:38:17) [MSC v.1929 64 bit (AMD64)]",
   "platform": "Windows-10-10.0.26200-SP0",
   "executable": "C:\\Users\\Shanks\\Desktop\\Codes\\patchworkaz - Copy - v2\\venv\\Scripts\\python.exe",
@@ -9,5 +9,5 @@
   "cuda_device_name": "NVIDIA GeForce RTX 3080",
   "cudnn_version": 90100,
   "seed": 42,
-  "config_path": "C:\\Users\\Shanks\\Desktop\\Codes\\patchworkaz - Copy - v2\\quick_diag\\config_flat.yaml"
+  "config_path": "C:\\Users\\Shanks\\Desktop\\Codes\\patchworkaz - Copy - v2\\quick_diag\\config_hier.yaml"
 }

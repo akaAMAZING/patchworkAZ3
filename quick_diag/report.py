@@ -141,7 +141,7 @@ def kl_verdict(flat_data: dict, hier_data: dict) -> None:
         print("  No data found.")
         return
 
-    last_iter = max(i for i in iters if flat_data.get(i) and hier_data.get(i), default=None)
+    last_iter = max((i for i in iters if flat_data.get(i) and hier_data.get(i)), default=None)
     if last_iter is None:
         print("  Need both flat and hier data for verdict.")
         return
@@ -222,19 +222,24 @@ def main() -> None:
 
     runs_dir = args.runs_dir.resolve() if not args.runs_dir.is_absolute() else args.runs_dir
 
-    flat_data = load_run(runs_dir / "qd_flat" / "committed")
-    hier_data = load_run(runs_dir / "qd_hier" / "committed")
+    # Auto-discover all qd_* run directories
+    all_run_dirs = {
+        "flat":    runs_dir / "qd_flat"     / "committed",
+        "hier":    runs_dir / "qd_hier"     / "committed",
+        "e3":      runs_dir / "qd_hier_e3"  / "committed",
+    }
 
     available = {}
-    if flat_data:
-        available["flat"] = flat_data
-    if hier_data:
-        available["hier"] = hier_data
+    for label, path in all_run_dirs.items():
+        data = load_run(path)
+        if data:
+            available[label] = data
 
     if not available:
         print("No diagnostic run data found.")
-        print(f"Expected committed iterations in: {runs_dir / 'qd_flat'} or {runs_dir / 'qd_hier'}")
+        print(f"Expected committed iterations under: {runs_dir}")
         print("Run:  python quick_diag/run_diag.py --mode both")
+        print("      python quick_diag/run_diag.py --mode e3")
         return
 
     all_iters = sorted(set(it for rd in available.values() for it in rd))
@@ -254,8 +259,10 @@ def main() -> None:
         for rid in available:
             for mname, _ in metrics:
                 hdr += f"  {(rid+':'+mname)[:col_w]:>{col_w}}"
-        if len(available) == 2 and "kl_divergence" in [m for m, _ in metrics]:
+        if "flat" in available and "hier" in available and "kl_divergence" in [m for m, _ in metrics]:
             hdr += f"  {'Δ_kl(H-F)':>12}"
+        if "e3" in available and "hier" in available and "kl_divergence" in [m for m, _ in metrics]:
+            hdr += f"  {'Δ_kl(E3-H)':>12}"
         print(hdr)
         print("  " + "-"*len(hdr.strip()))
 
@@ -268,15 +275,57 @@ def main() -> None:
                     v = get_nested(iter_data, jpath)
                     row_vals[(rid, mname)] = v
                     row += f"  {fmt(v, mname):>{col_w}}"
-            if len(available) == 2 and "kl_divergence" in [m for m, _ in metrics]:
-                rid_list = list(available.keys())
-                flat_kl = row_vals.get((rid_list[0], "kl_divergence"))
-                hier_kl = row_vals.get((rid_list[1], "kl_divergence"))
-                row += delta_marker(flat_kl, hier_kl, "kl_divergence")
+            if "flat" in available and "hier" in available and "kl_divergence" in [m for m, _ in metrics]:
+                row += delta_marker(
+                    row_vals.get(("flat", "kl_divergence")),
+                    row_vals.get(("hier", "kl_divergence")),
+                    "kl_divergence",
+                )
+            if "e3" in available and "hier" in available and "kl_divergence" in [m for m, _ in metrics]:
+                row += delta_marker(
+                    row_vals.get(("hier", "kl_divergence")),
+                    row_vals.get(("e3",   "kl_divergence")),
+                    "kl_divergence",
+                )
             print(row)
 
-    if len(available) == 2:
+    flat_data    = available.get("flat", {})
+    hier_data    = available.get("hier", {})
+    e3_data      = available.get("e3",   {})
+
+    if flat_data and hier_data:
         kl_verdict(flat_data, hier_data)
+
+    if e3_data and hier_data:
+        print("\n" + "="*60)
+        print("  E3 VERDICT  (optimizer resume  vs  cold-start each iter)")
+        print("="*60)
+        iters = sorted(set(e3_data) | set(hier_data))
+        last  = max((i for i in iters if e3_data.get(i) and hier_data.get(i)), default=None)
+        if last is not None:
+            h_kl  = get_nested(hier_data[last], "train_metrics.kl_divergence")
+            e3_kl = get_nested(e3_data[last],   "train_metrics.kl_divergence")
+            h_pe  = get_nested(hier_data[last], "train_metrics.policy_entropy")
+            e3_pe = get_nested(e3_data[last],   "train_metrics.policy_entropy")
+            h_te  = get_nested(hier_data[last], "train_metrics.target_entropy")
+            e3_te = get_nested(e3_data[last],   "train_metrics.target_entropy")
+            h_pa  = get_nested(hier_data[last], "train_metrics.policy_accuracy")
+            e3_pa = get_nested(e3_data[last],   "train_metrics.policy_accuracy")
+            print(f"\n  At iter {last}:")
+            print(f"    hier (cold)    KL={h_kl:.4f}  PE={h_pe:.3f}  TE={h_te:.3f}  pol_acc={h_pa*100:.1f}%")
+            print(f"    hier (resume)  KL={e3_kl:.4f}  PE={e3_pe:.3f}  TE={e3_te:.3f}  pol_acc={e3_pa*100:.1f}%")
+            diff = e3_kl - h_kl
+            print(f"    Δ KL (resume−cold) = {diff:+.4f}")
+            print()
+            if diff < -0.15:
+                print("  VERDICT: OPTIMIZER RESUME IS THE PRIMARY KL DRIVER")
+                print("  Enable resume in production config immediately.")
+            elif diff < -0.05:
+                print("  VERDICT: OPTIMIZER RESUME CONTRIBUTES (~{:.0f}% reduction)".format(100 * abs(diff) / h_kl))
+                print("  Worth enabling in production; other factors also present.")
+            else:
+                print("  VERDICT: OPTIMIZER RESUME NOT THE PRIMARY DRIVER")
+                print("  KL is structural (sim budget / replay noise). Resume alone won't fix it.")
 
     if args.compare_prod:
         prod_data = load_run(PROD_RUNS)

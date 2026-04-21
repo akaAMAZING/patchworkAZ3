@@ -79,11 +79,11 @@ training:
   d4_augmentation: dynamic
   d4_on_gpu: false
   d4_gpu_deterministic_test_mode: false
-  resume_optimizer_state: false  # fresh run — no prior optimizer state
-  resume_scheduler_state: false
-  resume_scaler_state: false
-  resume_ema_state: false
-  resume_from_committed_state: false
+  resume_optimizer_state: true  # fresh run — no prior optimizer state
+  resume_scheduler_state: true
+  resume_scaler_state: true
+  resume_ema_state: true
+  resume_from_committed_state: true
   min_lr: 0.000032
   batch_size: 1024
   use_amp: true
@@ -95,9 +95,9 @@ training:
   ownership_pos_weight: 6.0     # raised from 4.0: upweights empty cells 6× to fix recall (~30% → target >60%)
   bonus7x7_loss_weight: 0.10    # 7x7 bonus prediction head (binary BCE, 2 outputs: my/opp)
   opp_threat_loss_weight: 0.05  # opponent board threat head (regression MSE, scalar in [0,1])
-  policy_entropy_bonus_weight: 0.0    # removed: was inflating network entropy faster than MCTS targets, causing KL to grow 0.19→0.67 over 10 iters; re-enable at iter 150+ if policy collapse observed
+  policy_entropy_bonus_weight: 0.0    # removed: revisit
   value_label_smoothing: 0.02   # clamp value targets to [-0.98, +0.98]; prevents logit saturation
-  epochs_per_iteration: 2       # NOTE: raise to 3 at iter 300
+  epochs_per_iteration: 2       # NOTE: raise to 3 at iter 150-300
   val_split: 0.08
   val_frequency: 1000
   checkpoint_frequency: 10000

@@ -32,8 +32,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DIAG_DIR     = PROJECT_ROOT / "quick_diag"
 
 CONFIGS = {
-    "flat": DIAG_DIR / "config_flat.yaml",
-    "hier": DIAG_DIR / "config_hier.yaml",
+    "flat":  DIAG_DIR / "config_flat.yaml",
+    "hier":  DIAG_DIR / "config_hier.yaml",
+    "e3":    DIAG_DIR / "config_hier_e3.yaml",   # hier + epochs=3 + optimizer resume
 }
 
 # Directories to wipe before a fresh run (keeps iteration data pristine)
@@ -49,6 +50,12 @@ CLEAN_TARGETS = {
         PROJECT_ROOT / "quick_diag" / "checkpoints_hier",
         PROJECT_ROOT / "quick_diag" / "logs_hier",
         PROJECT_ROOT / "quick_diag" / "data_hier",
+    ],
+    "e3": [
+        PROJECT_ROOT / "quick_diag" / "runs"          / "qd_hier_e3",
+        PROJECT_ROOT / "quick_diag" / "checkpoints_hier_e3",
+        PROJECT_ROOT / "quick_diag" / "logs_hier_e3",
+        PROJECT_ROOT / "quick_diag" / "data_hier_e3",
     ],
 }
 
@@ -82,9 +89,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["flat", "hier", "both"],
+        choices=["flat", "hier", "e3", "both"],
         default="both",
-        help="Which policy head variant to run (default: both)",
+        help="flat | hier | e3 (hier+epochs3+optim_resume) | both=flat+hier (default: both)",
     )
     parser.add_argument(
         "--no-clean",
@@ -104,6 +111,7 @@ def main() -> None:
     args = parser.parse_args()
 
     modes = ["flat", "hier"] if args.mode == "both" else [args.mode]
+    # "both" intentionally excludes e3 — run it explicitly with --mode e3
 
     for mode in modes:
         if not args.no_clean:
