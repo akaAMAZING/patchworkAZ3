@@ -32,7 +32,8 @@
       "Bash(wc -l \"/c/Users/Shanks/Desktop/Codes/patchworkaz - Copy - v2/src/mcts\"/*.py*)"
     ],
     "additionalDirectories": [
-      "C:\\Users\\Shanks\\Desktop"
+      "C:\\Users\\Shanks\\Desktop",
+      "c:\\Users\\Shanks\\Desktop\\Codes\\patchworkaz - Copy - v2"
     ]
   }
 }

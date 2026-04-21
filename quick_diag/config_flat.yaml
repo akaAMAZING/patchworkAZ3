@@ -1,0 +1,354 @@
+# QUICK_DIAG — FLAT POLICY HEAD
+# ============================================================================
+# Scaled-down diagnostic run to isolate KL divergence vs production run.
+# Matches production config exactly EXCEPT:
+#   - use_hierarchical_policy: false  (FLAT 2026-way softmax)
+#   - simulations: 32, parallel_leaves: 8 (4 batches)
+#   - games_per_iteration: 80, num_workers: 4
+#   - batch_size: 256, epochs_per_iteration: 1
+#   - replay_buffer scaled to match game volume
+#   - all eval/ladder disabled
+#   - max_iterations: 6 (compare against production iter 6)
+#
+# USAGE (from project root):
+#   python quick_diag/run_diag.py --mode flat
+#   python quick_diag/run_diag.py --mode both   # runs flat then hier sequentially
+#   python quick_diag/report.py                  # compare results
+
+seed: 42
+deterministic: false
+
+hardware:
+  device: cuda
+  pin_memory: true
+  persistent_workers: true
+  prefetch_batches: 2
+
+data:
+  allow_legacy_state_channels: false
+  encoding_version: gold_v2_36ch
+  expected_spatial_channels: 36
+  expected_global_dim: 65
+  expected_track_shape: [8, 54]
+  expected_shop_shapes: [33, 10]
+
+network:
+  input_channels: 60
+  num_res_blocks: 18
+  channels: 128
+  policy_channels: 48
+  policy_hidden: 512
+  use_factorized_policy_head: false
+  use_hierarchical_policy: false      # FLAT: standard 2026-way softmax
+  value_channels: 48
+  value_hidden: 512
+  max_actions: 2026
+  dropout: 0.0
+  weight_decay: 0.0002
+  use_batch_norm: true
+  activation: relu
+  se_ratio: 0.0625
+  ownership_channels: 48
+  use_film: true
+  film_hidden: 256
+  film_global_dim: 65
+  film_track_dim: 432
+  film_shop_dim: 128
+  film_per_block: true
+  film_track_use_conv: true
+  film_global_inject_dim: 64
+  aux_channels: 32
+
+training:
+  optimizer: adamw
+  learning_rate: 0.0016
+  lr_schedule: cosine_warmup_per_phase
+  warmup_steps: 20
+  d4_augmentation: dynamic
+  d4_on_gpu: false
+  d4_gpu_deterministic_test_mode: false
+  resume_optimizer_state: false
+  resume_scheduler_state: false
+  resume_scaler_state: false
+  resume_ema_state: false
+  resume_from_committed_state: false
+  min_lr: 0.000032
+  batch_size: 256
+  use_amp: true
+  amp_dtype: bfloat16
+  policy_loss_weight: 1.0
+  value_loss_weight: 1.0
+  score_loss_weight: 0.08
+  ownership_loss_weight: 0.15
+  ownership_pos_weight: 6.0
+  bonus7x7_loss_weight: 0.10
+  opp_threat_loss_weight: 0.05
+  policy_entropy_bonus_weight: 0.0
+  value_label_smoothing: 0.02
+  epochs_per_iteration: 1
+  val_split: 0.08
+  val_frequency: 999999        # disabled: too few samples
+  checkpoint_frequency: 999999
+  keep_last_n_checkpoints: 10
+  save_best: false
+  best_metric: val_loss
+  early_stopping:
+    enabled: false
+    patience: 5
+    min_delta: 0.001
+  max_grad_norm: 1.0
+  allow_tf32: true
+  matmul_precision: high
+  ema:
+    enabled: true
+    decay: 0.999
+    use_for_selfplay: true
+    use_for_eval: true
+    save_checkpoint: true
+
+selfplay:
+  api_url: null
+  inference_backend: null
+  api_timeout: 120
+  api_retry_attempts: 3
+  num_workers: 4
+  max_game_length: 200
+  games_per_iteration: 80
+  store_canonical_only: true
+  augmentation: d4
+  mcts:
+    simulations: 32
+    parallel_leaves: 8             # 4 batches of 8 — controlled like production's 4 batches of 32
+    static_score_utility_weight: 0.0
+    dynamic_score_utility_weight: 0.00
+    score_utility_scale: 30.0
+    progressive_widening:
+      enabled: true
+      k_root: 12                   # scaled from 64: ~12 buy actions at root with 32 sims
+      k0: 6                        # scaled from 32
+      k_sqrt_coef: 1               # K_buy ≈ 6 + sqrt(32) ≈ 12 at root
+      always_include_pass: true
+      always_include_patch: true
+    packing_ordering:
+      enabled: true
+      alpha: 0.70
+      use_log_prior: true
+      local_check_radius: 2
+      weights:
+        adj_edges: 0.25
+        corner_bonus: 0.0
+        iso_hole_penalty: 6.0
+        frontier_penalty: 0.0
+        area_bonus: 0.0
+    cpuct: 1.5
+    temperature: 1.0
+    temperature_threshold: 15
+    root_dirichlet_alpha: 0.10
+    root_noise_weight: 0.25
+    virtual_loss: 1.0
+    num_threads: 1
+    fpu_reduction: 0.25
+    win_first:
+      enabled: true
+      value_delta_min: 0.01
+      value_delta_max: 0.10
+      value_delta_win_start: 0.60
+      value_delta_win_full: 0.90
+      gate_dsu_enabled: true
+      gate_dsu_win_start: 0.45
+      gate_dsu_win_full: 0.75
+      gate_dsu_power: 2.0
+      gate_dsu_loss_start: -0.90
+      gate_dsu_loss_full: -0.98
+      tiebreak: score_then_visits
+      filter_before_sampling: true
+    patch_tiebreak:
+      enabled: true
+      win_prob_floor: 0.88
+  playout_cap_randomization:
+    enabled: false
+    cap_fraction: 0.25
+    fast_probability: 0.20
+  bootstrap:
+    use_pure_mcts: true
+    mcts_simulations: 32
+    games: 80
+  stream_to_disk: true
+  hdf5_compression: lzf
+  hdf5_compression_level: 0
+  write_buffer_positions: 2048
+  policy_target_mode: visits
+  q_value_weight: 0.15
+  opponent_mix:
+    enabled: false
+
+replay_buffer:
+  max_size: 20000
+  min_size: 400
+  window_iterations: 3
+  newest_fraction: 0.25
+  recency_weight_lambda: 1.0
+  prioritized: false
+  storage_format: hdf5
+  compression: lzf
+  compression_level: 0
+
+evaluation:
+  lock_eval_cpuct_to_selfplay: true
+  games_vs_best: 0
+  games_vs_pure_mcts: 0
+  games_vs_anchor: 0
+  eval_progress_interval: 0
+  paired_eval: false
+  skip_pure_mcts_after_iter: 0
+  anchor_checkpoint:
+    path: null
+    config: null
+  ladder_eval:
+    enabled: false
+    interval: 999
+    lookback: 5
+    games: 0
+    sprt:
+      enabled: false
+      p0: 0.50
+      p1: 0.55
+      alpha: 0.05
+      beta: 0.05
+      min_games: 10
+  eval_baselines:
+  - type: pure_mcts
+    simulations: 32
+  - type: previous_best
+  win_rate_threshold: 0.0
+  anti_regression_floor: 0.0
+  max_consecutive_rejections: 1
+  sprt:
+    enabled: false
+    p0: 0.50
+    p1: 0.55
+    alpha: 0.05
+    beta: 0.05
+    min_games: 12
+    max_games: 400
+  micro_gate:
+    enabled: false
+    start_games: 10
+    step_games: 10
+    max_games: 60
+    anti_regression_threshold: 0.42
+  eval_mcts:
+    simulations: 32
+    temperature: 0.0
+    cpuct: 1.75
+  elo:
+    enabled: false
+    initial_rating: 1500
+    k_factor: 32
+
+logging:
+  log_level: INFO
+  tensorboard:
+    enabled: true
+    log_dir: quick_diag/logs_flat
+  wandb:
+    enabled: false
+    project: patchwork-alphazero
+    entity: null
+  log_file: quick_diag/logs_flat/training.log
+
+paths:
+  checkpoints_dir: quick_diag/checkpoints_flat
+  logs_dir: quick_diag/logs_flat
+  run_root: quick_diag/runs
+  run_id: qd_flat
+  data_dir: quick_diag/data_flat     # explicit: keeps replay buffer fallback inside quick_diag/
+
+iteration:
+  max_iterations: 6
+  auto_resume: false
+
+  adaptive_games:
+    enabled: false                   # fixed game count for reproducibility
+
+  lr_schedule:
+  - iteration: 0
+    lr: 0.0016
+
+  temperature_schedule:
+  - iteration: 0
+    temperature: 1.00
+
+  mcts_schedule:
+  - iteration: 0
+    simulations: 32
+
+  parallel_leaves_schedule:
+  - iteration: 0
+    parallel_leaves: 8
+
+  dirichlet_alpha_schedule:
+  - iteration: 0
+    alpha: 0.10
+
+  packing_alpha_schedule:
+  - iteration: 0
+    alpha: 0.70
+
+  score_sigma_schedule:
+  - iteration: 0
+    sigma: 2.5
+
+  dynamic_score_utility_weight_schedule:
+  - iteration: 0
+    dynamic_score_utility_weight: 0.00
+
+  q_value_weight_schedule:
+  - iteration: 0
+    q_value_weight: 0.15
+
+  cpuct_schedule:
+  - iteration: 0
+    cpuct: 1.50
+
+  noise_weight_schedule:
+  - iteration: 0
+    weight: 0.25
+
+  games_schedule:
+  - iteration: 0
+    games: 80
+
+  window_iterations_schedule:
+  - iteration: 0
+    window_iterations: 3
+
+inference:
+  batch_size: 64
+  max_batch_wait_ms: 3
+  use_amp: true
+  amp_dtype: bfloat16
+  torch_compile: false
+  allow_tf32: true
+
+league:
+  enabled: false
+  pfsp_alpha: 2.0
+  pfsp_uniform_prob: 0.10
+  sp_frac_vs_best: 0.40
+  sp_frac_vs_pfsp: 0.50
+  sp_frac_vs_uniform: 0.10
+  gate_threshold: 0.55
+  suite_threshold: 0.52
+  worst_threshold: 0.40
+  gate_eval_games: 0
+  suite_eval_games: 0
+  max_pool_size: 5
+  anchor_size: 2
+  anchor_refresh_interval: 5
+  payoff_max_models: 5
+  exploiter_enabled: false
+  exploiter_train_games: 0
+  exploiter_temp_boost: 1.5
+  recency_newest_frac: 0.70
+  recency_newest_window: 0.15
